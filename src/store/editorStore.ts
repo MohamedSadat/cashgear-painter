@@ -1,6 +1,8 @@
 import { produce, type Draft } from 'immer'
 import { create } from 'zustand'
 import {
+  CANVAS_HEIGHT,
+  CANVAS_WIDTH,
   IDENTITY_TRANSFORM,
   emptyDoc,
   type Doc,
@@ -14,6 +16,8 @@ import {
 export const HISTORY_LIMIT = 100
 export const MIN_SIZE = 1
 export const MAX_SIZE = 64
+export const MIN_ZOOM = 0.1 // screen pixels per canvas unit
+export const MAX_ZOOM = 32
 
 export interface Brush {
   color: string
@@ -21,9 +25,15 @@ export interface Brush {
 }
 
 export interface View {
-  scale: number
-  x: number
+  scale: number // multiplies the viewport's fit scale; 1 = the artboard fits
+  x: number // Stage position, in screen pixels
   y: number
+}
+
+export interface Viewport {
+  width: number // Stage size, in screen pixels
+  height: number
+  fit: number // scale at which the artboard fits the canvas area
 }
 
 export interface EditorState {
@@ -35,6 +45,7 @@ export interface EditorState {
   tool: ToolId
   brush: Brush
   view: View // zoom and pan, not in history
+  viewport: Viewport // measured canvas area; not in history or autosave
   draft: VectorNode | null // the node being drawn right now; not in history or autosave
   erasing: NodeId[] // nodes the eraser has touched in the current pass
 
@@ -51,6 +62,11 @@ export interface EditorState {
   setBrush(brush: Partial<Brush>): void
   setDraft(node: VectorNode | null): void
   setErasing(ids: NodeId[]): void
+  setViewport(viewport: Viewport): void
+  setView(view: View): void
+  zoomTo(zoom: number, anchor?: [x: number, y: number]): void
+  panBy(dx: number, dy: number): void
+  fitView(): void
 }
 
 // crypto.randomUUID() is missing on plain-http LAN URLs (npm run dev -- --host), so ids are built by hand.
@@ -97,6 +113,24 @@ export function clampSize(n: number): number {
   return Math.min(MAX_SIZE, Math.max(MIN_SIZE, Math.round(n)))
 }
 
+export function clampZoom(zoom: number): number {
+  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom))
+}
+
+/** Screen pixels per canvas unit: the Stage scale. */
+export function zoomOf({ view, viewport }: Pick<EditorState, 'view' | 'viewport'>): number {
+  return viewport.fit * view.scale
+}
+
+/** The view that centers the whole artboard in the viewport. */
+function fittedView({ width, height, fit }: Viewport): View {
+  return {
+    scale: 1,
+    x: (width - CANVAS_WIDTH * fit) / 2,
+    y: (height - CANVAS_HEIGHT * fit) / 2,
+  }
+}
+
 export const useEditorStore = create<EditorState>()((set, get) => {
   /**
    * Applies one edit to the doc. Outside a gesture it is one history step; inside one, the step
@@ -119,6 +153,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     tool: 'brush',
     brush: { color: '#000000', size: 8 },
     view: { scale: 1, x: 0, y: 0 },
+    viewport: { width: 0, height: 0, fit: 0 },
     draft: null,
     erasing: [],
 
@@ -250,6 +285,65 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 
     setErasing(ids) {
       set({ erasing: ids })
+    },
+
+    setViewport(next) {
+      const { viewport, view } = get()
+      if (
+        next.width === viewport.width &&
+        next.height === viewport.height &&
+        next.fit === viewport.fit
+      )
+        return
+      if (next.fit <= 0) set({ viewport: next })
+      else if (viewport.fit <= 0) set({ viewport: next, view: fittedView(next) })
+      else {
+        // The canvas point in the middle stays in the middle, and the zoom stays relative to the fit.
+        const before = zoomOf({ view, viewport })
+        const after = next.fit * view.scale
+        const cx = (viewport.width / 2 - view.x) / before
+        const cy = (viewport.height / 2 - view.y) / before
+        set({
+          viewport: next,
+          view: {
+            scale: view.scale,
+            x: next.width / 2 - cx * after,
+            y: next.height / 2 - cy * after,
+          },
+        })
+      }
+    },
+
+    setView(view) {
+      set({ view })
+    },
+
+    zoomTo(zoom, anchor) {
+      const state = get()
+      const { view, viewport } = state
+      if (viewport.fit <= 0 || !Number.isFinite(zoom)) return
+      // The canvas point under the anchor stays under it; by default that is the middle.
+      const [ax, ay] = anchor ?? [viewport.width / 2, viewport.height / 2]
+      const after = clampZoom(zoom)
+      const ratio = after / zoomOf(state)
+      set({
+        view: {
+          scale: after / viewport.fit,
+          x: ax - (ax - view.x) * ratio,
+          y: ay - (ay - view.y) * ratio,
+        },
+      })
+    },
+
+    panBy(dx, dy) {
+      const { view } = get()
+      if (dx === 0 && dy === 0) return
+      set({ view: { ...view, x: view.x + dx, y: view.y + dy } })
+    },
+
+    fitView() {
+      const { viewport } = get()
+      if (viewport.fit > 0) set({ view: fittedView(viewport) })
     },
   }
 })

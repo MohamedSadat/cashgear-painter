@@ -1,6 +1,6 @@
-import { Brush, Download, Eraser, Redo2, Trash2, Undo2 } from 'lucide-react'
+import { Brush, Download, Eraser, Hand, Redo2, Trash2, Undo2 } from 'lucide-react'
 import type { ReactNode } from 'react'
-import { MAX_SIZE, MIN_SIZE, useEditorStore } from '../store/editorStore'
+import { MAX_SIZE, MIN_SIZE, useEditorStore, zoomOf } from '../store/editorStore'
 
 const SWATCHES = [
   '#000000',
@@ -53,7 +53,8 @@ export function Toolbar({ onExport }: ToolbarProps) {
   const canUndo = useEditorStore((s) => s.past.length > 0)
   const canRedo = useEditorStore((s) => s.future.length > 0)
   const canClear = useEditorStore((s) => s.doc.rootIds.length > 0)
-  const { setTool, setBrush, undo, redo, clear } = useEditorStore.getState()
+  const zoomPercent = useEditorStore((s) => Math.round(zoomOf(s) * 100))
+  const { setTool, setBrush, undo, redo, clear, fitView } = useEditorStore.getState()
 
   // Picking a color means you want to paint with it.
   const pickColor = (c: string) => {
@@ -80,6 +81,14 @@ export function Toolbar({ onExport }: ToolbarProps) {
           onClick={() => setTool('eraser')}
         >
           <Eraser size={20} />
+        </IconButton>
+        <IconButton
+          label="Hand"
+          title="Hand (H, or hold Space)"
+          pressed={tool === 'hand'}
+          onClick={() => setTool('hand')}
+        >
+          <Hand size={20} />
         </IconButton>
       </div>
 
@@ -141,6 +150,16 @@ export function Toolbar({ onExport }: ToolbarProps) {
             <Trash2 size={20} />
           </IconButton>
         </div>
+        {/* Shows the zoom and fits the artboard, so touch screens have a way back too. */}
+        <button
+          type="button"
+          aria-label="Fit artboard"
+          title="Fit artboard (Ctrl+0)"
+          onClick={fitView}
+          className="h-9 min-w-12 rounded-md px-1.5 text-sm text-neutral-600 tabular-nums hover:bg-neutral-100"
+        >
+          {zoomPercent}%
+        </button>
         <IconButton label="Export PNG" onClick={onExport}>
           <Download size={20} />
         </IconButton>

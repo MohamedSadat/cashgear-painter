@@ -1,9 +1,9 @@
 import type Konva from 'konva'
 import type { KonvaEventObject } from 'konva/lib/Node'
-import { useEffect, useMemo, useRef, type Ref } from 'react'
+import { useCallback, useEffect, useMemo, useRef, type Ref } from 'react'
 import { Layer, Rect, Stage } from 'react-konva'
-import { useFitScale } from '../hooks/useFitScale'
-import { CURSOR_LAYER_NAME } from '../lib/exportPng'
+import { useViewport } from '../hooks/useViewport'
+import { OVERLAY_LAYER_NAME } from '../lib/exportPng'
 import { useEditorStore } from '../store/editorStore'
 import { toolFor } from '../tools'
 import type { ToolEvent } from '../tools/types'
@@ -14,6 +14,9 @@ import { NodeView } from './NodeView'
 interface CanvasStageProps {
   stageRef: Ref<Konva.Stage>
 }
+
+const PASTEBOARD_COLOR = '#e5e5e5'
+const ARTBOARD_EDGE_COLOR = '#d4d4d4'
 
 const activeTool = () => toolFor(useEditorStore.getState().tool)
 
@@ -40,13 +43,23 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
   const cursorRef = useRef<Konva.Group>(null)
   const activePointerId = useRef<number | null>(null)
   const lastEvent = useRef<ToolEvent | null>(null)
-  const scale = useFitScale(containerRef)
   const doc = useEditorStore((s) => s.doc)
   const draft = useEditorStore((s) => s.draft)
   const erasing = useEditorStore((s) => s.erasing)
   const tool = useEditorStore((s) => s.tool)
   const size = useEditorStore((s) => s.brush.size)
+  const view = useEditorStore((s) => s.view)
+  const viewport = useEditorStore((s) => s.viewport)
   const erasingIds = useMemo(() => new Set(erasing), [erasing])
+  const zoom = viewport.fit * view.scale
+
+  // A pinch is not a stroke: drop whatever the first finger started.
+  const cancelGesture = useCallback(() => {
+    if (activePointerId.current === null) return
+    activePointerId.current = null
+    activeTool()?.onCancel?.()
+  }, [])
+  useViewport(containerRef, cancelGesture)
 
   // End the gesture even when the pointer is released off the canvas.
   useEffect(() => {
@@ -124,29 +137,57 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
   }
 
   return (
+    // The padding only shapes the fit; the Stage fills the whole area, padding included.
     <div
       ref={containerRef}
-      className="flex min-h-0 flex-1 touch-none items-center justify-center overflow-hidden p-2 select-none [-webkit-touch-callout:none] sm:p-4"
+      className="relative min-h-0 flex-1 touch-none overflow-hidden p-2 select-none [-webkit-touch-callout:none] sm:p-4"
     >
-      {scale > 0 && (
+      {viewport.fit > 0 && (
         <div
-          className="shadow-md ring-1 ring-black/10"
+          className="absolute inset-0"
           style={{ cursor: toolFor(tool)?.cursor ?? 'default' }}
           data-testid="canvas"
           onPointerLeave={hideCursor}
         >
           <Stage
             ref={stageRef}
-            width={CANVAS_WIDTH * scale}
-            height={CANVAS_HEIGHT * scale}
-            scaleX={scale}
-            scaleY={scale}
+            width={viewport.width}
+            height={viewport.height}
+            scaleX={zoom}
+            scaleY={zoom}
+            x={view.x}
+            y={view.y}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
           >
             <Layer listening={false}>
-              <Rect width={CANVAS_WIDTH} height={CANVAS_HEIGHT} fill={doc.background} />
+              {/* The pasteboard covers the visible area, so it is sized in canvas units here. */}
+              <Rect
+                x={-view.x / zoom}
+                y={-view.y / zoom}
+                width={viewport.width / zoom}
+                height={viewport.height / zoom}
+                fill={PASTEBOARD_COLOR}
+              />
+              {/* A 1-screen-pixel edge and a soft shadow, both outside the artboard and the PNG. */}
+              <Rect
+                x={-1 / zoom}
+                y={-1 / zoom}
+                width={CANVAS_WIDTH + 2 / zoom}
+                height={CANVAS_HEIGHT + 2 / zoom}
+                fill={ARTBOARD_EDGE_COLOR}
+                shadowColor="#000000"
+                shadowOpacity={0.15}
+                shadowBlur={8 / zoom}
+                shadowOffsetY={2 / zoom}
+              />
+              <Rect
+                name="artboard"
+                width={CANVAS_WIDTH}
+                height={CANVAS_HEIGHT}
+                fill={doc.background}
+              />
             </Layer>
             {/* The draft is the last child, so the stroke being drawn is on top. */}
             <Layer ref={contentLayerRef} listening={false}>
@@ -155,8 +196,9 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
               ))}
               {draft && <NodeView key={draft.id} node={draft} isDraft />}
             </Layer>
-            <Layer name={CURSOR_LAYER_NAME} listening={false}>
-              <BrushCursor ref={cursorRef} size={size} />
+            {/* Selection handles and tool previews join the brush cursor here in later milestones. */}
+            <Layer name={OVERLAY_LAYER_NAME} listening={false}>
+              <BrushCursor ref={cursorRef} tool={tool} size={size} />
             </Layer>
           </Stage>
         </div>

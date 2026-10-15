@@ -444,7 +444,11 @@ Fix every error, then list what changed and anything you skipped.
 - `src/lib/persistence.test.ts` and `src/tools/tools.test.ts` are extra unit tests beyond the folder structure above.
 - Node ids don't use `crypto.randomUUID()`: it is missing on plain-http LAN URLs such as `npm run dev -- --host`. Use `newNodeId()` from `store/editorStore.ts`.
 - `editorStore.ts` doesn't use zustand's immer middleware. Doc edits go through a `commit` helper that runs immer's `produce`, so it can compare the doc before and after and skip no-op edits in history.
-- The store also holds two pieces of UI state that are neither in history nor autosaved: `draft` (the stroke being drawn, committed by one `addNodes` on pointer-up) and `erasing` (ids the eraser has touched, rendered dimmed).
+- The store also holds three pieces of UI state that are neither in history nor autosaved: `draft` (the stroke being drawn, committed by one `addNodes` on pointer-up), `erasing` (ids the eraser has touched, rendered dimmed) and `viewport` (the measured Stage size and v1's fit scale, set by `useViewport`).
+- `view.scale` is relative to the fit, so the screen zoom is `zoomOf(state)` = `viewport.fit × view.scale`. The 0.1×–32× limits and Ctrl/Cmd + 1's 100% are screen zoom. Overlay sizes that must stay constant on screen divide by `zoomOf`, not by `view.scale` alone. On resize, the canvas point in the middle stays put and `view.scale` is kept.
+- Holding Space switches the tool to `hand` and switches back on release, so Space-drag is the hand tool's own pan.
+- The Stage fills the whole canvas area. The white artboard `Rect` is named `artboard`; the e2e tests locate it through `window.Konva.stages[0]`.
+- The brush cursor's radius stays in canvas units, so it matches the stroke at any zoom; only its outline is a constant 1 screen px.
 - `src/tools/index.ts` maps each `ToolId` to its controller, so `CanvasStage` never names a tool.
 - Autosave uses IndexedDB database `painter`, object store `kv` (idb-keyval `createStore`), key `painter:v2`.
 - Migration erases a brush point when it is within eraser radius + brush radius of the eraser path, so a crossing leaves a gap as wide as the v1 eraser even on thick strokes.

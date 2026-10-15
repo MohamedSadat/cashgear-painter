@@ -1,6 +1,15 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { Point, StrokeNode } from '../types'
-import { HISTORY_LIMIT, MAX_SIZE, MIN_SIZE, createStrokeNode, useEditorStore } from './editorStore'
+import {
+  HISTORY_LIMIT,
+  MAX_SIZE,
+  MAX_ZOOM,
+  MIN_SIZE,
+  MIN_ZOOM,
+  createStrokeNode,
+  useEditorStore,
+  zoomOf,
+} from './editorStore'
 
 const initialState = useEditorStore.getState()
 const store = () => useEditorStore.getState()
@@ -315,6 +324,108 @@ describe('settings', () => {
     store().setDraft(stroke())
     store().setErasing(['x'])
 
+    expect(store().past).toEqual([])
+  })
+})
+
+describe('view', () => {
+  // The artboard fits at half size, 800 × 500, with 100 px to spare on every side.
+  const viewport = { width: 1000, height: 700, fit: 0.5 }
+
+  /** The canvas point under a screen point of the Stage. */
+  function canvasAt([sx, sy]: [number, number]): [number, number] {
+    const { view } = store()
+    const zoom = zoomOf(store())
+    return [(sx - view.x) / zoom, (sy - view.y) / zoom]
+  }
+
+  function expectPoint(actual: [number, number], expected: [number, number]) {
+    expect(actual[0]).toBeCloseTo(expected[0], 6)
+    expect(actual[1]).toBeCloseTo(expected[1], 6)
+  }
+
+  it('fits the artboard once the canvas area is measured', () => {
+    store().zoomTo(2)
+    expect(store().view).toEqual({ scale: 1, x: 0, y: 0 })
+
+    store().setViewport(viewport)
+
+    expect(store().view).toEqual({ scale: 1, x: 100, y: 100 })
+    expect(zoomOf(store())).toBe(0.5)
+  })
+
+  it('zooms around the anchor, from MIN_ZOOM to MAX_ZOOM', () => {
+    store().setViewport(viewport)
+    const anchor: [number, number] = [300, 200]
+    const under = canvasAt(anchor)
+
+    store().zoomTo(2, anchor)
+    expect(zoomOf(store())).toBeCloseTo(2, 9)
+    expectPoint(canvasAt(anchor), under)
+
+    store().zoomTo(1000, anchor)
+    expect(zoomOf(store())).toBeCloseTo(MAX_ZOOM, 9)
+    expectPoint(canvasAt(anchor), under)
+
+    store().zoomTo(0, anchor)
+    expect(zoomOf(store())).toBeCloseTo(MIN_ZOOM, 9)
+    expectPoint(canvasAt(anchor), under)
+  })
+
+  it('zooms around the middle by default', () => {
+    store().setViewport(viewport)
+
+    store().zoomTo(1)
+
+    expect(zoomOf(store())).toBeCloseTo(1, 9)
+    expectPoint(canvasAt([500, 350]), [800, 500])
+  })
+
+  it('pans, and fits the artboard again', () => {
+    store().setViewport(viewport)
+    store().zoomTo(3)
+
+    store().panBy(10, -20)
+    const { x, y } = store().view
+    store().panBy(5, 5)
+    expect(store().view).toMatchObject({ x: x + 5, y: y + 5 })
+
+    store().fitView()
+    expect(store().view).toEqual({ scale: 1, x: 100, y: 100 })
+  })
+
+  it('keeps the middle and the zoom relative to the fit when the canvas area resizes', () => {
+    store().setViewport(viewport)
+    store().setViewport({ width: 400, height: 900, fit: 0.2 })
+    // Still fitted: 320 × 200, centered.
+    expect(store().view).toEqual({ scale: 1, x: 40, y: 350 })
+
+    store().zoomTo(2, [100, 400])
+    const middle = canvasAt([200, 450])
+    store().setViewport({ width: 800, height: 500, fit: 0.4 })
+
+    expect(store().view.scale).toBeCloseTo(10, 9)
+    expectPoint(canvasAt([400, 250]), middle)
+  })
+
+  it('ignores zoom and fit until the canvas area is measured', () => {
+    store().zoomTo(4)
+    store().fitView()
+    store().setViewport({ width: 0, height: 0, fit: 0 })
+
+    expect(store().view).toEqual({ scale: 1, x: 0, y: 0 })
+  })
+
+  it('keeps zoom and pan out of history', () => {
+    store().setViewport(viewport)
+    const doc = store().doc
+
+    store().zoomTo(2)
+    store().panBy(10, 10)
+    store().setView({ scale: 3, x: 1, y: 2 })
+    store().fitView()
+
+    expect(store().doc).toBe(doc)
     expect(store().past).toEqual([])
   })
 })

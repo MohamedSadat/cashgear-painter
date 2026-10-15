@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import { createStrokeNode, useEditorStore } from '../store/editorStore'
+import { createStrokeNode, useEditorStore, zoomOf } from '../store/editorStore'
 import type { Point, StrokeNode } from '../types'
 import { brushTool } from './brushTool'
 import { eraserTool } from './eraserTool'
+import { handTool } from './handTool'
 import { toolFor } from './index'
 import type { ToolEvent } from './types'
 
@@ -38,9 +39,10 @@ beforeEach(() => {
 })
 
 describe('toolFor', () => {
-  it('finds the brush and the eraser', () => {
+  it('finds the brush, the eraser and the hand', () => {
     expect(toolFor('brush')).toBe(brushTool)
     expect(toolFor('eraser')).toBe(eraserTool)
+    expect(toolFor('hand')).toBe(handTool)
     expect(toolFor('pen')).toBeUndefined()
   })
 })
@@ -145,5 +147,39 @@ describe('eraserTool', () => {
 
     expect(store().erasing).toEqual([])
     expect(store().doc.rootIds).toHaveLength(1)
+  })
+})
+
+describe('handTool', () => {
+  beforeEach(() => {
+    store().setViewport({ width: 1000, height: 700, fit: 0.5 })
+    store().zoomTo(2)
+  })
+
+  it('pans by the screen distance the pointer moved, outside history', () => {
+    const before = store().view
+    expect(zoomOf(store())).toBe(2)
+
+    handTool.onDown(at(100, 100))
+    // Canvas points are read at the view before the move, so 10 units are 20 screen pixels.
+    handTool.onMove(at(110, 95))
+
+    expect(store().view.scale).toBe(before.scale)
+    expect(store().view.x).toBeCloseTo(before.x + 20, 9)
+    expect(store().view.y).toBeCloseTo(before.y - 10, 9)
+    expect(store().past).toEqual([])
+  })
+
+  it('stops panning on release and on cancel', () => {
+    const before = store().view
+
+    handTool.onDown(at(0, 0))
+    handTool.onUp(at(0, 0))
+    handTool.onMove(at(50, 50))
+    handTool.onDown(at(0, 0))
+    handTool.onCancel?.()
+    handTool.onMove(at(50, 50))
+
+    expect(store().view).toEqual(before)
   })
 })

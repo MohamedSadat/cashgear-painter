@@ -12,7 +12,7 @@ const NON_TEXT_INPUTS = new Set([
   'reset',
 ])
 
-function isTextEntry(target: EventTarget | null): boolean {
+export function isTextEntry(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false
   if (target.isContentEditable) return true
   if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return true
@@ -20,7 +20,10 @@ function isTextEntry(target: EventTarget | null): boolean {
   return false
 }
 
-/** Ctrl/Cmd+Z undo · Ctrl/Cmd+Shift+Z or Ctrl+Y redo · B brush · E eraser · [ and ] brush size. */
+/**
+ * Ctrl/Cmd+Z undo · Ctrl/Cmd+Shift+Z or Ctrl+Y redo · Ctrl/Cmd+0 fit · Ctrl/Cmd+1 100% ·
+ * B brush · E eraser · H hand · [ and ] brush size. Space for the hand tool is in useViewport.
+ */
 export function useShortcuts(): void {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -36,6 +39,13 @@ export function useShortcuts(): void {
         } else if (key === 'y') {
           e.preventDefault()
           store.redo()
+        } else if (key === '0') {
+          // Instead of the browser's own zoom reset.
+          e.preventDefault()
+          store.fitView()
+        } else if (key === '1') {
+          e.preventDefault()
+          store.zoomTo(1)
         }
         return
       }
@@ -46,6 +56,7 @@ export function useShortcuts(): void {
       const step = Math.max(1, Math.round(size / 8))
       if (key === 'b') store.setTool('brush')
       else if (key === 'e') store.setTool('eraser')
+      else if (key === 'h') store.setTool('hand')
       else if (e.key === '[') store.setBrush({ size: size - step })
       else if (e.key === ']') store.setBrush({ size: size + step })
     }
