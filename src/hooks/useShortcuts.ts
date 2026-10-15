@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { usePaintStore } from '../store/paintStore'
+import { useEditorStore } from '../store/editorStore'
 
 // Inputs that don't take typed text; shortcuts keep working while one of these has focus.
 const NON_TEXT_INPUTS = new Set([
@@ -25,7 +25,7 @@ export function useShortcuts(): void {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (isTextEntry(e.target)) return
-      const store = usePaintStore.getState()
+      const store = useEditorStore.getState()
       const key = e.key.toLowerCase()
 
       if (e.ctrlKey || e.metaKey) {
@@ -42,11 +42,12 @@ export function useShortcuts(): void {
       if (e.altKey) return
 
       // Bigger steps for bigger brushes, so the whole 1–64 range is a few presses away.
-      const step = Math.max(1, Math.round(store.size / 8))
+      const { size } = store.brush
+      const step = Math.max(1, Math.round(size / 8))
       if (key === 'b') store.setTool('brush')
       else if (key === 'e') store.setTool('eraser')
-      else if (e.key === '[') store.setSize(store.size - step)
-      else if (e.key === ']') store.setSize(store.size + step)
+      else if (e.key === '[') store.setBrush({ size: size - step })
+      else if (e.key === ']') store.setBrush({ size: size + step })
     }
 
     window.addEventListener('keydown', onKeyDown)

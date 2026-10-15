@@ -1,0 +1,320 @@
+import { beforeEach, describe, expect, it } from 'vitest'
+import type { Point, StrokeNode } from '../types'
+import { HISTORY_LIMIT, MAX_SIZE, MIN_SIZE, createStrokeNode, useEditorStore } from './editorStore'
+
+const initialState = useEditorStore.getState()
+const store = () => useEditorStore.getState()
+const point = (x: number, y: number, pressure = 0.5): Point => [x, y, pressure]
+
+function stroke(x = 0, id?: string): StrokeNode {
+  return createStrokeNode(
+    [point(x, 0), point(x + 10, 10)],
+    { color: '#000000', size: 8, usesPressure: false },
+    id,
+  )
+}
+
+/** Adds one stroke as its own history step and returns it. */
+function draw(x = 0, id?: string): StrokeNode {
+  const node = stroke(x, id)
+  store().addNodes([node])
+  return node
+}
+
+const ids = () => store().doc.rootIds
+const node = (id: string) => store().doc.nodes[id] as StrokeNode
+
+beforeEach(() => {
+  useEditorStore.setState(initialState, true)
+})
+
+describe('nodes', () => {
+  it('adds nodes at the top of the z-order', () => {
+    const a = draw(0)
+    const b = draw(100)
+
+    expect(ids()).toEqual([a.id, b.id])
+    expect(store().doc.nodes[a.id]).toBe(a)
+  })
+
+  it('skips nodes whose id already exists', () => {
+    const a = draw(0, 'same')
+    store().addNodes([stroke(50, 'same')])
+
+    expect(ids()).toEqual(['same'])
+    expect(store().doc.nodes.same).toBe(a)
+    expect(store().past).toHaveLength(1)
+  })
+
+  it('updates only the nodes it names, keeping the others as the same objects', () => {
+    const a = draw(0)
+    const b = draw(100)
+
+    store().updateNodes({ [a.id]: { size: 20 } })
+
+    expect(node(a.id).size).toBe(20)
+    expect(store().doc.nodes[b.id]).toBe(b)
+  })
+
+  it('deletes nodes from the map and the z-order', () => {
+    const a = draw(0)
+    const b = draw(100)
+
+    store().deleteNodes([a.id])
+
+    expect(ids()).toEqual([b.id])
+    expect(store().doc.nodes[a.id]).toBeUndefined()
+  })
+
+  it('records nothing for edits that change nothing', () => {
+    const a = draw(0)
+    const before = store().doc
+
+    store().updateNodes({ missing: { size: 2 } })
+    store().updateNodes({ [a.id]: { size: a.size } })
+    store().deleteNodes(['missing'])
+    store().addNodes([a])
+
+    expect(store().doc).toBe(before)
+    expect(store().past).toHaveLength(1)
+  })
+})
+
+describe('history', () => {
+  it('undoes and redoes edits', () => {
+    const a = draw(0)
+    const b = draw(100)
+
+    store().undo()
+    expect(ids()).toEqual([a.id])
+
+    store().redo()
+    expect(ids()).toEqual([a.id, b.id])
+  })
+
+  it('reuses the same doc and node objects across undo and redo', () => {
+    const a = draw()
+    const doc = store().doc
+
+    store().undo()
+    store().redo()
+
+    expect(store().doc).toBe(doc)
+    expect(store().doc.nodes[a.id]).toBe(a)
+  })
+
+  it('can undo a clear', () => {
+    draw(0)
+    draw(100)
+    const before = store().doc
+
+    store().clear()
+    expect(ids()).toEqual([])
+
+    store().undo()
+    expect(store().doc).toBe(before)
+  })
+
+  it('can redo a clear', () => {
+    draw()
+    store().clear()
+    store().undo()
+    store().redo()
+
+    expect(ids()).toEqual([])
+    expect(store().doc.nodes).toEqual({})
+  })
+
+  it('does not record a step when clearing an empty canvas', () => {
+    store().clear()
+
+    expect(store().past).toEqual([])
+  })
+
+  it('empties the redo stack when a new edit is made', () => {
+    draw(0)
+    draw(100)
+    store().undo()
+    expect(store().future).toHaveLength(1)
+
+    draw(200)
+
+    expect(store().future).toEqual([])
+    store().redo()
+    expect(ids()).toHaveLength(2)
+  })
+
+  it('keeps deletions in history like any other edit', () => {
+    const a = draw(0)
+    const b = draw(100)
+    store().deleteNodes([a.id])
+
+    store().undo()
+    expect(ids()).toEqual([a.id, b.id])
+
+    store().redo()
+    expect(ids()).toEqual([b.id])
+  })
+
+  it(`caps the undo stack at ${HISTORY_LIMIT} steps`, () => {
+    for (let i = 0; i < HISTORY_LIMIT + 20; i++) draw(i)
+
+    expect(store().past).toHaveLength(HISTORY_LIMIT)
+
+    for (let i = 0; i < HISTORY_LIMIT + 20; i++) store().undo()
+
+    // The oldest 20 steps were dropped, so undo stops with 20 strokes left.
+    expect(store().past).toEqual([])
+    expect(ids()).toHaveLength(20)
+  })
+
+  it('does nothing when there is nothing to undo or redo', () => {
+    store().undo()
+    store().redo()
+
+    expect(ids()).toEqual([])
+    expect(store().past).toEqual([])
+    expect(store().future).toEqual([])
+  })
+
+  it('drops selected ids that the restored doc no longer has', () => {
+    const a = draw(0)
+    const b = draw(100)
+    store().select([a.id, b.id])
+
+    store().undo()
+    expect(store().selection).toEqual([a.id])
+
+    store().redo()
+    expect(store().selection).toEqual([a.id])
+  })
+})
+
+describe('gestures', () => {
+  it('records a whole drag as one undo step', () => {
+    const a = draw(0)
+    const before = store().doc
+
+    store().beginGesture()
+    for (let size = 9; size <= 30; size++) {
+      store().updateNodes({ [a.id]: { size } })
+    }
+    expect(store().past).toHaveLength(1)
+    store().endGesture()
+
+    expect(node(a.id).size).toBe(30)
+    expect(store().past).toHaveLength(2)
+
+    store().undo()
+    expect(store().doc).toBe(before)
+  })
+
+  it('records nothing for a gesture that changed nothing', () => {
+    draw(0)
+
+    store().beginGesture()
+    store().endGesture()
+
+    expect(store().past).toHaveLength(1)
+    expect(store().gestureStart).toBeNull()
+  })
+
+  it('empties the redo stack when a gesture changes the doc', () => {
+    const a = draw(0)
+    draw(100)
+    store().undo()
+
+    store().beginGesture()
+    store().updateNodes({ [a.id]: { size: 12 } })
+    store().endGesture()
+
+    expect(store().future).toEqual([])
+  })
+
+  it('ignores undo and redo while a gesture is open', () => {
+    const a = draw(0)
+    store().beginGesture()
+    store().updateNodes({ [a.id]: { size: 12 } })
+
+    store().undo()
+    store().redo()
+
+    expect(node(a.id).size).toBe(12)
+    store().endGesture()
+    expect(store().past).toHaveLength(2)
+  })
+
+  it('ignores a second beginGesture while one is open', () => {
+    const a = draw(0)
+    const before = store().doc
+
+    store().beginGesture()
+    store().updateNodes({ [a.id]: { size: 12 } })
+    store().beginGesture()
+    store().updateNodes({ [a.id]: { size: 16 } })
+    store().endGesture()
+
+    store().undo()
+    expect(store().doc).toBe(before)
+  })
+})
+
+describe('selection', () => {
+  it('replaces, adds and toggles, ignoring unknown ids', () => {
+    const a = draw(0)
+    const b = draw(100)
+
+    store().select([a.id, 'missing'])
+    expect(store().selection).toEqual([a.id])
+
+    store().select([b.id], 'add')
+    expect(store().selection).toEqual([a.id, b.id])
+
+    store().select([a.id], 'toggle')
+    expect(store().selection).toEqual([b.id])
+  })
+
+  it('drops deleted and cleared nodes from the selection', () => {
+    const a = draw(0)
+    const b = draw(100)
+    store().select([a.id, b.id])
+
+    store().deleteNodes([a.id])
+    expect(store().selection).toEqual([b.id])
+
+    store().clear()
+    expect(store().selection).toEqual([])
+  })
+})
+
+describe('settings', () => {
+  it(`clamps brush size to ${MIN_SIZE}–${MAX_SIZE} whole units`, () => {
+    store().setBrush({ size: 0 })
+    expect(store().brush.size).toBe(MIN_SIZE)
+
+    store().setBrush({ size: 500 })
+    expect(store().brush.size).toBe(MAX_SIZE)
+
+    store().setBrush({ size: 12.6 })
+    expect(store().brush.size).toBe(13)
+
+    store().setBrush({ size: Number.NaN })
+    expect(store().brush.size).toBe(MIN_SIZE)
+  })
+
+  it('changes the color without touching the size', () => {
+    store().setBrush({ size: 20 })
+    store().setBrush({ color: '#ef4444' })
+
+    expect(store().brush).toEqual({ color: '#ef4444', size: 20 })
+  })
+
+  it('keeps tool, brush, draft and erasing out of history', () => {
+    store().setTool('eraser')
+    store().setBrush({ color: '#ef4444', size: 20 })
+    store().setDraft(stroke())
+    store().setErasing(['x'])
+
+    expect(store().past).toEqual([])
+  })
+})

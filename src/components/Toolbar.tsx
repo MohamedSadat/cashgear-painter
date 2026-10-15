@@ -1,6 +1,6 @@
 import { Brush, Download, Eraser, Redo2, Trash2, Undo2 } from 'lucide-react'
 import type { ReactNode } from 'react'
-import { MAX_SIZE, MIN_SIZE, usePaintStore } from '../store/paintStore'
+import { MAX_SIZE, MIN_SIZE, useEditorStore } from '../store/editorStore'
 
 const SWATCHES = [
   '#000000',
@@ -47,17 +47,17 @@ interface ToolbarProps {
 }
 
 export function Toolbar({ onExport }: ToolbarProps) {
-  const tool = usePaintStore((s) => s.tool)
-  const color = usePaintStore((s) => s.color)
-  const size = usePaintStore((s) => s.size)
-  const canUndo = usePaintStore((s) => s.past.length > 0)
-  const canRedo = usePaintStore((s) => s.future.length > 0)
-  const canClear = usePaintStore((s) => s.strokes.length > 0)
-  const { setTool, setColor, setSize, undo, redo, clear } = usePaintStore.getState()
+  const tool = useEditorStore((s) => s.tool)
+  const color = useEditorStore((s) => s.brush.color)
+  const size = useEditorStore((s) => s.brush.size)
+  const canUndo = useEditorStore((s) => s.past.length > 0)
+  const canRedo = useEditorStore((s) => s.future.length > 0)
+  const canClear = useEditorStore((s) => s.doc.rootIds.length > 0)
+  const { setTool, setBrush, undo, redo, clear } = useEditorStore.getState()
 
   // Picking a color means you want to paint with it.
   const pickColor = (c: string) => {
-    setColor(c)
+    setBrush({ color: c })
     setTool('brush')
   }
   const isCustomColor = !SWATCHES.includes(color)
@@ -123,7 +123,7 @@ export function Toolbar({ onExport }: ToolbarProps) {
           min={MIN_SIZE}
           max={MAX_SIZE}
           value={size}
-          onChange={(e) => setSize(Number(e.target.value))}
+          onChange={(e) => setBrush({ size: Number(e.target.value) })}
           className="w-24 accent-sky-600 sm:w-32"
         />
         <span className="w-5 text-right tabular-nums">{size}</span>

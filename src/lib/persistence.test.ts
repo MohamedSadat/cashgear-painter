@@ -1,121 +1,164 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createStore } from 'zustand/vanilla'
-import type { Stroke } from '../types'
-import { SAVE_DELAY_MS, STORAGE_KEY, loadStrokes, saveStrokes, startAutosave } from './persistence'
+import { createStrokeNode } from '../store/editorStore'
+import { emptyDoc, type Doc, type Point, type StrokeNode } from '../types'
+import {
+  SAVE_DELAY_MS,
+  STORAGE_KEY,
+  loadDoc,
+  sanitizeDoc,
+  saveDoc,
+  startAutosave,
+  type KeyValueStore,
+} from './persistence'
 
-function memoryStorage(): Storage {
-  const data = new Map<string, string>()
+/** An in-memory stand-in for IndexedDB; values are cloned like structured clone would. */
+function memoryStore(): KeyValueStore & { data: Map<string, unknown> } {
+  const data = new Map<string, unknown>()
   return {
-    get length() {
-      return data.size
-    },
-    clear: () => data.clear(),
-    getItem: (key) => data.get(key) ?? null,
-    key: (index) => [...data.keys()][index] ?? null,
-    removeItem: (key) => {
-      data.delete(key)
-    },
-    setItem: (key, value) => {
-      data.set(key, String(value))
+    data,
+    get: async (key) => structuredClone(data.get(key)),
+    set: async (key, value) => {
+      data.set(key, structuredClone(value))
     },
   }
 }
 
-const stroke = (overrides: Partial<Stroke> = {}): Stroke => ({
-  id: 's1',
-  tool: 'brush',
-  color: '#000000',
-  size: 8,
-  usesPressure: false,
-  points: [
-    [10.04, 20.06, 0.5],
-    [30.15, 40.149, 0.5],
-  ],
-  ...overrides,
-})
+const stroke = (id: string, points: Point[] = [[10.04, 20.06, 0.5]]): StrokeNode =>
+  createStrokeNode(points, { color: '#000000', size: 8, usesPressure: false }, id)
+
+function docWith(...nodes: StrokeNode[]): Doc {
+  const doc = emptyDoc()
+  for (const node of nodes) {
+    doc.nodes[node.id] = node
+    doc.rootIds.push(node.id)
+  }
+  return doc
+}
 
 afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
 })
 
-describe('saveStrokes and loadStrokes', () => {
-  it('round-trips strokes, rounding coordinates to 1 decimal', () => {
-    const storage = memoryStorage()
+describe('saveDoc and loadDoc', () => {
+  it('round-trips the doc, rounding coordinates to 1 decimal and pressure to 2', async () => {
+    const kv = memoryStore()
 
-    expect(saveStrokes([stroke({ points: [[10.04, 20.06, 0.123]] })], storage)).toBe(true)
+    expect(await saveDoc(docWith(stroke('a', [[10.04, 20.06, 0.123]])), kv)).toBe(true)
 
-    expect(loadStrokes(storage)).toEqual([stroke({ points: [[10, 20.1, 0.12]] })])
+    expect(await loadDoc(kv)).toEqual(docWith(stroke('a', [[10, 20.1, 0.12]])))
   })
 
-  it('loads an empty canvas when nothing is saved', () => {
-    expect(loadStrokes(memoryStorage())).toEqual([])
-    expect(loadStrokes(null)).toEqual([])
+  it('loads nothing when nothing is saved or there is no storage', async () => {
+    expect(await loadDoc(memoryStore())).toBeUndefined()
+    expect(await loadDoc(null)).toBeUndefined()
   })
 
-  it('loads an empty canvas from corrupt data', () => {
-    const storage = memoryStorage()
-    storage.setItem(STORAGE_KEY, '{not json')
-
-    expect(loadStrokes(storage)).toEqual([])
-  })
-
-  it('drops malformed strokes and keeps the valid ones', () => {
-    const storage = memoryStorage()
-    const valid = stroke()
-    storage.setItem(
-      STORAGE_KEY,
-      JSON.stringify([
-        valid,
-        { id: 'x' },
-        stroke({ points: [] }),
-        stroke({ tool: 'pencil' as 'brush' }),
-      ]),
-    )
-
-    expect(loadStrokes(storage)).toEqual([valid])
-  })
-
-  it('reports a full quota instead of throwing', () => {
+  it('loads nothing when storage can not be read', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const storage = memoryStorage()
-    storage.setItem = () => {
-      throw new DOMException('Quota exceeded', 'QuotaExceededError')
-    }
+    const kv = memoryStore()
+    kv.get = () => Promise.reject(new DOMException('Blocked', 'SecurityError'))
 
-    expect(saveStrokes([stroke()], storage)).toBe(false)
+    expect(await loadDoc(kv)).toBeUndefined()
+  })
+
+  it('loads an empty doc from unreadable data', async () => {
+    const kv = memoryStore()
+    kv.data.set(STORAGE_KEY, '{not a doc')
+
+    expect(await loadDoc(kv)).toEqual(emptyDoc())
+  })
+
+  it('reports a failed write instead of throwing', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const kv = memoryStore()
+    kv.set = () => Promise.reject(new DOMException('Quota exceeded', 'QuotaExceededError'))
+
+    expect(await saveDoc(docWith(stroke('a')), kv)).toBe(false)
+    expect(await saveDoc(docWith(stroke('a')), null)).toBe(false)
+  })
+})
+
+describe('sanitizeDoc', () => {
+  it('rejects other versions and shapes', () => {
+    expect(sanitizeDoc(null)).toEqual(emptyDoc())
+    expect(sanitizeDoc([])).toEqual(emptyDoc())
+    expect(sanitizeDoc({ ...docWith(stroke('a')), version: 3 })).toEqual(emptyDoc())
+    expect(sanitizeDoc({ ...docWith(stroke('a')), rootIds: 'a' })).toEqual(emptyDoc())
+  })
+
+  it('drops malformed nodes and keeps the valid ones in order', () => {
+    const valid = stroke('ok')
+    const doc = docWith(
+      stroke('a'),
+      valid,
+      { ...stroke('b'), points: [] },
+      { ...stroke('c'), style: { ...valid.style, opacity: Number.NaN } },
+    )
+    doc.nodes.a = { ...stroke('a'), id: 'other' }
+    doc.rootIds.push('missing', 'ok')
+
+    expect(sanitizeDoc(doc)).toEqual(docWith(valid))
+  })
+
+  it('drops node types that have no checks yet', () => {
+    const doc = docWith(stroke('a'))
+    doc.nodes.r = {
+      ...stroke('r'),
+      type: 'rect',
+      width: 10,
+      height: 10,
+      cornerRadius: 0,
+    } as unknown as StrokeNode
+    doc.rootIds.push('r')
+
+    expect(sanitizeDoc(doc).rootIds).toEqual(['a'])
   })
 })
 
 describe('startAutosave', () => {
-  it(`saves ${SAVE_DELAY_MS} ms after the strokes stop changing`, () => {
+  it(`saves ${SAVE_DELAY_MS} ms after the doc stops changing`, async () => {
     vi.useFakeTimers()
-    const storage = memoryStorage()
-    const store = createStore<{ strokes: Stroke[] }>()(() => ({ strokes: [] }))
-    const stop = startAutosave(store, storage)
+    const kv = memoryStore()
+    const store = createStore<{ doc: Doc }>()(() => ({ doc: emptyDoc() }))
+    const stop = startAutosave(store, kv)
 
-    store.setState({ strokes: [stroke({ id: 'a' })] })
+    store.setState({ doc: docWith(stroke('a')) })
     vi.advanceTimersByTime(SAVE_DELAY_MS - 100)
-    store.setState({ strokes: [stroke({ id: 'a' }), stroke({ id: 'b' })] })
+    store.setState({ doc: docWith(stroke('a'), stroke('b')) })
     vi.advanceTimersByTime(SAVE_DELAY_MS - 1)
-    expect(storage.getItem(STORAGE_KEY)).toBeNull()
+    expect(kv.data.has(STORAGE_KEY)).toBe(false)
 
     vi.advanceTimersByTime(1)
-    expect(loadStrokes(storage).map((s) => s.id)).toEqual(['a', 'b'])
+    expect((await loadDoc(kv))?.rootIds).toEqual(['a', 'b'])
 
     stop()
   })
 
   it('stops saving once stopped', () => {
     vi.useFakeTimers()
-    const storage = memoryStorage()
-    const store = createStore<{ strokes: Stroke[] }>()(() => ({ strokes: [] }))
-    const stop = startAutosave(store, storage)
+    const kv = memoryStore()
+    const store = createStore<{ doc: Doc }>()(() => ({ doc: emptyDoc() }))
+    const stop = startAutosave(store, kv)
 
-    store.setState({ strokes: [stroke()] })
+    store.setState({ doc: docWith(stroke('a')) })
     stop()
     vi.advanceTimersByTime(SAVE_DELAY_MS * 2)
 
-    expect(storage.getItem(STORAGE_KEY)).toBeNull()
+    expect(kv.data.has(STORAGE_KEY)).toBe(false)
+  })
+
+  it('ignores state changes that leave the doc alone', () => {
+    vi.useFakeTimers()
+    const kv = memoryStore()
+    const store = createStore<{ doc: Doc; other: number }>()(() => ({ doc: emptyDoc(), other: 0 }))
+    const stop = startAutosave(store, kv)
+
+    store.setState({ other: 1 })
+    vi.advanceTimersByTime(SAVE_DELAY_MS * 2)
+
+    expect(kv.data.has(STORAGE_KEY)).toBe(false)
+    stop()
   })
 })
