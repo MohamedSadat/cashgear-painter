@@ -11,7 +11,7 @@ import {
   useEditorStore,
   zoomOf,
 } from '../store/editorStore'
-import type { Anchor, PathNode, Point, StrokeNode, TextNode } from '../types'
+import type { Anchor, GroupNode, PathNode, Point, StrokeNode, TextNode } from '../types'
 import { brushTool } from './brushTool'
 import {
   deleteActiveAnchor,
@@ -1187,5 +1187,158 @@ describe('eraserTool in groups', () => {
     eraserTool.onDown(at(50, 600))
     eraserTool.onUp(at(50, 600))
     expect(store().doc.nodes).toEqual({})
+  })
+})
+
+describe('eraserTool in split mode', () => {
+  beforeEach(() => {
+    store().setEraserMode('split')
+    store().setBrush({ size: 10 })
+  })
+
+  const xs = (id: string) => (store().doc.nodes[id] as StrokeNode).points.map(([x]) => x)
+
+  it('cuts strokes as it moves, and the pass is one undo step', () => {
+    const top = addLine(0)
+    const bottom = addLine(100)
+    const before = store().doc
+
+    eraserTool.onDown(at(50, -40))
+    eraserTool.onMove(at(50, 40)) // a fast swipe across the top line only
+    const [, cutOff] = store().doc.rootIds
+    expect(store().doc.rootIds).toEqual([top.id, cutOff, bottom.id])
+    // Reach is eraser radius 5 + brush radius 4.
+    expect(xs(top.id)[1]).toBeCloseTo(41, 1)
+    expect(xs(cutOff)[0]).toBeCloseTo(59, 1)
+    expect(store().erasing).toEqual([])
+
+    eraserTool.onMove(at(80, 40))
+    eraserTool.onMove(at(80, -40)) // a second cut, through the piece on the right
+    eraserTool.onUp(at(80, -40))
+
+    expect(store().doc.rootIds).toHaveLength(4)
+    expect(store().doc.nodes[bottom.id]).toBe(bottom)
+    expect(store().past).toHaveLength(3)
+    expect(store().past.at(-1)).toBe(before)
+    store().undo()
+    expect(store().doc).toBe(before)
+  })
+
+  it('deletes a stroke it covers whole, and a group that empties', () => {
+    const short = addLine(0, {
+      points: [
+        [45, 0, 0.5],
+        [55, 0, 0.5],
+      ],
+    })
+    const other = addLine(100)
+    store().group([short.id])
+
+    eraserTool.onDown(at(50, 0))
+    eraserTool.onUp(at(50, 0))
+
+    expect(store().doc.rootIds).toEqual([other.id])
+    expect(Object.keys(store().doc.nodes)).toEqual([other.id])
+  })
+
+  it('leaves shapes, paths, text, and hidden or locked strokes alone', () => {
+    const rect = createRectNode(
+      { x: 0, y: -50, width: 100, height: 100 },
+      {
+        ...DEFAULT_SHAPE_STYLE,
+        fill: '#ef4444',
+      },
+    )
+    const line = createLineNode([0, 0], [100, 0], DEFAULT_SHAPE_STYLE)
+    const path = createPathNode([corner(0, 0), corner(100, 0)], false, DEFAULT_SHAPE_STYLE)
+    const text = createTextNode(0, -20, 100, DEFAULT_TEXT_STYLE, 'Hi')
+    store().addNodes([rect, line, path, text])
+    addLine(0, { hidden: true })
+    addLine(0, { locked: true })
+    const before = store().doc
+    const steps = store().past.length
+
+    eraserTool.onDown(at(50, -40))
+    eraserTool.onMove(at(50, 40))
+    eraserTool.onUp(at(50, 40))
+
+    expect(store().doc).toBe(before)
+    expect(store().past).toHaveLength(steps)
+  })
+
+  it('cuts a stroke in a turned group where the group puts it', () => {
+    const a = addLine(0)
+    store().group([a.id])
+    const [groupId] = store().selection
+    // A quarter turn about (200, 0): the stroke runs down x = 200 from y = 0 to 100.
+    store().updateNodes({
+      [groupId]: { transform: { x: 200, y: 0, rotation: 90, scaleX: 1, scaleY: 1 } },
+    })
+
+    eraserTool.onDown(at(150, 50))
+    eraserTool.onMove(at(250, 50))
+    eraserTool.onUp(at(250, 50))
+
+    const children = (store().doc.nodes[groupId] as GroupNode).childIds
+    expect(children).toHaveLength(2)
+    expect(children[0]).toBe(a.id)
+    expect(xs(a.id)[1]).toBeCloseTo(41, 1)
+    expect(xs(children[1])[0]).toBeCloseTo(59, 1)
+    expect(store().doc.nodes[children[1]]).toMatchObject({ parentId: groupId })
+  })
+
+  it('cuts a scaled stroke as wide as the eraser on the canvas', () => {
+    // Twice the size: the stroke runs from x = 0 to 200 along y = 0.
+    const a = addLine(0, { transform: { x: 0, y: 0, rotation: 0, scaleX: 2, scaleY: 2 } })
+
+    eraserTool.onDown(at(100, -40))
+    eraserTool.onMove(at(100, 40))
+    eraserTool.onUp(at(100, 40))
+
+    // Reach on the canvas is 5 + 8: from x = 87 to 113, which is 43.5 to 56.5 in its own units.
+    const [, other] = store().doc.rootIds
+    expect(xs(a.id)[1]).toBeCloseTo(43.5, 1)
+    expect(xs(other)[0]).toBeCloseTo(56.5, 1)
+    expect(store().doc.nodes[other].transform).toEqual(a.transform)
+  })
+
+  it('puts back what it cut on cancel, as a pinch does', () => {
+    addLine(0)
+    const before = store().doc
+    const past = store().past
+
+    eraserTool.onDown(at(50, -40))
+    eraserTool.onMove(at(50, 40))
+    expect(store().doc.rootIds).toHaveLength(2)
+    eraserTool.onCancel?.()
+    eraserTool.onUp(at(50, 40))
+
+    expect(store().doc).toBe(before)
+    expect(store().past).toBe(past)
+    expect(store().gestureStart).toBeNull()
+  })
+
+  it("leaves another tool's gesture alone when cancelled between passes", () => {
+    const a = addLine(0)
+    store().beginGesture()
+    store().updateNodes({ [a.id]: { size: 20 } })
+
+    eraserTool.onCancel?.()
+
+    expect(store().gestureStart).not.toBeNull()
+    expect((store().doc.nodes[a.id] as StrokeNode).size).toBe(20)
+    store().endGesture()
+  })
+
+  it('keeps the mode a pass started with', () => {
+    const a = addLine(0)
+
+    eraserTool.onDown(at(50, -40))
+    store().setEraserMode('object')
+    eraserTool.onMove(at(50, 40))
+    eraserTool.onUp(at(50, 40))
+
+    expect(store().doc.rootIds).toHaveLength(2)
+    expect(store().doc.rootIds[0]).toBe(a.id)
   })
 })

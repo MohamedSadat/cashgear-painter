@@ -81,6 +81,9 @@ export interface Brush {
   size: number
 }
 
+/** What the eraser does: delete whole objects, or cut through freehand strokes. */
+export type EraserMode = 'object' | 'split'
+
 export interface View {
   scale: number // multiplies the viewport's fit scale; 1 = the artboard fits
   x: number // Stage position, in screen pixels
@@ -112,6 +115,7 @@ export interface EditorState {
   gestureStart: Doc | null // doc when the current drag began
   tool: ToolId
   brush: Brush
+  eraserMode: EraserMode // not in history or autosave
   shapeStyle: Style // for new rects, ellipses and lines; not in history or autosave
   view: View // zoom and pan, not in history
   viewport: Viewport // measured canvas area; not in history or autosave
@@ -129,6 +133,7 @@ export interface EditorState {
   replaceDoc(doc: Doc): void
   updateNodes(patch: Record<NodeId, Partial<VectorNode>>, mergeKey?: string): void
   deleteNodes(ids: NodeId[]): void
+  splitStrokes(cuts: Record<NodeId, Point[][]>): void
   reorder(ids: NodeId[], where: ZOrder): void
   group(ids: NodeId[]): void
   ungroup(id: NodeId): void
@@ -147,6 +152,7 @@ export interface EditorState {
   select(ids: NodeId[], mode?: 'replace' | 'add' | 'toggle'): void
   setTool(t: ToolId): void
   setBrush(brush: Partial<Brush>): void
+  setEraserMode(mode: EraserMode): void
   setShapeStyle(style: Partial<Style>): void
   setDraft(node: VectorNode | null): void
   setErasing(ids: NodeId[]): void
@@ -582,6 +588,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     gestureStart: null,
     tool: 'brush',
     brush: { color: '#000000', size: 8 },
+    eraserMode: 'object',
     shapeStyle: DEFAULT_SHAPE_STYLE,
     view: { scale: 1, x: 0, y: 0 },
     viewport: { width: 0, height: 0, fit: 0 },
@@ -671,6 +678,33 @@ export const useEditorStore = create<EditorState>()((set, get) => {
         for (const id of doomed) delete doc.nodes[id]
         // A group never stays empty.
         dropEmptyGroups(doc, parents)
+      })
+    },
+
+    splitStrokes(cuts) {
+      const { doc } = get()
+      commit((draft) => {
+        const parents = new Set<NodeId | null>()
+        for (const [id, runs] of Object.entries(cuts)) {
+          const stroke = doc.nodes[id]
+          const node = draft.nodes[id]
+          if (stroke?.type !== 'stroke' || node?.type !== 'stroke') continue
+          if (runs.length === 0) {
+            detach(draft, id)
+            delete draft.nodes[id]
+            parents.add(stroke.parentId)
+            continue
+          }
+          // The first run keeps the stroke; the others are copies just above it, in their order
+          // along the stroke.
+          node.points = runs[0]
+          const copies = runs.slice(1).map((points) => ({ ...stroke, id: newNodeId(), points }))
+          for (const copy of copies) draft.nodes[copy.id] = copy
+          const siblings = siblingsOf(draft, stroke.parentId)
+          siblings.splice(siblings.indexOf(id) + 1, 0, ...copies.map((copy) => copy.id))
+        }
+        // A group never stays empty.
+        dropEmptyGroups(draft, parents)
       })
     },
 
@@ -920,6 +954,10 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     setBrush(brush) {
       const current = get().brush
       set({ brush: { ...current, ...brush, size: clampSize(brush.size ?? current.size) } })
+    },
+
+    setEraserMode(mode) {
+      set({ eraserMode: mode })
     },
 
     setShapeStyle(style) {

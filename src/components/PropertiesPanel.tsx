@@ -28,6 +28,7 @@ import {
   MIN_SIZE,
   canConvertToPath,
   useEditorStore,
+  type EraserMode,
   type ZOrder,
 } from '../store/editorStore'
 import { activeAnchorOf, deleteActiveAnchor, setActiveAnchorKind } from '../tools/directTool'
@@ -243,10 +244,47 @@ const ARRANGE: { label: string; title: string; where: ZOrder; icon: ReactNode }[
   },
 ]
 
-const ANCHOR_KINDS: { kind: AnchorKind; label: string; title: string }[] = [
-  { kind: 'corner', label: 'Corner', title: 'Corner: handles move on their own' },
-  { kind: 'smooth', label: 'Smooth', title: 'Smooth: handles stay in line' },
-  { kind: 'symmetric', label: 'Symmetric', title: 'Symmetric: handles stay in line and equal' },
+interface Choice<T extends string> {
+  value: T
+  label: string
+  title: string
+}
+
+interface ChoicesProps<T extends string> {
+  label: string
+  options: Choice<T>[]
+  value: T
+  onPick(value: T): void
+}
+
+/** Buttons for one of a few options, the current one pressed, such as an anchor's kind. */
+function Choices<T extends string>({ label, options, value, onPick }: ChoicesProps<T>) {
+  return (
+    <div role="group" aria-label={label} className="flex items-center gap-0.5">
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          aria-pressed={value === option.value}
+          title={option.title}
+          onClick={() => onPick(option.value)}
+          className={`h-8 rounded-md px-2 text-xs transition-colors ${
+            value === option.value
+              ? 'bg-sky-100 text-sky-700'
+              : 'text-neutral-700 hover:bg-neutral-100'
+          }`}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+const ANCHOR_KINDS: Choice<AnchorKind>[] = [
+  { value: 'corner', label: 'Corner', title: 'Corner: handles move on their own' },
+  { value: 'smooth', label: 'Smooth', title: 'Smooth: handles stay in line' },
+  { value: 'symmetric', label: 'Symmetric', title: 'Symmetric: handles stay in line and equal' },
 ]
 
 /** Direct select's active anchor: its kind, and a delete button for touch screens. */
@@ -258,24 +296,12 @@ function AnchorRow() {
   if (kind === null) return null
   return (
     <Row label="Anchor">
-      <div role="group" aria-label="Anchor kind" className="flex items-center gap-0.5">
-        {ANCHOR_KINDS.map((option) => (
-          <button
-            key={option.kind}
-            type="button"
-            aria-pressed={kind === option.kind}
-            title={option.title}
-            onClick={() => setActiveAnchorKind(option.kind)}
-            className={`h-8 rounded-md px-2 text-xs transition-colors ${
-              kind === option.kind
-                ? 'bg-sky-100 text-sky-700'
-                : 'text-neutral-700 hover:bg-neutral-100'
-            }`}
-          >
-            {option.label}
-          </button>
-        ))}
-      </div>
+      <Choices
+        label="Anchor kind"
+        options={ANCHOR_KINDS}
+        value={kind}
+        onPick={setActiveAnchorKind}
+      />
       <IconButton
         label="Delete anchor"
         title="Delete anchor (Del)"
@@ -628,10 +654,21 @@ function TextDefaults() {
   )
 }
 
+const ERASER_MODES: Choice<EraserMode>[] = [
+  { value: 'object', label: 'Object', title: 'Object: deletes every object it touches' },
+  { value: 'split', label: 'Split', title: 'Split: erases parts of freehand strokes' },
+]
+
+const ERASER_HINTS: Record<EraserMode, string> = {
+  object: 'Deletes every object it touches.',
+  split: 'Erases parts of freehand strokes. Shapes, paths and text stay.',
+}
+
 function BrushProperties({ eraser }: { eraser: boolean }) {
   const color = useEditorStore((s) => s.brush.color)
   const size = useEditorStore((s) => s.brush.size)
-  const { setBrush } = store()
+  const eraserMode = useEditorStore((s) => s.eraserMode)
+  const { setBrush, setEraserMode } = store()
   return (
     <>
       <Header title={eraser ? 'Eraser' : 'Brush'} />
@@ -653,6 +690,19 @@ function BrushProperties({ eraser }: { eraser: boolean }) {
         value={size}
         onChange={(n) => setBrush({ size: n })}
       />
+      {eraser && (
+        <>
+          <Row label="Mode">
+            <Choices
+              label="Eraser mode"
+              options={ERASER_MODES}
+              value={eraserMode}
+              onPick={setEraserMode}
+            />
+          </Row>
+          <p className="text-xs text-neutral-500">{ERASER_HINTS[eraserMode]}</p>
+        </>
+      )}
     </>
   )
 }

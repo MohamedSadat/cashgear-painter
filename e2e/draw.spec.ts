@@ -289,6 +289,22 @@ test('opens a v1 drawing with its eraser strokes applied', async ({ page }) => {
     [1000, 1000],
   ])
   expect(values).toEqual([WHITE, BLACK])
+
+  // The pieces are ordinary strokes: one selects, moves and deletes, a step each.
+  await page.keyboard.press('v')
+  await nextFrame(page)
+  await page.mouse.click(...onArtboard(await artboardBox(page), [500 / 1600, 0.5]))
+  expect(await selectedCount(page)).toBe(1)
+  await page.keyboard.press('ArrowRight')
+  expect((await shownTransforms(page))[0]).toMatchObject({ x: 1, y: 0 })
+  await page.keyboard.press('Delete')
+  expect(await shownTransforms(page)).toHaveLength(1)
+  await page.keyboard.press('Control+z')
+  await page.keyboard.press('Control+z')
+  expect(await shownTransforms(page)).toEqual([
+    expect.objectContaining({ x: 0 }),
+    expect.objectContaining({ x: 0 }),
+  ])
 })
 
 test('the PNG is the same at any zoom and pan', async ({ page }) => {
@@ -1040,6 +1056,8 @@ test('a text is placed, typed and edited, one undo step per edit', async ({ page
   await expect(undo).toBeDisabled()
   await redo.click()
   expect(await shownTexts(page)).toEqual(['Hello, world'])
+  // Konva draws the restored text's hit area on its next frame.
+  await nextFrame(page)
 
   // A double-click opens it again; Esc puts it back as it was.
   const onText = onArtboard(box, [0.32, 0.3])
@@ -1493,4 +1511,294 @@ test.describe('files on a 375 px phone', () => {
     await undo.tap()
     expect(await shownShapes(page)).toEqual(['Ellipse'])
   })
+})
+
+test('the split eraser cuts strokes apart and leaves shapes alone, as one undo step', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const redo = page.getByRole('button', { name: 'Redo' })
+  const split = page.getByRole('button', { name: 'Split', exact: true })
+  // Canvas (800, 500), where the eraser crosses the stroke; (600, 500) and (1000, 500) beside it;
+  // (800, 300) on the rectangle's top side, which the eraser crosses too.
+  const cut = exportPixel([0.5, 0.5])
+  const sides = [exportPixel([0.375, 0.5]), exportPixel([0.625, 0.5])]
+  const rectTop = exportPixel([0.5, 0.3])
+
+  await drawLine(page, [0.2, 0.5], [0.8, 0.5])
+  await page.keyboard.press('r')
+  await drawLine(page, [0.4, 0.3], [0.6, 0.7])
+  await page.keyboard.press('e')
+  await expect(page.getByRole('button', { name: 'Object', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  await split.click()
+  await expect(split).toHaveAttribute('aria-pressed', 'true')
+  await expect(page.getByText('Erases parts of freehand strokes.')).toBeVisible()
+  await drawLine(page, [0.5, 0.2], [0.5, 0.8])
+
+  // The stroke is two now, the piece on the right just above the one on the left.
+  expect(await shownShapes(page)).toEqual(['Path', 'Path', 'Rect'])
+  expect((await exportPixels(page, [cut, ...sides, rectTop])).values).toEqual([
+    WHITE,
+    BLACK,
+    BLACK,
+    BLACK,
+  ])
+
+  // One undo step brings the whole stroke back, and redo cuts it again.
+  await page.keyboard.press('Control+z')
+  expect(await shownShapes(page)).toEqual(['Path', 'Rect'])
+  expect((await exportPixels(page, [cut])).values).toEqual([BLACK])
+  await redo.click()
+  expect(await shownShapes(page)).toEqual(['Path', 'Path', 'Rect'])
+  for (let i = 0; i < 3; i++) await undo.click()
+  await expect(undo).toBeDisabled()
+
+  // The mode stays as it was through tool switches.
+  await page.keyboard.press('b')
+  await page.keyboard.press('e')
+  await expect(split).toHaveAttribute('aria-pressed', 'true')
+})
+
+test.describe('the split eraser on a 375 px phone', () => {
+  test.use({ viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: true })
+
+  test('cuts by touch, and a pinch puts back what its first finger cut', async ({ page }) => {
+    const finger = await fingerOn(page)
+    const undo = page.getByRole('button', { name: 'Undo' })
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(375)
+
+    // A stroke drawn by finger with the brush, then cut by finger in the middle.
+    const box = await artboardBox(page)
+    await finger.drag(onArtboard(box, [0.1, 0.5]), onArtboard(box, [0.9, 0.5]))
+    await page.getByRole('button', { name: 'Eraser' }).tap()
+    await page.getByRole('button', { name: 'Split', exact: true }).tap()
+    await finger.drag(onArtboard(box, [0.5, 0.3]), onArtboard(box, [0.5, 0.7]))
+    expect(await shownShapes(page)).toEqual(['Path', 'Path'])
+    const pixels = [exportPixel([0.5, 0.5]), exportPixel([0.3, 0.5]), exportPixel([0.7, 0.5])]
+    expect((await exportPixels(page, pixels)).values).toEqual([WHITE, BLACK, BLACK])
+
+    // A first finger cuts the piece on the right; a second one before it moves 8 px is a pinch,
+    // which puts the piece back and records nothing.
+    const [x, y] = onArtboard(box, [0.7, 0.5])
+    await touch(page, 'pointerdown', 1, [x, y])
+    await touch(page, 'pointermove', 1, [x, y + 3])
+    expect(await shownShapes(page)).toEqual(['Path', 'Path', 'Path'])
+    await touch(page, 'pointerdown', 2, [x + 80, y])
+    expect(await shownShapes(page)).toEqual(['Path', 'Path'])
+    await touch(page, 'pointerup', 1, [x, y + 3])
+    await touch(page, 'pointerup', 2, [x + 80, y])
+
+    // The cut and the stroke: a step each.
+    await undo.tap()
+    expect(await shownShapes(page)).toEqual(['Path'])
+    await undo.tap()
+    await expect(undo).toBeDisabled()
+    expect(await shownShapes(page)).toEqual([])
+  })
+})
+
+/** The page point at the middle of the shape at `index` on the content layer. */
+function shapeCenterOf(page: Page, index: number): Promise<Xy> {
+  return page.evaluate((index) => {
+    const stage = (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+    const rect = stage.getLayers()[1].getChildren()[index].getClientRect()
+    const origin = stage.container().getBoundingClientRect()
+    return [origin.x + rect.x + rect.width / 2, origin.y + rect.y + rect.height / 2] as Xy
+  }, index)
+}
+
+test('release: draw a shape, transform it, draw a pen path, undo and download the SVG', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const box = await artboardBox(page)
+
+  // A red rectangle, selected with the select tool once drawn.
+  await page.keyboard.press('r')
+  await drawLine(page, [0.2, 0.2], [0.4, 0.5])
+  await page.getByRole('button', { name: 'Fill #ef4444' }).click()
+  expect(await shownShapes(page)).toEqual(['Rect'])
+  const [drawnWidth] = (await shownAttr(page, 'width')) as number[]
+
+  // Stretched by its middle-right handle: the stretch goes into its width, not its scale.
+  const grip = await handleAt(page, 'middle-right')
+  await drag(page, grip, [grip[0] + 100, grip[1]])
+  const [stretchedWidth] = (await shownAttr(page, 'width')) as number[]
+  expect(stretchedWidth).toBeGreaterThan(drawnWidth + 50)
+  expect(await shownTransforms(page)).toEqual([expect.objectContaining({ scaleX: 1, scaleY: 1 })])
+
+  // A quarter turn, snapped by Shift.
+  const middle = await shapeCenterOf(page, 0)
+  await page.keyboard.down('Shift')
+  await drag(page, await handleAt(page, 'rotater'), [middle[0] + 150, middle[1]])
+  await page.keyboard.up('Shift')
+  const [turned] = await shownTransforms(page)
+  expect(turned.rotation).toBe(90)
+
+  // A pen path, ended with Enter, then taken back with one undo.
+  await page.keyboard.press('p')
+  await page.mouse.click(...onArtboard(box, [0.6, 0.2]))
+  await drag(page, onArtboard(box, [0.75, 0.6]), onArtboard(box, [0.85, 0.6]))
+  await page.mouse.click(...onArtboard(box, [0.9, 0.2]))
+  await page.keyboard.press('Enter')
+  expect(await shownShapes(page)).toEqual(['Rect', 'Path'])
+  await page.keyboard.press('Control+z')
+  expect(await shownShapes(page)).toEqual(['Rect'])
+  expect(await shownTransforms(page)).toEqual([turned])
+
+  // The SVG holds the turned rectangle and not the path, and looks like the PNG.
+  const { name, text: svg } = await downloadFromFileMenu(page, 'Export SVG')
+  expect(name).toBe('drawing.svg')
+  expect(svg).toMatch(/<rect transform="translate\([\d. ]+\) rotate\(90\)" width="[\d.]+"/)
+  expect(svg).toContain('fill="#ef4444"')
+  expect(svg).not.toContain('<path')
+  const { png } = await exportPixels(page, [])
+  expect((await svgAgainstPng(page, svg, png)).far).toBeLessThan(200)
+
+  // Draw, fill, stretch and turn: a step each.
+  for (let i = 0; i < 4; i++) await undo.click()
+  await expect(undo).toBeDisabled()
+  expect(await shownShapes(page)).toEqual([])
+})
+
+test('release: every object type turns, restyles, reorders and deletes, one undo step each', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const box = await artboardBox(page)
+  const select = async () => {
+    await page.keyboard.press('v')
+    await nextFrame(page)
+  }
+  // A stroke along the bottom, for each object to go behind.
+  await drawLine(page, [0.05, 0.95], [0.95, 0.95])
+
+  const kinds: { name: string; shape: string; steps: number; draw(): Promise<void> }[] = [
+    {
+      name: 'Stroke',
+      shape: 'Path',
+      steps: 1,
+      async draw() {
+        await page.keyboard.press('b')
+        await drawLine(page, [0.3, 0.3], [0.6, 0.6])
+        await select()
+        await page.mouse.click(...onArtboard(box, [0.45, 0.45]))
+      },
+    },
+    {
+      name: 'Rectangle',
+      shape: 'Rect',
+      steps: 1,
+      async draw() {
+        await page.keyboard.press('r')
+        await drawLine(page, [0.3, 0.3], [0.6, 0.6])
+      },
+    },
+    {
+      name: 'Ellipse',
+      shape: 'Ellipse',
+      steps: 1,
+      async draw() {
+        await page.keyboard.press('o')
+        await drawLine(page, [0.3, 0.3], [0.6, 0.6])
+      },
+    },
+    {
+      name: 'Line',
+      shape: 'Arrow',
+      steps: 1,
+      async draw() {
+        await page.keyboard.press('l')
+        await drawLine(page, [0.3, 0.45], [0.6, 0.45])
+      },
+    },
+    {
+      name: 'Path',
+      shape: 'Path',
+      steps: 1,
+      async draw() {
+        await page.keyboard.press('p')
+        await page.mouse.click(...onArtboard(box, [0.3, 0.3]))
+        await page.mouse.click(...onArtboard(box, [0.6, 0.3]))
+        await page.mouse.click(...onArtboard(box, [0.45, 0.6]))
+        await page.keyboard.press('Enter')
+      },
+    },
+    {
+      name: 'Text',
+      shape: 'Text',
+      steps: 1,
+      async draw() {
+        await page.keyboard.press('t')
+        await page.mouse.click(...onArtboard(box, [0.3, 0.4]))
+        await page.keyboard.type('Release')
+        await page.keyboard.press('Control+Enter')
+      },
+    },
+    {
+      name: 'Group',
+      shape: 'Group',
+      steps: 3,
+      async draw() {
+        await page.keyboard.press('r')
+        await drawLine(page, [0.3, 0.3], [0.4, 0.4])
+        await page.keyboard.press('o')
+        await drawLine(page, [0.5, 0.5], [0.6, 0.6])
+        await select()
+        await drag(page, onArtboard(box, [0.25, 0.25]), onArtboard(box, [0.65, 0.65]))
+        await page.keyboard.press('Control+g')
+      },
+    },
+  ]
+
+  for (const kind of kinds) {
+    await kind.draw()
+    await expect(page.getByRole('heading', { name: kind.name, exact: true })).toBeVisible()
+    expect(await shownShapes(page)).toEqual(['Path', kind.shape])
+    const [, drawn] = await shownTransforms(page)
+    const [, drawnData] = await shownAttr(page, 'points')
+
+    // A line turns by its end handle, everything else a quarter turn by the Transformer.
+    if (kind.name === 'Line') {
+      const end = await overlayPointOf(page, 'line-end')
+      await drag(page, end, [end[0], end[1] + 100])
+      expect((await shownAttr(page, 'points'))[1]).not.toEqual(drawnData)
+    } else {
+      const middle = await shapeCenterOf(page, 1)
+      await page.keyboard.down('Shift')
+      await drag(page, await handleAt(page, 'rotater'), [middle[0] + 150, middle[1]])
+      await page.keyboard.up('Shift')
+      expect((await shownTransforms(page))[1].rotation).toBe(90)
+    }
+
+    // Restyled, sent to the back and deleted. One key press on the slider is one edit, whatever
+    // the time between presses.
+    const opacity = page.getByRole('slider', { name: 'Opacity' })
+    await opacity.focus()
+    await page.keyboard.press('PageDown')
+    await opacity.blur()
+    expect((await shownAttr(page, 'opacity'))[1]).toBeLessThan(1)
+    await page.keyboard.press('Control+Shift+BracketLeft')
+    expect(await shownShapes(page)).toEqual([kind.shape, 'Path'])
+    await page.keyboard.press('Delete')
+    expect(await shownShapes(page)).toEqual(['Path'])
+
+    // Delete, reorder, restyle and turn undo a step each, then the object itself goes.
+    await undo.click()
+    expect(await shownShapes(page)).toEqual([kind.shape, 'Path'])
+    await undo.click()
+    expect(await shownShapes(page)).toEqual(['Path', kind.shape])
+    await undo.click()
+    expect((await shownAttr(page, 'opacity'))[1]).toBe(1)
+    await undo.click()
+    expect((await shownTransforms(page))[1]).toEqual(drawn)
+    expect((await shownAttr(page, 'points'))[1]).toEqual(drawnData)
+    for (let i = 0; i < kind.steps; i++) await undo.click()
+    expect(await shownShapes(page)).toEqual(['Path'])
+  }
+  await undo.click()
+  await expect(undo).toBeDisabled()
 })

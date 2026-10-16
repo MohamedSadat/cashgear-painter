@@ -339,9 +339,10 @@ describe('settings', () => {
     expect(store().brush).toEqual({ color: '#ef4444', size: 20 })
   })
 
-  it('keeps tool, brush, draft and erasing out of history', () => {
+  it('keeps tool, brush, eraser mode, draft and erasing out of history', () => {
     store().setTool('eraser')
     store().setBrush({ color: '#ef4444', size: 20 })
+    store().setEraserMode('split')
     store().setDraft(stroke())
     store().setErasing(['x'])
 
@@ -1039,5 +1040,84 @@ describe('files', () => {
     expect(store().toast?.message).toBe('second')
     store().dismissToast(store().toast!.id)
     expect(store().toast).toBeNull()
+  })
+})
+
+describe('splitStrokes', () => {
+  const run = (...xs: number[]) => xs.map((x) => point(x, 0))
+
+  it('keeps the first run in the stroke and puts the others just above it, as one step', () => {
+    const a = draw(0)
+    const b = draw(100)
+    const before = store().doc
+    store().select([a.id])
+
+    store().splitStrokes({ [a.id]: [run(0, 2), run(6, 8), run(9, 10)] })
+
+    const [, second, third] = ids()
+    expect(ids()).toEqual([a.id, second, third, b.id])
+    expect(node(a.id).points).toEqual(run(0, 2))
+    expect(node(second)).toEqual({ ...a, id: second, points: run(6, 8) })
+    expect(node(third).points).toEqual(run(9, 10))
+    expect(store().doc.nodes[b.id]).toBe(b)
+    expect(store().selection).toEqual([a.id])
+    expect(store().past.at(-1)).toBe(before)
+
+    store().undo()
+    expect(store().doc).toBe(before)
+  })
+
+  it('deletes a stroke with no runs left, and a group it empties', () => {
+    const a = draw(0)
+    const b = draw(100)
+    store().group([a.id])
+    const [groupId] = store().selection
+
+    store().splitStrokes({ [a.id]: [] })
+
+    expect(ids()).toEqual([b.id])
+    expect(groupId in store().doc.nodes).toBe(false)
+    expect(store().selection).toEqual([])
+  })
+
+  it('splits a stroke inside its group', () => {
+    const a = draw(0)
+    const b = draw(100)
+    store().group([a.id, b.id])
+    const [groupId] = store().selection
+
+    store().splitStrokes({ [a.id]: [run(0, 2), run(6, 8)] })
+
+    const children = (store().doc.nodes[groupId] as GroupNode).childIds
+    expect(children).toEqual([a.id, children[1], b.id])
+    expect(node(children[1])).toMatchObject({ parentId: groupId, points: run(6, 8) })
+    expect(ids()).toEqual([groupId])
+  })
+
+  it('leaves other nodes, missing ids and unchanged strokes alone', () => {
+    const a = draw(0)
+    const rect = createRectNode({ x: 0, y: 0, width: 10, height: 10 }, DEFAULT_SHAPE_STYLE)
+    store().addNodes([rect])
+    const before = store().doc
+
+    store().splitStrokes({ [rect.id]: [], missing: [], [a.id]: [a.points] })
+
+    expect(store().doc).toBe(before)
+    expect(store().past).toHaveLength(2)
+  })
+
+  it('records one step for a gesture of many cuts', () => {
+    const a = draw(0)
+    const before = store().doc
+
+    store().beginGesture()
+    store().splitStrokes({ [a.id]: [run(0, 2), run(6, 10)] })
+    const [, second] = ids()
+    store().splitStrokes({ [second]: [] })
+    store().endGesture()
+
+    expect(ids()).toEqual([a.id])
+    expect(store().past).toHaveLength(2)
+    expect(store().past.at(-1)).toBe(before)
   })
 })

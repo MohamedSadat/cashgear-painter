@@ -1,5 +1,12 @@
-import type { Point } from '../../types'
-import { boxesOverlap, pointsBox, type Box } from './bounds'
+import type { Point, Transform } from '../../types'
+import {
+  applyTransform,
+  boxesOverlap,
+  invertTransform,
+  isIdentity,
+  pointsBox,
+  type Box,
+} from './bounds'
 import { distToSegment } from './hitTest'
 
 export interface EraserPath {
@@ -104,4 +111,32 @@ export function eraseSplit(points: Point[], brushSize: number, eraser: EraserPat
   if (!erased) return [points]
   if (!prevCovered) runs.push(run)
   return runs.filter((r) => r.length >= 2)
+}
+
+/**
+ * eraseSplit for a stroke that `transform` places on the canvas, with the eraser path in canvas
+ * units. The cut is made on the canvas, so the gap is as wide as the eraser on a scaled stroke
+ * too, and the runs come back in the stroke's own coordinates. The ink's half-width scales by the
+ * mean of the two axes' scales, as the eraser's hit test assumes. Kept points are the stroke's
+ * own; when nothing is erased the result is `[points]`, the same array.
+ */
+export function eraseSplitPlaced(
+  points: Point[],
+  brushSize: number,
+  transform: Transform,
+  eraser: EraserPath,
+): Point[][] {
+  if (isIdentity(transform)) return eraseSplit(points, brushSize, eraser)
+  const own = new Map<Point, Point>()
+  const placed = points.map((p) => {
+    const q: Point = [...applyTransform(transform, p[0], p[1]), p[2]]
+    own.set(q, p)
+    return q
+  })
+  const scale = (Math.abs(transform.scaleX) + Math.abs(transform.scaleY)) / 2
+  const runs = eraseSplit(placed, brushSize * scale, eraser)
+  if (runs.length === 1 && runs[0] === placed) return [points]
+  return runs.map((run) =>
+    run.map((q) => own.get(q) ?? [...invertTransform(transform, q[0], q[1]), q[2]]),
+  )
 }
