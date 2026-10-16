@@ -5,8 +5,10 @@ import {
   Eraser,
   Hand,
   MousePointer2,
+  PenTool,
   Redo2,
   Slash,
+  SplinePointer,
   Square,
   Trash2,
   Undo2,
@@ -65,10 +67,16 @@ interface ToolButton {
   icon: LucideIcon
 }
 
-// Separated into groups: picking and painting, shapes, then the view.
+// Separated into groups: picking and painting, shapes and paths, then the view.
 const TOOL_GROUPS: ToolButton[][] = [
   [
     { id: 'select', label: 'Select', title: 'Select (V)', icon: MousePointer2 },
+    {
+      id: 'direct',
+      label: 'Direct select',
+      title: 'Direct select: edit anchors (A)',
+      icon: SplinePointer,
+    },
     { id: 'brush', label: 'Brush', title: 'Brush (B)', icon: Brush },
     { id: 'eraser', label: 'Eraser', title: 'Eraser (E)', icon: Eraser },
   ],
@@ -76,11 +84,12 @@ const TOOL_GROUPS: ToolButton[][] = [
     { id: 'rect', label: 'Rectangle', title: 'Rectangle (R)', icon: Square },
     { id: 'ellipse', label: 'Ellipse', title: 'Ellipse (O)', icon: Circle },
     { id: 'line', label: 'Line', title: 'Line / arrow (L)', icon: Slash },
+    { id: 'pen', label: 'Pen', title: 'Pen (P)', icon: PenTool },
   ],
   [{ id: 'hand', label: 'Hand', title: 'Hand (H, or hold Space)', icon: Hand }],
 ]
 
-const SEPARATOR = 'mx-1 h-6 w-px bg-neutral-200 sm:mx-0 sm:my-1 sm:h-px sm:w-6'
+const SEPARATOR = 'mx-0.5 h-6 w-px bg-neutral-200 sm:mx-0 sm:my-1 sm:h-px sm:w-6'
 
 interface ToolRailProps {
   onExport(): void
@@ -100,7 +109,12 @@ export function ToolRail({ onExport }: ToolRailProps) {
 
   return (
     <nav className="flex shrink-0 flex-wrap items-center gap-1 border-b border-neutral-200 bg-white px-2 py-1 sm:flex-col sm:flex-nowrap sm:border-r sm:border-b-0 sm:px-1 sm:py-2">
-      <div role="group" aria-label="Tools" className="flex items-center gap-0.5 sm:flex-col">
+      {/* No gaps on phones, so the nine tools fit one row from 360 px up; narrower ones wrap. */}
+      <div
+        role="group"
+        aria-label="Tools"
+        className="flex flex-wrap items-center sm:flex-col sm:flex-nowrap sm:gap-0.5"
+      >
         {TOOL_GROUPS.map((group, i) => (
           <Fragment key={group[0].id}>
             {i > 0 && <div aria-hidden className={SEPARATOR} />}

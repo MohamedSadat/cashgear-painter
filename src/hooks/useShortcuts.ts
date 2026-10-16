@@ -16,11 +16,13 @@ const NON_TEXT_INPUTS = new Set([
 
 const TOOL_KEYS: Record<string, ToolId> = {
   v: 'select',
+  a: 'direct',
   b: 'brush',
   e: 'eraser',
   r: 'rect',
   o: 'ellipse',
   l: 'line',
+  p: 'pen',
   h: 'hand',
 }
 
@@ -36,8 +38,8 @@ export function isTextEntry(target: EventTarget | null): boolean {
  * The active tool sees each key first (the select tool's are in selectTool.ts); Esc otherwise
  * cancels what the tool is doing. Then: Ctrl/Cmd+Z undo · Ctrl/Cmd+Shift+Z or Ctrl+Y redo ·
  * Ctrl/Cmd+A select all · Ctrl/Cmd+V paste · Ctrl/Cmd+0 fit · Ctrl/Cmd+1 100% · V select ·
- * B brush · E eraser · R rectangle · O ellipse · L line · H hand · [ and ] brush size. Space for
- * the hand tool is in useViewport.
+ * A direct select · B brush · E eraser · R rectangle · O ellipse · L line · P pen · H hand ·
+ * [ and ] brush size. Space for the hand tool is in useViewport.
  */
 export function useShortcuts(): void {
   useEffect(() => {

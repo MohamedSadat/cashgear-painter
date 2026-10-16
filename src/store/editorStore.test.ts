@@ -11,9 +11,11 @@ import {
   PASTE_OFFSET,
   createEllipseNode,
   createLineNode,
+  createPathNode,
   createRectNode,
   createStrokeNode,
   reorderIds,
+  shapeToPath,
   useEditorStore,
   zoomOf,
 } from './editorStore'
@@ -679,5 +681,78 @@ describe('duplicate, copy and paste', () => {
     expect(childId).not.toBe('child')
     expect(store().doc.nodes[childId]).toMatchObject({ parentId: copy.id, transform: { x: 0 } })
     expect(copy.transform).toMatchObject({ x: PASTE_OFFSET, y: PASTE_OFFSET })
+  })
+})
+
+describe('paths', () => {
+  const corner = (x: number, y: number) => ({
+    x,
+    y,
+    inX: 0,
+    inY: 0,
+    outX: 0,
+    outY: 0,
+    kind: 'corner' as const,
+  })
+  const box = { x: 10, y: 20, width: 100, height: 50 }
+
+  it('places a new path at its first anchor', () => {
+    expect(
+      createPathNode([corner(10, 20), corner(110, 70)], false, DEFAULT_SHAPE_STYLE, 'p'),
+    ).toMatchObject({
+      id: 'p',
+      type: 'path',
+      name: 'Path',
+      transform: { ...IDENTITY_TRANSFORM, x: 10, y: 20 },
+      anchors: [corner(0, 0), corner(100, 50)],
+      closed: false,
+    })
+  })
+
+  it('converts shapes to paths in place, as one undo step', () => {
+    const rect = { ...createRectNode(box, DEFAULT_SHAPE_STYLE), name: 'Door' }
+    const ellipse = createEllipseNode(box, { ...DEFAULT_SHAPE_STYLE, fill: '#ef4444' })
+    const line = { ...createLineNode([0, 0], [50, 0], DEFAULT_SHAPE_STYLE), arrowEnd: true }
+    const locked = { ...createRectNode(box, DEFAULT_SHAPE_STYLE), locked: true }
+    const freehand = stroke()
+    store().addNodes([rect, ellipse, line, locked, freehand])
+    store().select([rect.id, ellipse.id])
+    const before = store().doc
+
+    store().convertToPath([rect.id, ellipse.id, line.id, locked.id, freehand.id])
+
+    expect(store().past.at(-1)).toBe(before)
+    expect(ids()).toEqual(before.rootIds)
+    expect(store().selection).toEqual([rect.id, ellipse.id])
+    expect(store().doc.nodes[rect.id]).toEqual(shapeToPath(rect))
+    expect(store().doc.nodes[rect.id]).toMatchObject({ name: 'Door', closed: true })
+    expect(store().doc.nodes[ellipse.id]).toMatchObject({
+      type: 'path',
+      name: 'Path',
+      transform: ellipse.transform,
+      style: ellipse.style,
+    })
+    expect(store().doc.nodes[line.id]).toMatchObject({ type: 'path', closed: false })
+    expect(store().doc.nodes[line.id]).not.toHaveProperty('arrowEnd')
+    expect(store().doc.nodes[locked.id]).toBe(locked)
+    expect(store().doc.nodes[freehand.id]).toBe(freehand)
+
+    store().undo()
+    expect(store().doc).toBe(before)
+    store().convertToPath([freehand.id, locked.id])
+    expect(store().past).toHaveLength(1)
+  })
+
+  it('keeps the active anchor only while its path stays selected', () => {
+    const path = createPathNode([corner(0, 0), corner(10, 0)], false, DEFAULT_SHAPE_STYLE)
+    const other = draw()
+    store().addNodes([path])
+    store().select([path.id])
+    store().setActiveAnchor({ id: path.id, index: 1 })
+
+    store().select([other.id], 'add')
+    expect(store().activeAnchor).toEqual({ id: path.id, index: 1 })
+    store().select([other.id])
+    expect(store().activeAnchor).toBeNull()
   })
 })

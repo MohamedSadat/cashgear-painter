@@ -18,6 +18,8 @@ export interface ToolController {
   onDown(e: ToolEvent): void
   onMove(e: ToolEvent): void
   onUp(e: ToolEvent): void
+  // Pointer moves with nothing pressed (mice and pens); null when the pointer leaves the canvas.
+  onHover?(e: ToolEvent | null): void
   onKey?(e: KeyboardEvent): boolean // true = handled
   onCancel?(): void // Esc or tool switch
 }

@@ -444,7 +444,10 @@ test('a stroke moves, turns and stretches one undo step at a time, and survives 
   // Canvas (480, 500) to (800, 500); its middle is (640, 500) in its own coordinates for good.
   await drawLine(page, [0.3, 0.5], [0.5, 0.5])
   await page.keyboard.press('v')
-  await expect(page.getByRole('button', { name: 'Select' })).toHaveAttribute('aria-pressed', 'true')
+  await expect(page.getByRole('button', { name: 'Select', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
   await nextFrame(page)
   const box = await artboardBox(page)
   await page.mouse.click(...onArtboard(box, [0.4, 0.5]))
@@ -589,7 +592,7 @@ test('rectangles, ellipses and lines draw, restyle and undo one step at a time',
   page,
 }) => {
   const undo = page.getByRole('button', { name: 'Undo' })
-  const select = page.getByRole('button', { name: 'Select' })
+  const select = page.getByRole('button', { name: 'Select', exact: true })
   const rectInside = exportPixel([0.2, 0.2])
   const ellipseInside = exportPixel([0.5, 0.2])
   const ellipseCorner = exportPixel([0.41, 0.11]) // inside its box, outside the ellipse
@@ -769,7 +772,7 @@ test.describe('on a 375 px phone', () => {
       await page.getByRole('button', { name: tool }).tap()
       const box = await artboardBox(page)
       await touchDrag(page, onArtboard(box, from), onArtboard(box, to))
-      await expect(page.getByRole('button', { name: 'Select' })).toHaveAttribute(
+      await expect(page.getByRole('button', { name: 'Select', exact: true })).toHaveAttribute(
         'aria-pressed',
         'true',
       )
@@ -787,6 +790,206 @@ test.describe('on a 375 px phone', () => {
     for (let i = 0; i < 3; i++) await undo.tap()
     expect((await exportPixels(page, inside)).values).toEqual([GREEN, WHITE])
     for (let i = 0; i < 2; i++) await undo.tap()
+    await expect(undo).toBeDisabled()
+    expect(await shownShapes(page)).toEqual([])
+  })
+})
+
+/** How many anchors direct select shows on the overlay. */
+function anchorCount(page: Page) {
+  return page.evaluate(
+    () =>
+      (window as unknown as { Konva: typeof Konva }).Konva.stages[0].find((n: Konva.Node) =>
+        /^anchor-\d+$/.test(n.name()),
+      ).length,
+  )
+}
+
+test('the pen draws a closed heart that reshapes by its handles, one undo step each', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const inside = exportPixel([0.5, 0.55])
+  // Canvas (549, 250): above the left lobe, until its out handle is pulled up.
+  const aboveLobe: Xy = [1098, 500]
+
+  // Bottom tip, left lobe dragged up, top dip, right lobe dragged down, then the tip again.
+  await page.keyboard.press('p')
+  const box = await artboardBox(page)
+  await page.mouse.click(...onArtboard(box, [0.5, 0.8]))
+  await drag(page, onArtboard(box, [0.3, 0.4]), onArtboard(box, [0.3, 0.2]))
+  await page.mouse.click(...onArtboard(box, [0.5, 0.35]))
+  await drag(page, onArtboard(box, [0.7, 0.4]), onArtboard(box, [0.7, 0.6]))
+  await expect(page.getByRole('button', { name: 'Finish path' })).toBeEnabled()
+  await page.mouse.click(...onArtboard(box, [0.5, 0.8]))
+
+  // The closed path is selected, with the select tool.
+  await expect(page.getByRole('button', { name: 'Select', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  expect(await shownShapes(page)).toEqual(['Path'])
+  expect(await selectedCount(page)).toBe(1)
+  expect(await shownAttr(page, 'data')).toEqual([expect.stringMatching(/ Z$/)])
+  await page.getByRole('button', { name: 'Fill #ef4444' }).click()
+  expect((await exportPixels(page, [inside, aboveLobe])).values).toEqual([RED, WHITE])
+
+  // A double-click on the path switches to direct select, with its 4 anchors.
+  await page.mouse.dblclick(...onArtboard(box, [0.5, 0.55]))
+  await expect(page.getByRole('button', { name: 'Direct select' })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  await expect.poll(() => anchorCount(page)).toBe(4)
+  const [heart] = (await shownAttr(page, 'data')) as string[]
+
+  // Pulling the left lobe's handle up makes the lobe taller.
+  await drag(page, await overlayPointOf(page, 'handle-out-1'), onArtboard(box, [0.3, 0]))
+  expect((await exportPixels(page, [aboveLobe])).values).toEqual([RED])
+  const [taller] = (await shownAttr(page, 'data')) as string[]
+
+  // Alt-drag moves one handle of the smooth right lobe and leaves the other alone.
+  const otherHandle = await overlayPointOf(page, 'handle-in-3')
+  await page.keyboard.down('Alt')
+  await drag(page, await overlayPointOf(page, 'handle-out-3'), onArtboard(box, [0.8, 0.6]))
+  await page.keyboard.up('Alt')
+  expect(await overlayPointOf(page, 'handle-in-3')).toEqual(otherHandle)
+  await expect(page.getByRole('button', { name: 'Corner' })).toHaveAttribute('aria-pressed', 'true')
+
+  // Alt-drag, drag, fill and the path itself: a step each.
+  await undo.click()
+  expect(await shownAttr(page, 'data')).toEqual([taller])
+  await undo.click()
+  expect(await shownAttr(page, 'data')).toEqual([heart])
+  expect((await exportPixels(page, [aboveLobe])).values).toEqual([WHITE])
+  await undo.click()
+  expect((await exportPixels(page, [inside])).values).toEqual([WHITE])
+  await undo.click()
+  await expect(undo).toBeDisabled()
+  expect(await shownShapes(page)).toEqual([])
+})
+
+test('a rectangle converts to a path whose anchors add and delete, one undo step each', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  // Inside, on the left side's outline and outside the rectangle from canvas (320, 200) to
+  // (640, 500).
+  const pixels = [exportPixel([0.3, 0.35]), exportPixel([0.2, 0.35]), exportPixel([0.15, 0.35])]
+
+  await page.keyboard.press('r')
+  await drawLine(page, [0.2, 0.2], [0.4, 0.5])
+  await page.getByRole('button', { name: 'Fill #3b82f6' }).click()
+  expect((await exportPixels(page, pixels)).values).toEqual([BLUE, BLACK, WHITE])
+
+  await page.getByRole('button', { name: 'Convert to path' }).click()
+  expect(await shownShapes(page)).toEqual(['Path'])
+  await expect(page.getByRole('heading', { name: 'Path' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Convert to path' })).toHaveCount(0)
+  expect((await exportPixels(page, pixels)).values).toEqual([BLUE, BLACK, WHITE])
+
+  // A double-click on the top side adds an anchor, and Delete removes it again.
+  await page.keyboard.press('a')
+  await expect.poll(() => anchorCount(page)).toBe(4)
+  const box = await artboardBox(page)
+  await page.mouse.dblclick(...onArtboard(box, [0.3, 0.2]))
+  expect(await anchorCount(page)).toBe(5)
+  await expect(page.getByRole('group', { name: 'Anchor kind' })).toBeVisible()
+  await page.keyboard.press('Delete')
+  expect(await anchorCount(page)).toBe(4)
+
+  // Delete, add and convert are a step each.
+  await undo.click()
+  expect(await anchorCount(page)).toBe(5)
+  await undo.click()
+  expect(await anchorCount(page)).toBe(4)
+  await undo.click()
+  expect(await shownShapes(page)).toEqual(['Rect'])
+  expect((await exportPixels(page, pixels)).values).toEqual([BLUE, BLACK, WHITE])
+})
+
+test('paths are saved and come back after a reload', async ({ page }) => {
+  await page.keyboard.press('p')
+  const box = await artboardBox(page)
+  await page.mouse.click(...onArtboard(box, [0.2, 0.2]))
+  await drag(page, onArtboard(box, [0.4, 0.6]), onArtboard(box, [0.5, 0.6]))
+  await page.keyboard.press('Enter')
+  const drawn = await shownAttr(page, 'data')
+
+  await expect.poll(() => savedNodeCount(page)).toBe(1)
+  await page.reload()
+  await waitForCanvas(page)
+  expect(await shownShapes(page)).toEqual(['Path'])
+  expect(await shownAttr(page, 'data')).toEqual(drawn)
+})
+
+/** Real touch events through the DevTools protocol: Konva's own drags follow these. */
+async function fingerOn(page: Page) {
+  const cdp = await page.context().newCDPSession(page)
+  const send = (type: 'touchStart' | 'touchMove' | 'touchEnd', at?: Xy) =>
+    cdp.send('Input.dispatchTouchEvent', {
+      type,
+      touchPoints: at ? [{ x: at[0], y: at[1] }] : [],
+    })
+  const drag = async (from: Xy, to: Xy, steps = 8) => {
+    await send('touchStart', from)
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps
+      await send('touchMove', [from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t])
+    }
+    // A finger holds still before it lifts; a fast release would start a fling in Chrome,
+    // and the next tap would only stop it.
+    await page.waitForTimeout(150)
+    await send('touchEnd')
+  }
+  return { drag, tap: (at: Xy) => drag(at, at, 0) }
+}
+
+test.describe('paths on a 375 px phone', () => {
+  test.use({ viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: true })
+
+  test('the pen, direct select and convert to path work by touch, and undo', async ({ page }) => {
+    const finger = await fingerOn(page)
+    const undo = page.getByRole('button', { name: 'Undo' })
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(375)
+
+    // A corner, a smooth anchor dragged out to the right, and a corner; the panel ends the path.
+    await page.getByRole('button', { name: 'Pen' }).tap()
+    const box = await artboardBox(page)
+    await finger.tap(onArtboard(box, [0.2, 0.3]))
+    await finger.drag(onArtboard(box, [0.4, 0.7]), onArtboard(box, [0.5, 0.7]))
+    await finger.tap(onArtboard(box, [0.6, 0.3]))
+    await page.getByRole('button', { name: 'Finish path' }).tap()
+    await expect(page.getByRole('button', { name: 'Select', exact: true })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    expect(await shownShapes(page)).toEqual(['Path'])
+    const drawn = await shownAttr(page, 'data')
+
+    // The path stays selected; direct select shows its anchors, and a handle drags by touch.
+    await page.getByRole('button', { name: 'Direct select' }).tap()
+    await expect.poll(() => anchorCount(page)).toBe(3)
+    const handle = await overlayPointOf(page, 'handle-out-1')
+    const twin = await overlayPointOf(page, 'handle-in-1')
+    await finger.drag(handle, [handle[0], handle[1] + 60])
+    expect(await shownAttr(page, 'data')).not.toEqual(drawn)
+    // The smooth anchor's other handle swings to stay in line.
+    expect(await overlayPointOf(page, 'handle-in-1')).not.toEqual(twin)
+
+    // A rectangle converts with a tap.
+    await page.getByRole('button', { name: 'Rectangle' }).tap()
+    await finger.drag(onArtboard(box, [0.1, 0.75]), onArtboard(box, [0.3, 0.95]))
+    await page.getByRole('button', { name: 'Convert to path' }).tap()
+    expect(await shownShapes(page)).toEqual(['Path', 'Path'])
+
+    // Convert, rectangle, handle drag and the path: a step each.
+    await undo.tap()
+    expect(await shownShapes(page)).toEqual(['Path', 'Rect'])
+    await undo.tap()
+    await undo.tap()
+    expect(await shownAttr(page, 'data')).toEqual(drawn)
+    await undo.tap()
     await expect(undo).toBeDisabled()
     expect(await shownShapes(page)).toEqual([])
   })

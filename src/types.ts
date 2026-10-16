@@ -61,7 +61,9 @@ export type VectorNode =
 export type NodeType = VectorNode['type']
 export type NodeOf<T extends NodeType> = Extract<VectorNode, { type: T }>
 export type StrokeNode = NodeOf<'stroke'>
-export type ShapeNode = NodeOf<'rect' | 'ellipse' | 'line'>
+export type PathNode = NodeOf<'path'>
+/** Nodes drawn as geometry with an optional outline: rectangles, ellipses, lines and paths. */
+export type ShapeNode = NodeOf<'rect' | 'ellipse' | 'line' | 'path'>
 
 /** The drawing surface in logical canvas units; the Stage is scaled to fit its container. */
 export const CANVAS_WIDTH = 1600

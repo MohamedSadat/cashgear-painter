@@ -10,6 +10,7 @@ import type { ToolEvent } from '../tools/types'
 import { CANVAS_HEIGHT, CANVAS_WIDTH, type NodeId } from '../types'
 import { BrushCursor } from './BrushCursor'
 import { NodeView } from './NodeView'
+import { PathEditOverlay } from './PathEditOverlay'
 import { SelectionOverlay } from './SelectionOverlay'
 
 interface CanvasStageProps {
@@ -108,8 +109,9 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
     cursor.visible(true)
   }
 
-  const hideCursor = () => {
+  const handlePointerLeave = () => {
     cursorRef.current?.visible(false)
+    activeTool()?.onHover?.(null)
   }
 
   const handlePointerDown = ({ evt, target }: KonvaEventObject<PointerEvent>) => {
@@ -133,6 +135,11 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
 
   const handlePointerMove = ({ evt }: KonvaEventObject<PointerEvent>) => {
     moveCursor(evt)
+    if (activePointerId.current === null && evt.pointerType !== 'touch') {
+      const hover = activeTool()?.onHover
+      if (hover) hover(readToolEvent(contentLayerRef.current, evt))
+      return
+    }
     if (evt.pointerId !== activePointerId.current) return
     const e = readToolEvent(contentLayerRef.current, evt)
     if (!e) return
@@ -158,7 +165,7 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
           className="absolute inset-0"
           style={{ cursor: toolFor(tool)?.cursor ?? 'default' }}
           data-testid="canvas"
-          onPointerLeave={hideCursor}
+          onPointerLeave={handlePointerLeave}
         >
           <Stage
             ref={stageRef}
@@ -207,9 +214,9 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
               ))}
               {draft && <NodeView key={draft.id} node={draft} isDraft />}
             </Layer>
-            {/* Pen previews and path handles join these in later milestones. */}
             <Layer name={OVERLAY_LAYER_NAME}>
               <SelectionOverlay contentLayerRef={contentLayerRef} />
+              <PathEditOverlay />
               <BrushCursor ref={cursorRef} tool={tool} size={size} />
             </Layer>
           </Stage>

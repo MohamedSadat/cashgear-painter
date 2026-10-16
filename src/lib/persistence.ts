@@ -101,6 +101,16 @@ function isStyle(value: unknown): boolean {
 
 const isLength = (value: unknown) => isFiniteNumber(value) && value >= 0
 
+const ANCHOR_KINDS: ReadonlySet<unknown> = new Set(['corner', 'smooth', 'symmetric'])
+
+function isAnchor(value: unknown): boolean {
+  return (
+    isObject(value) &&
+    ['x', 'y', 'inX', 'inY', 'outX', 'outY'].every((key) => isFiniteNumber(value[key])) &&
+    ANCHOR_KINDS.has(value.kind)
+  )
+}
+
 // Other node types get their checks in their own milestones; until then they are dropped.
 const TYPE_CHECKS: Record<string, (node: Record<string, unknown>) => boolean> = {
   stroke: (node) =>
@@ -117,6 +127,12 @@ const TYPE_CHECKS: Record<string, (node: Record<string, unknown>) => boolean> = 
     node.points.every(isFiniteNumber) &&
     typeof node.arrowStart === 'boolean' &&
     typeof node.arrowEnd === 'boolean',
+  // A path needs a segment, so at least 2 anchors; the editor deletes one that drops below that.
+  path: (node) =>
+    Array.isArray(node.anchors) &&
+    node.anchors.length >= 2 &&
+    node.anchors.every(isAnchor) &&
+    typeof node.closed === 'boolean',
 }
 
 function isNode(id: string, value: unknown): value is VectorNode {

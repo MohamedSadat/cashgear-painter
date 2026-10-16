@@ -6,8 +6,8 @@ import { applyTransform, invertTransform } from '../lib/geometry/bounds'
 import { bakeTransform, normalizeRotation, snapAngle } from '../lib/geometry/transform'
 import { useEditorStore, zoomOf } from '../store/editorStore'
 import type { NodeId, NodeOf, VectorNode } from '../types'
+import { ACCENT, ANCHOR_SIZE, HANDLE_GRIP } from './overlayStyle'
 
-const ACCENT = '#0ea5e9'
 const ALL_ANCHORS = [
   'top-left',
   'top-center',
@@ -24,14 +24,9 @@ const MIN_SIZE_PX = 2 // smallest box a resize may leave, in screen pixels
 // Konva's matrix math leaves noise such as 0.9999999999999997 on axes nobody scaled.
 const roundScale = (scale: number) => Math.round(scale * 1e6) / 1e6
 
-// Fingers need bigger handles than mice.
-const coarsePointer = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches
-const ANCHOR_SIZE = coarsePointer ? 18 : 9
 // Screen pixels between the ink and the box, so a thin stroke's middle handles don't cover it
 // and a press on the stroke moves it instead of stretching it.
 const BOX_PADDING = ANCHOR_SIZE / 2 + 4
-// Screen pixels of extra grip around a line's end handles.
-const END_GRIP = coarsePointer ? 16 : 8
 
 const store = () => useEditorStore.getState()
 
@@ -81,7 +76,7 @@ function LineEnds({ line, listening }: { line: NodeOf<'line'>; listening: boolea
       stroke={ACCENT}
       strokeWidth={1}
       strokeScaleEnabled={false}
-      hitStrokeWidth={END_GRIP}
+      hitStrokeWidth={HANDLE_GRIP}
       listening={listening}
       draggable
       onDragStart={() => {

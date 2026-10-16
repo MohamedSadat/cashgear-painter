@@ -1,14 +1,17 @@
-import type { ShapeNode, StrokeNode, VectorNode } from '../../types'
+import { Bezier } from 'bezier-js'
+import type { PathNode, ShapeNode, StrokeNode, VectorNode } from '../../types'
 import {
   applyTransform,
   arrowHeadSize,
   boxesOverlap,
+  canvasSegments,
   isIdentity,
   nodeBounds,
   outlineReach,
   pointsBox,
   type Vec,
 } from './bounds'
+import { pathSegments, type Cubic } from './pathData'
 
 /** Distance from (px, py) to the segment a–b; a zero-length segment is a point. */
 export function distToSegment(px: number, py: number, a: Vec, b: Vec): number {
@@ -119,9 +122,40 @@ function arrowHead(tip: Vec, from: Vec, size: number): Vec[] {
   return [tip, [bx - uy * half, by + ux * half], [bx + uy * half, by - ux * half]]
 }
 
+// A curve is sampled at about this many canvas units per step, within these bounds.
+const CURVE_STEP = 4
+const MIN_CURVE_STEPS = 2
+const MAX_CURVE_STEPS = 64
+
+/** Points along the segments, sampled by bezier-js; the control polygon bounds each one's length. */
+function flattenSegments(segments: Cubic[]): Vec[] {
+  const points: Vec[] = []
+  for (const cubic of segments) {
+    let reach = 0
+    for (let i = 1; i < 4; i++) {
+      reach += Math.hypot(cubic[i][0] - cubic[i - 1][0], cubic[i][1] - cubic[i - 1][1])
+    }
+    const steps = Math.min(
+      MAX_CURVE_STEPS,
+      Math.max(MIN_CURVE_STEPS, Math.ceil(reach / CURVE_STEP)),
+    )
+    const lut = new Bezier(...cubic.flat()).getLUT(steps)
+    // Each segment starts where the previous one ended.
+    for (let i = points.length === 0 ? 0 : 1; i < lut.length; i++) points.push([lut[i].x, lut[i].y])
+  }
+  return points
+}
+
 /** A shape's outline pieces in its own coordinates. */
 function localContours(node: ShapeNode): Contour[] {
   switch (node.type) {
+    case 'path': {
+      const points = flattenSegments(pathSegments(node.anchors, node.closed))
+      // Canvas and SVG fill an open path as if it were closed.
+      return points.length < 2
+        ? []
+        : [{ points, closed: node.closed, filled: node.style.fill !== null }]
+    }
     case 'rect':
       return [
         {
@@ -183,7 +217,7 @@ function contourDistance({ points, closed }: Contour, a: Vec, b: Vec): number {
 }
 
 const isShape = (node: VectorNode): node is ShapeNode =>
-  node.type === 'rect' || node.type === 'ellipse' || node.type === 'line'
+  node.type === 'rect' || node.type === 'ellipse' || node.type === 'line' || node.type === 'path'
 
 /**
  * Whether a circle of `radius` swept from a to b touches the node's ink. Testing the swept segment,
@@ -214,4 +248,22 @@ export function nodeHitsSegment(node: VectorNode, a: Vec, b: Vec, radius: number
       contourDistance(contour, a, b) <= reach ||
       (contour.filled && pointInPolygon(a, contour.points)),
   )
+}
+
+export interface PathPoint {
+  segment: number // index of the segment, which starts at the anchor of the same index
+  t: number // 0..1 along it
+  distance: number // canvas units from the point asked about
+}
+
+/** The point of a path's outline nearest a canvas point, found by bezier-js; null without segments. */
+export function nearestOnPath(node: PathNode, { 0: x, 1: y }: Vec): PathPoint | null {
+  let best: PathPoint | null = null
+  const segments = canvasSegments(node)
+  for (let segment = 0; segment < segments.length; segment++) {
+    const p = new Bezier(...segments[segment].flat()).project({ x, y })
+    const distance = Math.hypot(p.x - x, p.y - y)
+    if (!best || distance < best.distance) best = { segment, t: p.t, distance }
+  }
+  return best
 }

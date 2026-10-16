@@ -1,12 +1,32 @@
 import { nodeBounds, type Box } from '../lib/geometry/bounds'
 import { useEditorStore, zoomOf, type Rect } from '../store/editorStore'
 import type { Doc, NodeId, Transform } from '../types'
-import type { ToolController } from './types'
+import type { ToolController, ToolEvent } from './types'
 
 const store = () => useEditorStore.getState()
 
 // Screen pixels a press may wander before it becomes a drag.
 const DRAG_SLOP = 3
+// A second press this soon and this close (in screen pixels) is a double-click or double-tap.
+const DOUBLE_MS = 400
+const DOUBLE_SLOP = 6
+const TOUCH_DOUBLE_SLOP = 24
+
+/** A detector that tells whether each press is the second of a double-click or double-tap. */
+export function doublePressDetector(): (e: ToolEvent) => boolean {
+  let last: { at: number; point: [number, number] } | null = null
+  return (e) => {
+    const now = Date.now()
+    const slop = e.pointerType === 'touch' ? TOUCH_DOUBLE_SLOP : DOUBLE_SLOP
+    const travel = last ? Math.hypot(e.point[0] - last.point[0], e.point[1] - last.point[1]) : 0
+    const double = last !== null && now - last.at < DOUBLE_MS && travel * zoomOf(store()) <= slop
+    // A third press starts over, so a triple-click is not two doubles.
+    last = double ? null : { at: now, point: e.point }
+    return double
+  }
+}
+
+const isDoublePress = doublePressDetector()
 const NUDGE = 1
 const BIG_NUDGE = 10 // with Shift
 
@@ -104,6 +124,7 @@ function startMove(start: Xy): Drag {
  * Click selects and Shift-click adds (or, on a selected node, removes). Dragging a node or the
  * inside of the selection moves the selection; dragging empty canvas draws a marquee that selects
  * what lies fully inside it. Resize and rotate belong to the Transformer in SelectionOverlay.
+ * Double-clicking a path switches to direct select to edit its anchors.
  */
 export const selectTool: ToolController = {
   cursor: 'default',
@@ -112,6 +133,11 @@ export const selectTool: ToolController = {
   onDown(e) {
     const { doc, selection } = store()
     const target = e.target === null ? null : topLevelId(doc, e.target)
+    if (isDoublePress(e) && target !== null && doc.nodes[target].type === 'path') {
+      store().select([target])
+      store().setTool('direct')
+      return
+    }
     const wasSelected = target !== null && selection.includes(target)
     if (target !== null && !wasSelected) store().select([target], e.shift ? 'add' : 'replace')
     const box = target === null && !e.shift ? unionBounds(doc, selection) : null

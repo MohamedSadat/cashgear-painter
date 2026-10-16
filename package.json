@@ -13,6 +13,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "bezier-js": "6.1.4",
     "idb-keyval": "6.3.0",
     "immer": "11.1.21",
     "konva": "10.9.0",

@@ -1,13 +1,16 @@
 import { produce, type Draft } from 'immer'
 import { create } from 'zustand'
+import { shapeAnchors } from '../lib/geometry/pathData'
 import {
   CANVAS_HEIGHT,
   CANVAS_WIDTH,
   IDENTITY_TRANSFORM,
   emptyDoc,
+  type Anchor,
   type Doc,
   type NodeId,
   type NodeOf,
+  type PathNode,
   type Point,
   type StrokeNode,
   type Style,
@@ -60,6 +63,12 @@ export interface Viewport {
   fit: number // scale at which the artboard fits the canvas area
 }
 
+/** An anchor of a path, by the path's id and the anchor's index. */
+export interface AnchorRef {
+  id: NodeId
+  index: number
+}
+
 export interface EditorState {
   doc: Doc
   selection: NodeId[]
@@ -75,6 +84,8 @@ export interface EditorState {
   erasing: NodeId[] // nodes the eraser has touched in the current pass
   marquee: Rect | null // the select tool's drag rectangle
   clipboard: VectorNode[] // copied nodes with their descendants; not in history or autosave
+  penHover: [x: number, y: number] | null // the pen's pointer while it hovers, in canvas units
+  activeAnchor: AnchorRef | null // the direct-select tool's anchor, for Delete and the panel
 
   addNodes(nodes: VectorNode[], parentId?: NodeId): void
   updateNodes(patch: Record<NodeId, Partial<VectorNode>>, mergeKey?: string): void
@@ -84,6 +95,7 @@ export interface EditorState {
   duplicate(ids: NodeId[]): void
   copy(ids: NodeId[]): void
   paste(): void
+  convertToPath(ids: NodeId[]): void
   beginGesture(): void
   endGesture(): void
   cancelGesture(): void
@@ -97,6 +109,8 @@ export interface EditorState {
   setDraft(node: VectorNode | null): void
   setErasing(ids: NodeId[]): void
   setMarquee(rect: Rect | null): void
+  setPenHover(point: [number, number] | null): void
+  setActiveAnchor(anchor: AnchorRef | null): void
   setViewport(viewport: Viewport): void
   setView(view: View): void
   zoomTo(zoom: number, anchor?: [x: number, y: number]): void
@@ -183,6 +197,52 @@ export function createLineNode(
     points: [0, 0, to[0] - from[0], to[1] - from[1]],
     arrowStart: false,
     arrowEnd: false,
+  }
+}
+
+/** A path through anchors given in canvas units, placed at the first anchor. */
+export function createPathNode(
+  anchors: Anchor[],
+  closed: boolean,
+  style: Style,
+  id: NodeId = newNodeId(),
+): PathNode {
+  const [x, y] = anchors.length > 0 ? [anchors[0].x, anchors[0].y] : [0, 0]
+  return {
+    ...newBase(id, 'Path', style, x, y),
+    type: 'path',
+    anchors: anchors.map((a) => ({ ...a, x: a.x - x, y: a.y - y })),
+    closed,
+  }
+}
+
+type ConvertibleNode = NodeOf<'rect' | 'ellipse' | 'line'>
+
+const DEFAULT_NAMES: Record<ConvertibleNode['type'], string> = {
+  rect: 'Rectangle',
+  ellipse: 'Ellipse',
+  line: 'Line',
+}
+
+export const canConvertToPath = (node: VectorNode): node is ConvertibleNode =>
+  node.type === 'rect' || node.type === 'ellipse' || node.type === 'line'
+
+/**
+ * The shape as a path that looks the same, under the same id, transform and style; a default name
+ * becomes 'Path'. A line's arrowheads are dropped.
+ */
+export function shapeToPath(node: ConvertibleNode): PathNode {
+  const { id, name, parentId, transform, style, hidden, locked } = node
+  return {
+    id,
+    name: name === DEFAULT_NAMES[node.type] ? 'Path' : name,
+    parentId,
+    transform,
+    style,
+    hidden,
+    locked,
+    type: 'path',
+    ...shapeAnchors(node),
   }
 }
 
@@ -348,6 +408,8 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     erasing: [],
     marquee: null,
     clipboard: [],
+    penHover: null,
+    activeAnchor: null,
 
     addNodes(nodes, parentId) {
       commit((doc) => {
@@ -446,6 +508,18 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       insertCopies(clipboard, PASTE_OFFSET * pasteCount)
     },
 
+    convertToPath(ids) {
+      const { doc } = get()
+      const paths = ids.flatMap((id) => {
+        const node = doc.nodes[id]
+        return node && !node.locked && canConvertToPath(node) ? [shapeToPath(node)] : []
+      })
+      if (paths.length === 0) return
+      commit((draft) => {
+        for (const path of paths) draft.nodes[path.id] = path
+      })
+    },
+
     beginGesture() {
       const { gestureStart, doc } = get()
       if (gestureStart) return
@@ -499,18 +573,22 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     },
 
     select(ids, mode = 'replace') {
-      const { doc, selection } = get()
+      const { doc, selection, activeAnchor } = get()
       const picked = [...new Set(ids)].filter((id) => id in doc.nodes)
-      if (mode === 'replace') set({ selection: picked })
-      else if (mode === 'add') set({ selection: [...new Set([...selection, ...picked])] })
+      let next: NodeId[]
+      if (mode === 'replace') next = picked
+      else if (mode === 'add') next = [...new Set([...selection, ...picked])]
       else {
         const toggled = new Set(selection)
         for (const id of picked) {
           if (toggled.has(id)) toggled.delete(id)
           else toggled.add(id)
         }
-        set({ selection: [...toggled] })
+        next = [...toggled]
       }
+      // An anchor stays active only while its path is selected.
+      const keepAnchor = activeAnchor !== null && next.includes(activeAnchor.id)
+      set({ selection: next, activeAnchor: keepAnchor ? activeAnchor : null })
     },
 
     setTool(t) {
@@ -544,6 +622,14 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 
     setMarquee(rect) {
       set({ marquee: rect })
+    },
+
+    setPenHover(point) {
+      set({ penHover: point })
+    },
+
+    setActiveAnchor(anchor) {
+      set({ activeAnchor: anchor })
     },
 
     setViewport(next) {

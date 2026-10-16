@@ -2,14 +2,25 @@ import {
   ArrowDown,
   ArrowUp,
   BringToFront,
+  Check,
   CopyPlus,
   MoveLeft,
   MoveRight,
   SendToBack,
+  Spline,
   Trash2,
 } from 'lucide-react'
 import type { ReactNode } from 'react'
-import { MAX_SIZE, MIN_SIZE, useEditorStore, type ZOrder } from '../store/editorStore'
+import type { AnchorKind } from '../lib/geometry/pathData'
+import {
+  MAX_SIZE,
+  MIN_SIZE,
+  canConvertToPath,
+  useEditorStore,
+  type ZOrder,
+} from '../store/editorStore'
+import { activeAnchorOf, deleteActiveAnchor, setActiveAnchorKind } from '../tools/directTool'
+import { finishPath } from '../tools/penTool'
 import { lineStyleOf } from '../tools/shapeTools'
 import type { NodeId, NodeOf, Style, VectorNode } from '../types'
 import { IconButton } from './ToolRail'
@@ -40,10 +51,11 @@ function shared<T>(values: T[]): Value<T> {
 const store = () => useEditorStore.getState()
 
 // Which style each node type has: freehand strokes are all fill and lines all outline, so neither
-// can do without its color.
-const hasFill = (n: VectorNode) => n.type === 'stroke' || n.type === 'rect' || n.type === 'ellipse'
-const hasOutline = (n: VectorNode) => n.type === 'rect' || n.type === 'ellipse' || n.type === 'line'
-const canClearColor = (n: VectorNode) => n.type === 'rect' || n.type === 'ellipse'
+// can do without its color. Rectangles, ellipses and paths can do without either.
+const canClearColor = (n: VectorNode) =>
+  n.type === 'rect' || n.type === 'ellipse' || n.type === 'path'
+const hasFill = (n: VectorNode) => n.type === 'stroke' || canClearColor(n)
+const hasOutline = (n: VectorNode) => n.type === 'line' || canClearColor(n)
 
 /**
  * Applies style changes to the nodes as one undo step; nodes that already have them are left out.
@@ -217,9 +229,55 @@ const ARRANGE: { label: string; title: string; where: ZOrder; icon: ReactNode }[
   },
 ]
 
+const ANCHOR_KINDS: { kind: AnchorKind; label: string; title: string }[] = [
+  { kind: 'corner', label: 'Corner', title: 'Corner: handles move on their own' },
+  { kind: 'smooth', label: 'Smooth', title: 'Smooth: handles stay in line' },
+  { kind: 'symmetric', label: 'Symmetric', title: 'Symmetric: handles stay in line and equal' },
+]
+
+/** Direct select's active anchor: its kind, and a delete button for touch screens. */
+function AnchorRow() {
+  const kind = useEditorStore((s) => {
+    const active = activeAnchorOf(s)
+    return active ? active.path.anchors[active.index].kind : null
+  })
+  if (kind === null) return null
+  return (
+    <Row label="Anchor">
+      <div role="group" aria-label="Anchor kind" className="flex items-center gap-0.5">
+        {ANCHOR_KINDS.map((option) => (
+          <button
+            key={option.kind}
+            type="button"
+            aria-pressed={kind === option.kind}
+            title={option.title}
+            onClick={() => setActiveAnchorKind(option.kind)}
+            className={`h-8 rounded-md px-2 text-xs transition-colors ${
+              kind === option.kind
+                ? 'bg-sky-100 text-sky-700'
+                : 'text-neutral-700 hover:bg-neutral-100'
+            }`}
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+      <IconButton
+        label="Delete anchor"
+        title="Delete anchor (Del)"
+        danger
+        onClick={deleteActiveAnchor}
+      >
+        <Trash2 size={18} />
+      </IconButton>
+    </Row>
+  )
+}
+
 function SelectionProperties() {
   const doc = useEditorStore((s) => s.doc)
   const selection = useEditorStore((s) => s.selection)
+  const direct = useEditorStore((s) => s.tool === 'direct')
   const nodes = selection.flatMap((id) => (id in doc.nodes ? [doc.nodes[id]] : []))
 
   if (nodes.length === 0) {
@@ -227,7 +285,9 @@ function SelectionProperties() {
       <>
         <Header title="Nothing selected" />
         <p className="text-xs text-neutral-500">
-          Tap or click an object to change its style. Drag across empty canvas to select several.
+          {direct
+            ? 'Tap or click a path to edit its anchors and handles. Double-click its outline to add an anchor.'
+            : 'Tap or click an object to change its style. Drag across empty canvas to select several.'}
         </p>
       </>
     )
@@ -236,6 +296,7 @@ function SelectionProperties() {
   const filled = nodes.filter(hasFill)
   const outlined = nodes.filter(hasOutline)
   const rects = nodes.filter((n): n is NodeOf<'rect'> => n.type === 'rect')
+  const convertible = nodes.filter((n) => canConvertToPath(n) && !n.locked)
   const lines = nodes.filter((n): n is NodeOf<'line'> => n.type === 'line')
   // Konva and SVG round corners to at most half the shorter side.
   const radiusOf = (r: NodeOf<'rect'>) =>
@@ -255,6 +316,14 @@ function SelectionProperties() {
     <>
       <Header title={nodes.length === 1 ? nodes[0].name : `${nodes.length} objects`}>
         <div role="group" aria-label="Arrange" className="flex items-center gap-0.5">
+          {convertible.length > 0 && (
+            <IconButton
+              label="Convert to path"
+              onClick={() => store().convertToPath(convertible.map((n) => n.id))}
+            >
+              <Spline size={18} />
+            </IconButton>
+          )}
           <IconButton
             label="Duplicate"
             title="Duplicate (Ctrl+D)"
@@ -283,6 +352,7 @@ function SelectionProperties() {
         </div>
       </Header>
 
+      {direct && <AnchorRow />}
       {filled.length > 0 && (
         <ColorRow
           label={filled.every((n) => n.type === 'stroke') ? 'Color' : 'Fill'}
@@ -392,17 +462,37 @@ function BrushProperties({ eraser }: { eraser: boolean }) {
   )
 }
 
-const SHAPE_TITLES = { rect: 'New rectangle', ellipse: 'New ellipse', line: 'New line' }
+const SHAPE_TITLES = {
+  rect: 'New rectangle',
+  ellipse: 'New ellipse',
+  line: 'New line',
+  pen: 'New path',
+}
 
-/** The style the next shape gets; drawing one selects it, so its own style shows next. */
+/**
+ * The style the next shape or path gets; drawing one selects it, so its own style shows next. The
+ * pen also gets a button that ends the path, for touch screens.
+ */
 function ShapeDefaults({ tool }: { tool: keyof typeof SHAPE_TITLES }) {
   const shapeStyle = useEditorStore((s) => s.shapeStyle)
+  const canFinish = useEditorStore((s) => s.draft?.type === 'path' && s.draft.anchors.length >= 2)
   const isLine = tool === 'line'
   const style = isLine ? lineStyleOf(shapeStyle) : shapeStyle
   const { setShapeStyle } = store()
   return (
     <>
-      <Header title={SHAPE_TITLES[tool]} />
+      <Header title={SHAPE_TITLES[tool]}>
+        {tool === 'pen' && (
+          <IconButton
+            label="Finish path"
+            title="Finish path (Enter)"
+            disabled={!canFinish}
+            onClick={finishPath}
+          >
+            <Check size={18} />
+          </IconButton>
+        )}
+      </Header>
       {!isLine && (
         <ColorRow
           label="Fill"
@@ -440,16 +530,17 @@ function ShapeDefaults({ tool }: { tool: keyof typeof SHAPE_TITLES }) {
 }
 
 /**
- * Style for what the active tool works on: the selection with the select and hand tools, the
- * brush with the brush and eraser, and the next shape with the shape tools. On the right from
- * 640 px up; a bottom sheet of fixed height on phones, so the canvas doesn't jump as it changes.
+ * Style for what the active tool works on: the selection with the select, direct-select and hand
+ * tools, the brush with the brush and eraser, and the next shape with the shape tools and the pen.
+ * On the right from 640 px up; a bottom sheet of fixed height on phones, so the canvas doesn't
+ * jump as it changes.
  */
 export function PropertiesPanel() {
   const tool = useEditorStore((s) => s.tool)
   let content: ReactNode
   if (tool === 'brush' || tool === 'eraser')
     content = <BrushProperties eraser={tool === 'eraser'} />
-  else if (tool === 'rect' || tool === 'ellipse' || tool === 'line') {
+  else if (tool === 'rect' || tool === 'ellipse' || tool === 'line' || tool === 'pen') {
     content = <ShapeDefaults tool={tool} />
   } else content = <SelectionProperties />
 

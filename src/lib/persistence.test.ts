@@ -4,6 +4,7 @@ import {
   DEFAULT_SHAPE_STYLE,
   createEllipseNode,
   createLineNode,
+  createPathNode,
   createRectNode,
   createStrokeNode,
 } from '../store/editorStore'
@@ -11,6 +12,7 @@ import {
   emptyDoc,
   type Doc,
   type NodeOf,
+  type PathNode,
   type Point,
   type StrokeNode,
   type VectorNode,
@@ -49,6 +51,20 @@ function shapes(): [NodeOf<'rect'>, NodeOf<'ellipse'>, NodeOf<'line'>] {
     createEllipseNode(box, { ...DEFAULT_SHAPE_STYLE, opacity: 0.5 }, 'ellipse'),
     { ...createLineNode([0, 0], [55.55, -20], DEFAULT_SHAPE_STYLE, 'line'), arrowEnd: true },
   ]
+}
+
+/** A closed path of every anchor kind, with odd coordinates kept as they are. */
+function path(id = 'path'): PathNode {
+  return createPathNode(
+    [
+      { x: 10.123, y: 20, inX: 0, inY: 0, outX: 0, outY: 0, kind: 'corner' },
+      { x: 110, y: 20.456, inX: -30, inY: -40, outX: 15, outY: 20, kind: 'smooth' },
+      { x: 60, y: 90.789, inX: 20, inY: 0, outX: -20, outY: 0, kind: 'symmetric' },
+    ],
+    true,
+    { ...DEFAULT_SHAPE_STYLE, fill: '#3b82f6' },
+    id,
+  )
 }
 
 function docWith(...nodes: VectorNode[]): Doc {
@@ -128,10 +144,40 @@ describe('sanitizeDoc', () => {
 
   it('drops node types that have no checks yet', () => {
     const doc = docWith(stroke('a'))
-    doc.nodes.p = { ...stroke('p'), type: 'path', anchors: [], closed: false } as VectorNode
-    doc.rootIds.push('p')
+    doc.nodes.t = { ...stroke('t'), type: 'text', text: 'Hi' } as unknown as VectorNode
+    doc.rootIds.push('t')
 
     expect(sanitizeDoc(doc).rootIds).toEqual(['a'])
+  })
+
+  it('keeps paths', () => {
+    const doc = docWith(path(), { ...path('open'), closed: false })
+
+    expect(sanitizeDoc(doc)).toEqual(doc)
+  })
+
+  it('drops malformed paths, and paths with fewer than 2 anchors', () => {
+    const valid = path()
+    const [first, second] = valid.anchors
+    const doc = docWith(
+      { ...valid, id: 'p1', anchors: [first] },
+      {
+        ...valid,
+        id: 'p2',
+        anchors: [first, { ...second, kind: 'curvy' }],
+      } as unknown as VectorNode,
+      { ...valid, id: 'p3', anchors: [first, { ...second, outY: Number.NaN }] },
+      {
+        ...valid,
+        id: 'p4',
+        anchors: [first, { ...second, inX: undefined }],
+      } as unknown as VectorNode,
+      { ...valid, id: 'p5', closed: 1 } as unknown as VectorNode,
+      { ...valid, id: 'p6', anchors: 'M 0 0' } as unknown as VectorNode,
+      valid,
+    )
+
+    expect(sanitizeDoc(doc).rootIds).toEqual([valid.id])
   })
 
   it('keeps rectangles, ellipses and lines', () => {
@@ -154,9 +200,9 @@ describe('sanitizeDoc', () => {
     expect(sanitizeDoc(doc).rootIds).toEqual([rect.id])
   })
 
-  it('round-trips shapes through storage unchanged', async () => {
+  it('round-trips shapes and paths through storage unchanged', async () => {
     const kv = memoryStore()
-    const doc = docWith(...shapes())
+    const doc = docWith(...shapes(), path())
 
     await saveDoc(doc, kv)
 

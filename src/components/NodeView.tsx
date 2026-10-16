@@ -1,6 +1,7 @@
 import { memo } from 'react'
 import { Arrow, Ellipse, Path, Rect } from 'react-konva'
 import { arrowHeadSize } from '../lib/geometry/bounds'
+import { cachedPathData } from '../lib/geometry/pathData'
 import { strokeToPath } from '../lib/strokePath'
 import { useEditorStore, zoomOf } from '../store/editorStore'
 import type { Point, ShapeNode, StrokeNode, VectorNode } from '../types'
@@ -36,9 +37,9 @@ interface CommonProps {
 }
 
 /**
- * Rectangles, ellipses and lines. Their outlines are in canvas units and scale with the zoom, so
- * the hit outline is recomputed per zoom: at least HIT_STROKE_PX on screen, and never thinner than
- * the visible one. Only these re-render on zoom, not every freehand stroke.
+ * Rectangles, ellipses, lines and paths. Their outlines are in canvas units and scale with the
+ * zoom, so the hit outline is recomputed per zoom: at least HIT_STROKE_PX on screen, and never
+ * thinner than the visible one. Only these re-render on zoom, not every freehand stroke.
  */
 function ShapeView({ node, common }: { node: ShapeNode; common: CommonProps }) {
   const zoom = useEditorStore(zoomOf)
@@ -50,13 +51,19 @@ function ShapeView({ node, common }: { node: ShapeNode; common: CommonProps }) {
     strokeWidth: style.strokeWidth,
     hitStrokeWidth: Math.max(outline, zoom > 0 ? HIT_STROKE_PX / zoom : HIT_STROKE_PX),
   }
+  // Konva's hit canvas fills every fill-enabled shape, so an unfilled one turns filling off to be
+  // picked on its outline only.
+  const fill = { fill: style.fill ?? undefined, fillEnabled: style.fill !== null }
 
   switch (node.type) {
+    case 'path':
+      // Miter joins and round caps, so a converted rectangle keeps its corners and a converted
+      // line its round ends.
+      return (
+        <Path {...paint} {...fill} data={cachedPathData(node)} lineJoin="miter" lineCap="round" />
+      )
     case 'rect':
     case 'ellipse': {
-      // Konva's hit canvas fills every fill-enabled shape, so an unfilled one turns filling off
-      // to be picked on its outline only.
-      const fill = { fill: style.fill ?? undefined, fillEnabled: style.fill !== null }
       return node.type === 'rect' ? (
         <Rect
           {...paint}
@@ -137,8 +144,9 @@ export const NodeView = memo(function NodeView({
     case 'rect':
     case 'ellipse':
     case 'line':
+    case 'path':
       return <ShapeView node={node} common={common} />
-    // Paths, text and groups render from their own milestones on (M11–M12).
+    // Text and groups render from M12 on.
     default:
       return null
   }

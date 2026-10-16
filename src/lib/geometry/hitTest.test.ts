@@ -2,12 +2,20 @@ import { describe, expect, it } from 'vitest'
 import {
   createEllipseNode,
   createLineNode,
+  createPathNode,
   createRectNode,
   createStrokeNode,
 } from '../../store/editorStore'
 import type { Point, Style, VectorNode } from '../../types'
 import { arrowHeadSize, type Vec } from './bounds'
-import { distToSegment, nodeHitsSegment, pointInPolygon, segmentsDistance } from './hitTest'
+import {
+  distToSegment,
+  nearestOnPath,
+  nodeHitsSegment,
+  pointInPolygon,
+  segmentsDistance,
+} from './hitTest'
+import { corner } from './pathData'
 
 /** A size-8 horizontal stroke from (0, 0) to (100, 0). */
 const stroke = (overrides: Partial<VectorNode> = {}) =>
@@ -57,9 +65,9 @@ describe('nodeHitsSegment', () => {
   })
 
   it('never hits node types without hit tests yet', () => {
-    const path = { ...stroke(), type: 'path', anchors: [], closed: false }
+    const text = { ...stroke(), type: 'text', text: 'Hi', fontSize: 20, width: 100 }
 
-    expect(nodeHitsSegment(path as VectorNode, [5, 5], [5, 5], 50)).toBe(false)
+    expect(nodeHitsSegment(text as VectorNode, [5, 5], [5, 5], 50)).toBe(false)
   })
 })
 
@@ -137,5 +145,54 @@ describe('nodeHitsSegment on shapes', () => {
     // Turned about its corner, it covers x 400..500 and y 500..700.
     expect(nodeHitsSegment(turned, [600, 550], [600, 550], 1)).toBe(false)
     expect(nodeHitsSegment(turned, [450, 650], [450, 650], 1)).toBe(true)
+  })
+})
+
+describe('paths', () => {
+  const outline: Style = { fill: null, stroke: '#000000', strokeWidth: 4, opacity: 1 }
+  const filled: Style = { ...outline, fill: '#ef4444' }
+
+  /** An arch from (100, 100) up to (150, 25) and down to (200, 100), its handles 100 tall. */
+  const arch = (style: Style) =>
+    createPathNode(
+      [
+        { ...corner(100, 100), outY: -100 },
+        { ...corner(200, 100), inY: -100 },
+      ],
+      false,
+      style,
+    )
+
+  it('touches an unfilled path only on its curve, within half its outline', () => {
+    // Eraser radius 5 + half the outline 2 = 7 from the curve's top at (150, 25).
+    expect(nodeHitsSegment(arch(outline), [150, 31], [150, 31], 5)).toBe(true)
+    expect(nodeHitsSegment(arch(outline), [150, 34], [150, 34], 5)).toBe(false)
+    // The handles reach y = 0, the curve doesn't.
+    expect(nodeHitsSegment(arch(outline), [150, 5], [150, 5], 5)).toBe(false)
+    expect(nodeHitsSegment(arch(outline), [150, 80], [150, 80], 5)).toBe(false)
+    expect(nodeHitsSegment(arch(outline), [150, -50], [150, 200], 1)).toBe(true)
+  })
+
+  it('fills an open path as if it were closed', () => {
+    expect(nodeHitsSegment(arch(filled), [150, 80], [150, 80], 1)).toBe(true)
+    expect(nodeHitsSegment(arch(filled), [150, 110], [150, 110], 1)).toBe(false)
+  })
+
+  it('follows the path transform', () => {
+    const path = arch(outline)
+    // Turned half a turn about its first anchor, the top lands at (50, 175).
+    const turned = { ...path, transform: { ...path.transform, rotation: 180 } }
+
+    expect(nodeHitsSegment(turned, [50, 175], [50, 175], 1)).toBe(true)
+    expect(nodeHitsSegment(turned, [150, 25], [150, 25], 1)).toBe(false)
+  })
+
+  it('finds the nearest point of the outline, by segment and position along it', () => {
+    const near = nearestOnPath(arch(outline), [150, 0])!
+
+    expect(near.segment).toBe(0)
+    expect(near.t).toBeCloseTo(0.5, 2)
+    expect(near.distance).toBeCloseTo(25, 1)
+    expect(nearestOnPath({ ...arch(outline), anchors: [] }, [0, 0])).toBeNull()
   })
 })
