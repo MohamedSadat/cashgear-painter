@@ -198,17 +198,20 @@ export function SelectionOverlay({ contentLayerRef }: SelectionOverlayProps) {
     // Path data and other geometry changes don't notify the Transformer by themselves.
     transformer.forceUpdate()
     transformer.getLayer()?.batchDraw()
+    // A drag the doc or selection changed under (an undo, say) has nothing to preview.
+    store().setTransformPreview(null)
   }, [contentLayerRef, doc, selection, shown, line])
 
   // A single text's side handles change its width as they move, so it wraps live instead of
   // stretching; the width is in Konva until transformend.
+  // The panel's X, Y, W, H and rotation fields follow the drag through the preview.
   const handleTransform = () => {
     const transformer = transformerRef.current
     const [shape] = transformer?.nodes() ?? []
-    if (!transformer || !text || !shape || !SIDE_ANCHORS.has(transformer.getActiveAnchor() ?? '')) {
-      return
+    if (transformer && text && shape && SIDE_ANCHORS.has(transformer.getActiveAnchor() ?? '')) {
+      shape.setAttrs({ width: shape.width() * shape.scaleX(), scaleX: 1 })
     }
-    shape.setAttrs({ width: shape.width() * shape.scaleX(), scaleX: 1 })
+    store().setTransformPreview(transformerChanges().patch)
   }
 
   // A resize snaps the edges its handle moves to the page and other objects; a turn doesn't snap.
@@ -286,14 +289,16 @@ export function SelectionOverlay({ contentLayerRef }: SelectionOverlayProps) {
   const tooSmall = (box: TransformerBox) =>
     Math.abs(box.width) < MIN_SIZE_PX || Math.abs(box.height) < MIN_SIZE_PX
 
-  const handleTransformEnd = () => {
-    resizeSnap.current = null
-    store().setGuides([])
-    const transformer = transformerRef.current
-    if (!transformer) return
-    const { doc, updateNodes } = useEditorStore.getState()
+  /**
+   * The changes the Transformer's shapes stand for as they are now: scale baked into geometry
+   * where the node type allows, and the transform each shape ends with.
+   */
+  const transformerChanges = () => {
+    const shapes = transformerRef.current?.nodes() ?? []
+    const { doc } = store()
     const patch: Record<NodeId, Partial<VectorNode>> = {}
-    for (const shape of transformer.nodes()) {
+    const ends: [Konva.Node, Transform][] = []
+    for (const shape of shapes) {
       const node = doc.nodes[shape.id()]
       if (!node) continue
       // A text's width may already have taken some of the scale, live.
@@ -305,13 +310,21 @@ export function SelectionOverlay({ contentLayerRef }: SelectionOverlayProps) {
         scaleX: roundScale(shape.scaleX() * widthScale),
         scaleY: roundScale(shape.scaleY()),
       })
-      const t = changes[node.id]?.transform ?? node.transform
-      // React only sets props that differ from its last render, so Konva must already hold the
-      // model's values: a baked scale goes back to 1, and any skew is dropped.
-      shape.setAttrs({ ...t, skewX: 0, skewY: 0 })
+      ends.push([shape, changes[node.id]?.transform ?? node.transform])
       Object.assign(patch, changes)
     }
-    updateNodes(patch)
+    return { patch, ends }
+  }
+
+  const handleTransformEnd = () => {
+    resizeSnap.current = null
+    store().setGuides([])
+    store().setTransformPreview(null)
+    const { patch, ends } = transformerChanges()
+    // React only sets props that differ from its last render, so Konva must already hold the
+    // model's values: a baked scale goes back to 1, and any skew is dropped.
+    for (const [shape, t] of ends) shape.setAttrs({ ...t, skewX: 0, skewY: 0 })
+    store().updateNodes(patch)
   }
 
   return (

@@ -2203,3 +2203,178 @@ test('objects snap to the page edge and to each other within 6 screen px, with g
   expect((await shown(1)).x).toBeCloseTo(960, 6)
   expect((await shownAttr(page, 'width'))[1]).toBe(160)
 })
+
+type ShownRect = { x: number; y: number; width: number; height: number; rotation: number }
+
+/** Each shape on the content layer, bottom to top, by its Konva position, size and rotation. */
+function shownRects(page: Page): Promise<ShownRect[]> {
+  return page.evaluate(() =>
+    (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+      .getLayers()[1]
+      .getChildren()
+      .map((n) => ({
+        x: n.x(),
+        y: n.y(),
+        width: n.width() * n.scaleX(),
+        height: n.height() * n.scaleY(),
+        rotation: n.rotation(),
+      })),
+  )
+}
+
+/** Draws a rectangle with the rectangle tool between two canvas points. */
+async function drawRectOnCanvas(page: Page, from: Xy, to: Xy) {
+  await page.keyboard.press('r')
+  await drag(page, await screenOf(page, from), await screenOf(page, to))
+}
+
+test('objects align and distribute from the keyboard and the toolbar, one undo step each', async ({
+  page,
+}) => {
+  // Three rectangles with the same 4-unit outline, so their boxes line up as their inks do.
+  await drawRectOnCanvas(page, [100, 100], [300, 200])
+  await drawRectOnCanvas(page, [500, 300], [600, 400])
+  await drawRectOnCanvas(page, [1200, 700], [1300, 900])
+  await page.keyboard.press('Control+a')
+  await expect.poll(() => selectedCount(page)).toBe(3)
+
+  const steps = [await shownRects(page)]
+  // Waits for the command to show, checks it and keeps the result.
+  const step = async (check: (rects: ShownRect[]) => void) => {
+    await expect.poll(() => shownRects(page)).not.toEqual(steps.at(-1))
+    const rects = await shownRects(page)
+    check(rects)
+    steps.push(rects)
+  }
+  const same = (values: number[]) => {
+    for (const v of values) expect(v).toBeCloseTo(values[0], 6)
+  }
+
+  // Alt + Shift + V spaces them evenly down the page; the toolbar does it across.
+  await page.keyboard.press('Alt+Shift+V')
+  await step(([a, b, c]) => {
+    expect(b.y - (a.y + a.height)).toBeCloseTo(c.y - (b.y + b.height), 6)
+    expect([a.y, c.y]).toEqual([steps[0][0].y, steps[0][2].y])
+  })
+  await page.getByRole('button', { name: 'Distribute horizontally' }).click()
+  await step(([a, b, c]) => {
+    expect(b.x - (a.x + a.width)).toBeCloseTo(c.x - (b.x + b.width), 6)
+  })
+
+  // Alt + A lines the left edges up on the leftmost; the toolbar lines the bottoms up on the
+  // lowest.
+  await page.keyboard.press('Alt+A')
+  await step((rects) => {
+    same(rects.map((r) => r.x))
+    expect(rects[0].x).toBe(steps[0][0].x)
+  })
+  await page.getByRole('button', { name: 'Align bottom edges' }).click()
+  await step((rects) => {
+    same(rects.map((r) => r.y + r.height))
+    expect(rects[2].y).toBe(steps[0][2].y)
+  })
+
+  // One object aligns to the page: the tallest, picked by its top edge, goes to the page's
+  // horizontal center with Alt + H.
+  const tall = steps.at(-1)![2]
+  await page.mouse.click(...(await screenOf(page, [tall.x + tall.width / 2, tall.y])))
+  await expect.poll(() => selectedCount(page)).toBe(1)
+  await page.keyboard.press('Alt+H')
+  await step(([a, b, c]) => {
+    expect(c.x + c.width / 2).toBeCloseTo(800, 6)
+    expect([a, b]).toEqual(steps.at(-1)!.slice(0, 2))
+  })
+
+  // Each command was one undo step.
+  const undo = page.getByRole('button', { name: 'Undo' })
+  for (let i = steps.length - 2; i >= 0; i--) {
+    await undo.click()
+    await expect.poll(() => shownRects(page)).toEqual(steps[i])
+  }
+})
+
+test('the X, Y, W, H and rotation fields follow drags live and apply typed math, one step each', async ({
+  page,
+}) => {
+  await drawRectOnCanvas(page, [400, 300], [600, 400])
+  const field = (name: string) => page.getByRole('textbox', { name, exact: true })
+  const valueOf = async (name: string) => Number(await field(name).inputValue())
+  const shown = async () => (await shownRects(page))[0]
+  // The fields go by the ink: the 4-unit outline reaches 2 past the rectangle.
+  const start = await shown()
+  await expect.poll(() => valueOf('X')).toBeCloseTo(start.x - 2, 1)
+  expect(await valueOf('Width')).toBeCloseTo(start.width + 4, 1)
+  expect(await valueOf('Height')).toBeCloseTo(start.height + 4, 1)
+  await expect(field('Rotation')).toHaveValue('0')
+
+  // A move shows in X while the drag goes on, Ctrl keeping snapping out of it.
+  const zoom = await zoomOf(page)
+  const edge = await screenOf(page, [start.x, start.y + start.height / 2])
+  await page.mouse.move(...edge)
+  await page.keyboard.down('Control')
+  await page.mouse.down()
+  for (let i = 1; i <= 5; i++) await page.mouse.move(edge[0] + 8 * i, edge[1])
+  const moving = await shown()
+  expect(moving.x).toBeCloseTo(start.x + 40 / zoom, 1)
+  await expect.poll(() => valueOf('X')).toBeCloseTo(moving.x - 2, 1)
+  await page.mouse.up()
+  await page.keyboard.up('Control')
+
+  // So does a resize by the Transformer's handle, though Konva holds it until the release.
+  const handle = await handleAt(page, 'middle-right')
+  await page.mouse.move(...handle)
+  await page.keyboard.down('Control')
+  await page.mouse.down()
+  for (let i = 1; i <= 5; i++) await page.mouse.move(handle[0] + 10 * i, handle[1])
+  const stretching = await shown()
+  expect(stretching.width).toBeGreaterThan(start.width + 40 / zoom)
+  await expect.poll(() => valueOf('Width')).toBeCloseTo(stretching.width + 4, 1)
+  await page.mouse.up()
+  await page.keyboard.up('Control')
+  // Baking rounds the scale to millionths.
+  await expect.poll(async () => (await shown()).width).toBeCloseTo(stretching.width, 2)
+  const resized = await shown()
+
+  // Typed values apply on Enter, worked out when they are sums; Esc puts the field back.
+  await field('X').fill('200/2')
+  await field('X').press('Enter')
+  await expect(field('X')).toHaveValue('100')
+  expect((await shown()).x).toBeCloseTo(102, 6)
+  await field('Width').fill('999')
+  await field('Width').press('Escape')
+  expect(await valueOf('Width')).toBeCloseTo(resized.width + 4, 1)
+  await field('Width').fill('300')
+  await field('Width').press('Enter')
+  await expect(field('Width')).toHaveValue('300')
+  // The outline keeps its width, so the rectangle takes the rest.
+  expect((await shown()).width).toBeCloseTo(296, 6)
+  expect((await shown()).x).toBeCloseTo(102, 6)
+
+  // With the ratio kept, a new height scales the width too.
+  const before = await shown()
+  await page.getByRole('button', { name: 'Keep ratio' }).click()
+  await field('Height').fill('(50 + 4) * 2')
+  await field('Height').press('Enter')
+  await expect(field('Height')).toHaveValue('108')
+  const kept = await shown()
+  expect(kept.height).toBeCloseTo(104, 6)
+  expect(kept.width).toBeCloseTo((before.width * 104) / before.height, 6)
+
+  // Rotation turns it about its middle; its box is then the turned rectangle's.
+  await field('Rotation').fill('90')
+  await field('Rotation').press('Enter')
+  await expect.poll(async () => (await shown()).rotation).toBe(90)
+  await expect.poll(() => valueOf('Width')).toBeCloseTo(kept.height + 4, 1)
+  expect(await valueOf('Height')).toBeCloseTo(kept.width + 4, 1)
+
+  // Each typed change was one undo step, as were the move and the resize.
+  const undo = page.getByRole('button', { name: 'Undo' })
+  await undo.click()
+  await expect.poll(shown).toEqual(kept)
+  await undo.click()
+  await expect.poll(shown).toEqual(before)
+  for (let i = 0; i < 2; i++) await undo.click()
+  await expect.poll(shown).toEqual(resized)
+  for (let i = 0; i < 2; i++) await undo.click()
+  await expect.poll(shown).toEqual(start)
+})

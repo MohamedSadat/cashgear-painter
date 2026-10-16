@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { inkBounds } from '../lib/geometry/bounds'
 import { solid } from '../lib/paint/paint'
 import {
   IDENTITY_TRANSFORM,
@@ -1351,5 +1352,73 @@ describe('pages', () => {
     expect(store().selection).toEqual([])
     store().undo()
     expect(node(a.id).size).toBe(8)
+  })
+})
+
+describe('align and distribute', () => {
+  const plain = { ...DEFAULT_SHAPE_STYLE, stroke: null, fill: solid('#000000') }
+  const rect = (x: number, y: number, rotation = 0) => {
+    const node = createRectNode({ x, y, width: 100, height: 50 }, plain)
+    return { ...node, transform: { ...node.transform, rotation } }
+  }
+  const boxes = (list: string[]) => list.map((id) => inkBounds(store().doc.nodes, id)!)
+
+  it('aligns as one undo step, rotated objects by their axis-aligned boxes', () => {
+    const a = rect(100, 100)
+    const b = rect(400, 300, 45)
+    const c = rect(700, 600)
+    store().addNodes([a, b, c])
+    store().select([a.id, b.id, c.id])
+    const steps = store().past.length
+
+    store().align(store().selection, 'right')
+
+    for (const box of boxes([a.id, b.id, c.id])) expect(box.maxX).toBeCloseTo(800, 9)
+    expect(store().past).toHaveLength(steps + 1)
+    expect(store().selection).toEqual([a.id, b.id, c.id])
+    store().undo()
+    expect(store().doc.nodes[b.id]).toEqual(b)
+  })
+
+  it('aligns one object to its page, and records nothing when nothing moves', () => {
+    const a = rect(100, 100)
+    store().addNodes([a])
+    store().align([a.id], 'bottom')
+    expect(boxes([a.id])[0].maxY).toBe(1000)
+    const steps = store().past.length
+    store().align([a.id], 'bottom')
+    store().align([], 'left')
+    expect(store().past).toHaveLength(steps)
+  })
+
+  it('aligns a group as a whole, not what it holds', () => {
+    const a = rect(100, 100)
+    const b = rect(300, 200)
+    const c = rect(600, 400)
+    store().addNodes([a, b, c])
+    store().group([a.id, b.id])
+    const [g] = store().selection
+    store().align([g, a.id, c.id], 'left')
+    expect(boxes([g, c.id]).map((box) => box.minX)).toEqual([100, 100])
+    // Its children kept their places in it.
+    expect(boxes([a.id, b.id]).map((box) => box.minX)).toEqual([100, 300])
+  })
+
+  it('distributes as one undo step, and needs 3 objects', () => {
+    const a = rect(0, 100)
+    const b = rect(150, 100)
+    const c = rect(900, 100)
+    store().addNodes([a, b, c])
+    const steps = store().past.length
+
+    store().distribute([a.id, b.id], 'x')
+    expect(store().past).toHaveLength(steps)
+    store().distribute([a.id, b.id, c.id], 'x')
+
+    const [boxA, boxB, boxC] = boxes([a.id, b.id, c.id])
+    expect(boxB.minX - boxA.maxX).toBeCloseTo(boxC.minX - boxB.maxX, 9)
+    expect(store().past).toHaveLength(steps + 1)
+    store().undo()
+    expect(store().doc.nodes[b.id]).toEqual(b)
   })
 })

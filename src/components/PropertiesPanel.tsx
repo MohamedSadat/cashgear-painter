@@ -1,7 +1,15 @@
 import {
   AlignCenter,
+  AlignCenterHorizontal,
+  AlignCenterVertical,
+  AlignEndHorizontal,
+  AlignEndVertical,
+  AlignHorizontalDistributeCenter,
   AlignLeft,
   AlignRight,
+  AlignStartHorizontal,
+  AlignStartVertical,
+  AlignVerticalDistributeCenter,
   ArrowDown,
   ArrowLeftRight,
   ArrowUp,
@@ -19,8 +27,10 @@ import {
   Spline,
   Trash2,
   Ungroup,
+  type LucideIcon,
 } from 'lucide-react'
 import { useCallback, useRef, useState, type ReactNode } from 'react'
+import type { AlignEdge, Axis } from '../lib/align/align'
 import type { AnchorKind } from '../lib/geometry/pathData'
 import { WEB_SAFE_FONTS } from '../lib/geometry/textLayout'
 import { PAGE_PRESETS, mmToPx, presetOf, pxToMm } from '../lib/pages'
@@ -32,6 +42,7 @@ import {
   MIN_SIZE,
   canConvertToPath,
   currentPageOf,
+  outermost,
   useEditorStore,
   type EraserMode,
   type ZOrder,
@@ -44,6 +55,7 @@ import { startTextEdit } from '../tools/textTool'
 import type { NodeId, NodeOf, Page, Paint, Style, TextNode, VectorNode } from '../types'
 import { MoveToPageMenu } from './MoveToPageMenu'
 import { IconButton } from './ToolRail'
+import { TransformFields } from './TransformFields'
 
 const SWATCHES = [
   '#000000',
@@ -256,6 +268,70 @@ const ARRANGE: { label: string; title: string; where: ZOrder; icon: ReactNode }[
     icon: <SendToBack size={18} />,
   },
 ]
+
+const ALIGN_BUTTONS: { where: AlignEdge; label: string; keys: string; icon: LucideIcon }[] = [
+  { where: 'left', label: 'Align left edges', keys: 'Alt+A', icon: AlignStartVertical },
+  { where: 'center', label: 'Align horizontal centers', keys: 'Alt+H', icon: AlignCenterVertical },
+  { where: 'right', label: 'Align right edges', keys: 'Alt+D', icon: AlignEndVertical },
+  { where: 'top', label: 'Align top edges', keys: 'Alt+W', icon: AlignStartHorizontal },
+  { where: 'middle', label: 'Align vertical centers', keys: 'Alt+V', icon: AlignCenterHorizontal },
+  { where: 'bottom', label: 'Align bottom edges', keys: 'Alt+S', icon: AlignEndHorizontal },
+]
+
+const DISTRIBUTE_BUTTONS: { axis: Axis; label: string; keys: string; icon: LucideIcon }[] = [
+  {
+    axis: 'x',
+    label: 'Distribute horizontally',
+    keys: 'Alt+Shift+H',
+    icon: AlignHorizontalDistributeCenter,
+  },
+  {
+    axis: 'y',
+    label: 'Distribute vertically',
+    keys: 'Alt+Shift+V',
+    icon: AlignVerticalDistributeCenter,
+  },
+]
+
+/**
+ * The align and distribute commands, also on Alt shortcuts. One object aligns to the page,
+ * several to the box around them; distributing takes 3 or more.
+ */
+function AlignRows({ count }: { count: number }) {
+  const selection = useEditorStore((s) => s.selection)
+  const toPage = count === 1 ? ' to the page' : ''
+  return (
+    <>
+      <Row label="Align">
+        {ALIGN_BUTTONS.map(({ where, label, keys, icon: Icon }) => (
+          <IconButton
+            key={where}
+            label={label}
+            title={`${label}${toPage} (${keys})`}
+            compact
+            onClick={() => store().align(selection, where)}
+          >
+            <Icon size={18} />
+          </IconButton>
+        ))}
+      </Row>
+      <Row label="Distribute">
+        {DISTRIBUTE_BUTTONS.map(({ axis, label, keys, icon: Icon }) => (
+          <IconButton
+            key={axis}
+            label={label}
+            title={count < 3 ? `${label}: select 3 or more objects` : `${label} (${keys})`}
+            disabled={count < 3}
+            compact
+            onClick={() => store().distribute(selection, axis)}
+          >
+            <Icon size={18} />
+          </IconButton>
+        ))}
+      </Row>
+    </>
+  )
+}
 
 interface Choice<T extends string> {
   value: T
@@ -704,6 +780,8 @@ function SelectionProperties() {
         </div>
       </Header>
 
+      <TransformFields />
+      <AlignRows count={outermost(doc, selection).length} />
       {direct && <AnchorRow />}
       {filled.length > 0 && (
         <ColorRow

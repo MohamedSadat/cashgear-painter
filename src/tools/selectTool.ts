@@ -1,3 +1,4 @@
+import type { AlignEdge, Axis } from '../lib/align/align'
 import { canvasBounds, nodeBounds, unionBoxes, type Box } from '../lib/geometry/bounds'
 import { deltaInParent } from '../lib/geometry/transform'
 import { beginSnap, currentThreshold } from '../lib/snap/session'
@@ -44,6 +45,40 @@ const ARROWS: Record<string, [number, number]> = {
   ArrowRight: [1, 0],
   ArrowUp: [0, -1],
   ArrowDown: [0, 1],
+}
+
+// Alt + a letter aligns the selection; Alt + Shift + H or V distributes it.
+const ALIGN_KEYS: Record<string, AlignEdge> = {
+  a: 'left',
+  h: 'center',
+  d: 'right',
+  w: 'top',
+  v: 'middle',
+  s: 'bottom',
+}
+const DISTRIBUTE_KEYS: Record<string, Axis> = { h: 'x', v: 'y' }
+
+/**
+ * The letter on the key: by the character it types, or by its position where Alt makes it type
+ * another character, as Option does on a Mac.
+ */
+function letterOf(e: KeyboardEvent): string | null {
+  if (/^[a-z]$/i.test(e.key)) return e.key.toLowerCase()
+  return /^Key[A-Z]$/.test(e.code) ? e.code.slice(3).toLowerCase() : null
+}
+
+/** Aligns or distributes the selection for an Alt shortcut; true when the key is one of them. */
+function arrangeByKey(e: KeyboardEvent, selection: NodeId[]): boolean {
+  const letter = letterOf(e)
+  if (letter === null) return false
+  if (e.shiftKey) {
+    if (!Object.hasOwn(DISTRIBUTE_KEYS, letter)) return false
+    store().distribute(selection, DISTRIBUTE_KEYS[letter])
+  } else {
+    if (!Object.hasOwn(ALIGN_KEYS, letter)) return false
+    store().align(selection, ALIGN_KEYS[letter])
+  }
+  return true
 }
 
 type Xy = [number, number]
@@ -196,7 +231,9 @@ export function ungroupSelection(): void {
  * what lies fully inside it. Resize and rotate belong to the Transformer in SelectionOverlay.
  * A click picks a whole group; a double-click enters it and selects the child under the pointer,
  * and clicks then pick within it until one lands outside. Double-clicking a path switches to
- * direct select to edit its anchors, and double-clicking a text edits it.
+ * direct select to edit its anchors, and double-clicking a text edits it. Alt + A, H or D aligns
+ * the selection's left edges, centers or right edges, Alt + W, V or S its tops, middles or
+ * bottoms, and Alt + Shift + H or V distributes it.
  */
 export const selectTool: ToolController = {
   cursor: 'default',
@@ -292,7 +329,8 @@ export const selectTool: ToolController = {
       return true
     }
     const { doc, selection } = store()
-    if (drag || selection.length === 0 || e.altKey) return false
+    if (drag || selection.length === 0) return false
+    if (e.altKey) return !(e.ctrlKey || e.metaKey) && arrangeByKey(e, selection)
 
     if (!(e.ctrlKey || e.metaKey)) {
       if (e.key === 'Delete' || e.key === 'Backspace') {

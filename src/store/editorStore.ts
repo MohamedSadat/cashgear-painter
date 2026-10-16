@@ -1,5 +1,12 @@
 import { produce, type Draft } from 'immer'
 import { create } from 'zustand'
+import {
+  alignPatch,
+  distributePatch,
+  type AlignEdge,
+  type Axis,
+  type Patch,
+} from '../lib/align/align'
 import { isIdentity } from '../lib/geometry/bounds'
 import { shapeAnchors } from '../lib/geometry/pathData'
 import { WEB_SAFE_FONTS } from '../lib/geometry/textLayout'
@@ -170,6 +177,9 @@ export interface EditorState {
   textStyle: TextStyle // for new text; not in history or autosave
   editingText: NodeId | null // the text the textarea overlay is editing
   toast: Toast | null // a short message, such as what an import skipped
+  // What the Transformer drag in progress will change, so the panel's fields follow it live.
+  transformPreview: Patch | null
+  ratioLocked: boolean // the W and H fields keep the ratio; not in history or autosave
 
   addNodes(nodes: VectorNode[], parentId?: NodeId): void
   replaceDoc(doc: Doc): void
@@ -185,6 +195,8 @@ export interface EditorState {
   copy(ids: NodeId[]): void
   paste(): void
   convertToPath(ids: NodeId[]): void
+  align(ids: NodeId[], where: AlignEdge): void
+  distribute(ids: NodeId[], axis: Axis): void
   beginGesture(): void
   endGesture(): void
   cancelGesture(): void
@@ -206,6 +218,8 @@ export interface EditorState {
   setActiveAnchor(anchor: AnchorRef | null): void
   setTextStyle(style: Partial<TextStyle>): void
   setEditingText(id: NodeId | null): void
+  setTransformPreview(patch: Patch | null): void
+  setRatioLocked(on: boolean): void
   showToast(message: string): void
   dismissToast(id: number): void
   setCurrentPage(id: string): void
@@ -821,6 +835,8 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     textStyle: DEFAULT_TEXT_STYLE,
     editingText: null,
     toast: null,
+    transformPreview: null,
+    ratioLocked: false,
 
     addNodes(nodes, parentId) {
       // Nodes inside an added group stay there: the group's childIds already place them.
@@ -1111,6 +1127,21 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       })
     },
 
+    align(ids, where) {
+      const { doc, currentPageId } = get()
+      const picked = outermost(doc, ids)
+      if (picked.length === 0) return
+      // One object lines up with its page.
+      const page = pageById(doc, pageOf(doc, picked[0]) ?? currentPageId) ?? currentPageOf(get())
+      const box = { minX: 0, minY: 0, maxX: page.width, maxY: page.height }
+      get().updateNodes(alignPatch(doc.nodes, picked, where, box))
+    },
+
+    distribute(ids, axis) {
+      const { doc } = get()
+      get().updateNodes(distributePatch(doc.nodes, outermost(doc, ids), axis))
+    },
+
     beginGesture() {
       const { gestureStart, doc } = get()
       if (gestureStart) return
@@ -1263,6 +1294,14 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 
     setEditingText(id) {
       set({ editingText: id })
+    },
+
+    setTransformPreview(patch) {
+      if (patch !== get().transformPreview) set({ transformPreview: patch })
+    },
+
+    setRatioLocked(on) {
+      set({ ratioLocked: on })
     },
 
     showToast(message) {

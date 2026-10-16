@@ -1107,6 +1107,71 @@ describe('selectTool groups from the keyboard', () => {
   })
 })
 
+describe('selectTool align and distribute from the keyboard', () => {
+  const plain = { ...DEFAULT_SHAPE_STYLE, stroke: null, fill: solid('#000000') }
+  const addRects = (...xs: number[]) => {
+    const rects = xs.map((x, i) => createRectNode({ x, y: 100 * i, width: 100, height: 50 }, plain))
+    store().addNodes(rects)
+    return rects.map((r) => r.id)
+  }
+  const box = (id: string) => {
+    const t = store().doc.nodes[id].transform
+    return { left: t.x, top: t.y }
+  }
+
+  it('aligns on Alt + A, H, D, W, V and S, one undo step each', () => {
+    const ids = addRects(100, 400, 700)
+    store().select(ids)
+    const steps = store().past.length
+    const press = (key: string) =>
+      selectTool.onKey?.(keyEvent(key, { altKey: true, code: `Key${key.toUpperCase()}` }))
+
+    expect(press('d')).toBe(true)
+    expect(ids.map((id) => box(id).left)).toEqual([700, 700, 700])
+    // Lined up already: the key is taken, and nothing is recorded.
+    expect(press('a')).toBe(true)
+    expect(ids.map((id) => box(id).left)).toEqual([700, 700, 700])
+    expect(press('s')).toBe(true)
+    expect(ids.map((id) => box(id).top)).toEqual([200, 200, 200])
+    expect(store().past).toHaveLength(steps + 2)
+  })
+
+  it('reads the key by its position when Alt types another character, as Option does', () => {
+    const ids = addRects(100, 400)
+    store().select(ids)
+    expect(selectTool.onKey?.(keyEvent('å', { altKey: true, code: 'KeyA' }))).toBe(true)
+    expect(ids.map((id) => box(id).left)).toEqual([100, 100])
+  })
+
+  it('distributes on Alt + Shift + H and V', () => {
+    const ids = addRects(0, 150, 900)
+    store().select(ids)
+    expect(selectTool.onKey?.(keyEvent('H', { altKey: true, shiftKey: true, code: 'KeyH' }))).toBe(
+      true,
+    )
+    expect(box(ids[1]).left).toBe(450)
+    expect(selectTool.onKey?.(keyEvent('V', { altKey: true, shiftKey: true, code: 'KeyV' }))).toBe(
+      true,
+    )
+    // 0–50, 100–150 and 200–250 already have equal gaps.
+    expect(box(ids[1]).top).toBe(100)
+  })
+
+  it('leaves other Alt keys, Ctrl + Alt and an empty selection to the browser', () => {
+    const ids = addRects(100, 400)
+    expect(selectTool.onKey?.(keyEvent('a', { altKey: true, code: 'KeyA' }))).toBe(false)
+    store().select(ids)
+    expect(selectTool.onKey?.(keyEvent('q', { altKey: true, code: 'KeyQ' }))).toBe(false)
+    expect(selectTool.onKey?.(keyEvent('a', { altKey: true, ctrlKey: true, code: 'KeyA' }))).toBe(
+      false,
+    )
+    expect(selectTool.onKey?.(keyEvent('A', { altKey: true, shiftKey: true, code: 'KeyA' }))).toBe(
+      false,
+    )
+    expect(box(ids[1]).left).toBe(400)
+  })
+})
+
 describe('textTool', () => {
   // At zoom 1, canvas units are screen pixels.
   beforeEach(() => {
