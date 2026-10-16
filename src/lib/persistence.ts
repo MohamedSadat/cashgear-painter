@@ -99,6 +99,8 @@ function isStyle(value: unknown): boolean {
   )
 }
 
+const isLength = (value: unknown) => isFiniteNumber(value) && value >= 0
+
 // Other node types get their checks in their own milestones; until then they are dropped.
 const TYPE_CHECKS: Record<string, (node: Record<string, unknown>) => boolean> = {
   stroke: (node) =>
@@ -107,6 +109,14 @@ const TYPE_CHECKS: Record<string, (node: Record<string, unknown>) => boolean> = 
     node.points.every(isPoint) &&
     isFiniteNumber(node.size) &&
     typeof node.usesPressure === 'boolean',
+  rect: (node) => isLength(node.width) && isLength(node.height) && isLength(node.cornerRadius),
+  ellipse: (node) => isLength(node.rx) && isLength(node.ry),
+  line: (node) =>
+    Array.isArray(node.points) &&
+    node.points.length === 4 &&
+    node.points.every(isFiniteNumber) &&
+    typeof node.arrowStart === 'boolean' &&
+    typeof node.arrowEnd === 'boolean',
 }
 
 function isNode(id: string, value: unknown): value is VectorNode {

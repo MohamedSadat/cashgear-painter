@@ -7,8 +7,10 @@ import {
   emptyDoc,
   type Doc,
   type NodeId,
+  type NodeOf,
   type Point,
   type StrokeNode,
+  type Style,
   type ToolId,
   type VectorNode,
 } from '../types'
@@ -18,8 +20,18 @@ export const MIN_SIZE = 1
 export const MAX_SIZE = 64
 export const MIN_ZOOM = 0.1 // screen pixels per canvas unit
 export const MAX_ZOOM = 32
-export const NUDGE_MERGE_MS = 500 // arrow-key nudges this close together are one undo step
+// Nudges, and edits sharing a merge key (a slider drag, a color picker), this close together are
+// one undo step.
+export const MERGE_MS = 500
 export const PASTE_OFFSET = 10 // canvas units between a copy and its duplicate or paste
+
+/** The style new rectangles, ellipses and lines start with: a black outline and no fill. */
+export const DEFAULT_SHAPE_STYLE: Style = {
+  fill: null,
+  stroke: '#000000',
+  strokeWidth: 4,
+  opacity: 1,
+}
 
 export type ZOrder = 'forward' | 'backward' | 'front' | 'back'
 
@@ -56,6 +68,7 @@ export interface EditorState {
   gestureStart: Doc | null // doc when the current drag began
   tool: ToolId
   brush: Brush
+  shapeStyle: Style // for new rects, ellipses and lines; not in history or autosave
   view: View // zoom and pan, not in history
   viewport: Viewport // measured canvas area; not in history or autosave
   draft: VectorNode | null // the node being drawn right now; not in history or autosave
@@ -64,7 +77,7 @@ export interface EditorState {
   clipboard: VectorNode[] // copied nodes with their descendants; not in history or autosave
 
   addNodes(nodes: VectorNode[], parentId?: NodeId): void
-  updateNodes(patch: Record<NodeId, Partial<VectorNode>>): void
+  updateNodes(patch: Record<NodeId, Partial<VectorNode>>, mergeKey?: string): void
   deleteNodes(ids: NodeId[]): void
   reorder(ids: NodeId[], where: ZOrder): void
   nudge(ids: NodeId[], dx: number, dy: number): void
@@ -80,6 +93,7 @@ export interface EditorState {
   select(ids: NodeId[], mode?: 'replace' | 'add' | 'toggle'): void
   setTool(t: ToolId): void
   setBrush(brush: Partial<Brush>): void
+  setShapeStyle(style: Partial<Style>): void
   setDraft(node: VectorNode | null): void
   setErasing(ids: NodeId[]): void
   setMarquee(rect: Rect | null): void
@@ -118,6 +132,60 @@ export function createStrokeNode(
   }
 }
 
+/** The fields every new top-level node starts with, placed at (x, y). */
+function newBase(id: NodeId, name: string, style: Style, x: number, y: number) {
+  return {
+    id,
+    name,
+    parentId: null,
+    transform: { ...IDENTITY_TRANSFORM, x, y },
+    style,
+    hidden: false,
+    locked: false,
+  }
+}
+
+/** A rectangle filling `box`, placed at its top-left corner. */
+export function createRectNode(box: Rect, style: Style, id: NodeId = newNodeId()): NodeOf<'rect'> {
+  return {
+    ...newBase(id, 'Rectangle', style, box.x, box.y),
+    type: 'rect',
+    width: box.width,
+    height: box.height,
+    cornerRadius: 0,
+  }
+}
+
+/** The ellipse inside `box`, placed at its center. */
+export function createEllipseNode(
+  box: Rect,
+  style: Style,
+  id: NodeId = newNodeId(),
+): NodeOf<'ellipse'> {
+  return {
+    ...newBase(id, 'Ellipse', style, box.x + box.width / 2, box.y + box.height / 2),
+    type: 'ellipse',
+    rx: box.width / 2,
+    ry: box.height / 2,
+  }
+}
+
+/** A line from `from` to `to` without arrowheads, placed at `from`. */
+export function createLineNode(
+  from: readonly [number, number],
+  to: readonly [number, number],
+  style: Style,
+  id: NodeId = newNodeId(),
+): NodeOf<'line'> {
+  return {
+    ...newBase(id, 'Line', style, from[0], from[1]),
+    type: 'line',
+    points: [0, 0, to[0] - from[0], to[1] - from[1]],
+    arrowStart: false,
+    arrowEnd: false,
+  }
+}
+
 function pushSnapshot(past: Doc[], doc: Doc): Doc[] {
   const next = [...past, doc]
   return next.length > HISTORY_LIMIT ? next.slice(next.length - HISTORY_LIMIT) : next
@@ -132,6 +200,11 @@ function existing(selection: NodeId[], doc: Doc): NodeId[] {
 export function clampSize(n: number): number {
   if (!Number.isFinite(n)) return MIN_SIZE
   return Math.min(MAX_SIZE, Math.max(MIN_SIZE, Math.round(n)))
+}
+
+export function clampOpacity(n: number): number {
+  if (!Number.isFinite(n)) return 1
+  return Math.min(1, Math.max(0, n))
 }
 
 export function clampZoom(zoom: number): number {
@@ -244,8 +317,19 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     set({ selection: copies.topIds })
   }
 
-  // The doc the last nudge produced, and when: a nudge soon after, with no edit between, merges.
-  let lastNudge: { at: number; doc: Doc } | null = null
+  // The doc the last mergeable edit produced, its key, and when: an edit with the same key soon
+  // after, with no other edit between, merges into it.
+  let lastMerge: { key: string; at: number; doc: Doc } | null = null
+  function commitMerging(key: string, recipe: (doc: Draft<Doc>) => void): void {
+    const now = Date.now()
+    const merge =
+      lastMerge !== null &&
+      lastMerge.key === key &&
+      lastMerge.doc === get().doc &&
+      now - lastMerge.at < MERGE_MS
+    commit(recipe, merge)
+    lastMerge = { key, at: now, doc: get().doc }
+  }
   // Pastes since the last copy, so repeated pastes step away from the original.
   let pasteCount = 0
 
@@ -257,6 +341,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     gestureStart: null,
     tool: 'brush',
     brush: { color: '#000000', size: 8 },
+    shapeStyle: DEFAULT_SHAPE_STYLE,
     view: { scale: 1, x: 0, y: 0 },
     viewport: { width: 0, height: 0, fit: 0 },
     draft: null,
@@ -281,13 +366,15 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       })
     },
 
-    updateNodes(patch) {
-      commit((doc) => {
+    updateNodes(patch, mergeKey) {
+      const recipe = (doc: Draft<Doc>) => {
         for (const [id, changes] of Object.entries(patch)) {
           const node = doc.nodes[id]
           if (node) Object.assign(node, changes)
         }
-      })
+      }
+      if (mergeKey === undefined) commit(recipe)
+      else commitMerging(mergeKey, recipe)
     },
 
     deleteNodes(ids) {
@@ -332,17 +419,13 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 
     nudge(ids, dx, dy) {
       if (dx === 0 && dy === 0) return
-      const now = Date.now()
-      const merge =
-        lastNudge !== null && lastNudge.doc === get().doc && now - lastNudge.at < NUDGE_MERGE_MS
-      commit((doc) => {
+      commitMerging('nudge', (doc) => {
         for (const id of ids) {
           const node = doc.nodes[id]
           if (!node || node.locked) continue
           node.transform = { ...node.transform, x: node.transform.x + dx, y: node.transform.y + dy }
         }
-      }, merge)
-      lastNudge = { at: now, doc: get().doc }
+      })
     },
 
     duplicate(ids) {
@@ -437,6 +520,18 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     setBrush(brush) {
       const current = get().brush
       set({ brush: { ...current, ...brush, size: clampSize(brush.size ?? current.size) } })
+    },
+
+    setShapeStyle(style) {
+      const current = get().shapeStyle
+      set({
+        shapeStyle: {
+          ...current,
+          ...style,
+          strokeWidth: clampSize(style.strokeWidth ?? current.strokeWidth),
+          opacity: clampOpacity(style.opacity ?? current.opacity),
+        },
+      })
     },
 
     setDraft(node) {

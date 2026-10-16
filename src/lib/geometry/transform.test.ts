@@ -8,7 +8,7 @@ import {
   type Point,
   type Transform,
 } from '../../types'
-import { bakeTransform, normalizeRotation } from './transform'
+import { bakeTransform, normalizeRotation, snapAngle } from './transform'
 
 const base: BaseNode = {
   id: 'n',
@@ -33,6 +33,24 @@ describe('normalizeRotation', () => {
     expect(normalizeRotation(-180)).toBe(180)
     expect(normalizeRotation(89.99999999999999)).toBe(90)
     expect(Object.is(normalizeRotation(-360), 0)).toBe(true)
+  })
+})
+
+describe('snapAngle', () => {
+  it('swings the point to the nearest 45° around the origin, keeping its distance', () => {
+    const [x1, y1] = snapAngle([10, 10], [110, 15])
+    expect(x1).toBeCloseTo(10 + Math.hypot(100, 5), 6)
+    expect(y1).toBe(10)
+
+    const [x2, y2] = snapAngle([0, 0], [100, 90])
+    expect(x2).toBeCloseTo(Math.hypot(100, 90) / Math.SQRT2, 6)
+    expect(y2).toBeCloseTo(x2, 6)
+  })
+
+  it('leaves no float noise on the snapped axis', () => {
+    const [x, y] = snapAngle([5, 5], [5.2, -95])
+    expect(x).toBe(5)
+    expect(y).toBeCloseTo(5 - Math.hypot(0.2, 100), 6)
   })
 })
 

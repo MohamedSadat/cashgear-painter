@@ -1,13 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { IDENTITY_TRANSFORM, type Point, type StrokeNode, type VectorNode } from '../types'
 import {
+  DEFAULT_SHAPE_STYLE,
   HISTORY_LIMIT,
   MAX_SIZE,
   MAX_ZOOM,
+  MERGE_MS,
   MIN_SIZE,
   MIN_ZOOM,
-  NUDGE_MERGE_MS,
   PASTE_OFFSET,
+  createEllipseNode,
+  createLineNode,
+  createRectNode,
   createStrokeNode,
   reorderIds,
   useEditorStore,
@@ -481,7 +485,7 @@ describe('nudge', () => {
     vi.useRealTimers()
   })
 
-  it(`moves unlocked nodes, merging nudges less than ${NUDGE_MERGE_MS} ms apart`, () => {
+  it(`moves unlocked nodes, merging nudges less than ${MERGE_MS} ms apart`, () => {
     vi.useFakeTimers()
     draw(0, 'a')
     draw(10, 'b')
@@ -489,14 +493,14 @@ describe('nudge', () => {
     const steps = store().past.length
 
     store().nudge(['a', 'b'], 1, 0)
-    vi.advanceTimersByTime(NUDGE_MERGE_MS - 100)
+    vi.advanceTimersByTime(MERGE_MS - 100)
     store().nudge(['a', 'b'], 0, 10)
 
     expect(node('a').transform).toMatchObject({ x: 1, y: 10 })
     expect(node('b').transform).toMatchObject({ x: 0, y: 0 })
     expect(store().past).toHaveLength(steps + 1)
 
-    vi.advanceTimersByTime(NUDGE_MERGE_MS + 100)
+    vi.advanceTimersByTime(MERGE_MS + 100)
     store().nudge(['a'], 1, 0)
     expect(store().past).toHaveLength(steps + 2)
 
@@ -515,6 +519,91 @@ describe('nudge', () => {
 
     expect(store().past).toHaveLength(4)
     expect(node('a').transform.x).toBe(2)
+  })
+})
+
+describe('merged updates', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it(`merges updates with the same key less than ${MERGE_MS} ms apart`, () => {
+    vi.useFakeTimers()
+    draw(0, 'a')
+
+    // A slider drag: many values, one step back to where it began.
+    for (const size of [10, 12, 14]) {
+      store().updateNodes({ a: { size } }, 'size')
+      vi.advanceTimersByTime(MERGE_MS - 100)
+    }
+    expect(store().past).toHaveLength(2)
+
+    vi.advanceTimersByTime(200)
+    store().updateNodes({ a: { size: 20 } }, 'size')
+    expect(store().past).toHaveLength(3)
+
+    store().undo()
+    expect(node('a').size).toBe(14)
+    store().undo()
+    expect(node('a').size).toBe(8)
+  })
+
+  it('keeps different keys, plain updates and nudges apart', () => {
+    vi.useFakeTimers()
+    draw(0, 'a')
+
+    store().updateNodes({ a: { size: 10 } }, 'size')
+    store().updateNodes({ a: { usesPressure: true } }, 'pressure')
+    store().updateNodes({ a: { size: 12 } })
+    store().updateNodes({ a: { size: 14 } })
+    store().nudge(['a'], 1, 0)
+    store().updateNodes({ a: { size: 16 } }, 'size')
+
+    expect(store().past).toHaveLength(7)
+  })
+})
+
+describe('shape style and new shapes', () => {
+  it('keeps the style for new shapes outside history, with clamped width and opacity', () => {
+    store().setShapeStyle({ fill: '#ef4444', strokeWidth: 500, opacity: 2 })
+    expect(store().shapeStyle).toEqual({
+      fill: '#ef4444',
+      stroke: '#000000',
+      strokeWidth: MAX_SIZE,
+      opacity: 1,
+    })
+
+    store().setShapeStyle({ stroke: null, strokeWidth: -3, opacity: -1 })
+    expect(store().shapeStyle).toMatchObject({ stroke: null, strokeWidth: MIN_SIZE, opacity: 0 })
+    expect(store().past).toEqual([])
+  })
+
+  it('places a rect at its corner, an ellipse at its center and a line at its start', () => {
+    const box = { x: 10, y: 20, width: 100, height: 50 }
+
+    expect(createRectNode(box, DEFAULT_SHAPE_STYLE, 'r')).toMatchObject({
+      id: 'r',
+      type: 'rect',
+      name: 'Rectangle',
+      transform: { ...IDENTITY_TRANSFORM, x: 10, y: 20 },
+      style: DEFAULT_SHAPE_STYLE,
+      width: 100,
+      height: 50,
+      cornerRadius: 0,
+    })
+    expect(createEllipseNode(box, DEFAULT_SHAPE_STYLE)).toMatchObject({
+      type: 'ellipse',
+      transform: { x: 60, y: 45 },
+      rx: 50,
+      ry: 25,
+    })
+    expect(createLineNode([10, 20], [110, 70], DEFAULT_SHAPE_STYLE)).toMatchObject({
+      type: 'line',
+      transform: { x: 10, y: 20 },
+      points: [0, 0, 100, 50],
+      arrowStart: false,
+      arrowEnd: false,
+    })
   })
 })
 

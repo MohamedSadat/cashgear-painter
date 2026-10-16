@@ -1,7 +1,20 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createStore } from 'zustand/vanilla'
-import { createStrokeNode } from '../store/editorStore'
-import { emptyDoc, type Doc, type Point, type StrokeNode } from '../types'
+import {
+  DEFAULT_SHAPE_STYLE,
+  createEllipseNode,
+  createLineNode,
+  createRectNode,
+  createStrokeNode,
+} from '../store/editorStore'
+import {
+  emptyDoc,
+  type Doc,
+  type NodeOf,
+  type Point,
+  type StrokeNode,
+  type VectorNode,
+} from '../types'
 import {
   SAVE_DELAY_MS,
   STORAGE_KEY,
@@ -27,7 +40,18 @@ function memoryStore(): KeyValueStore & { data: Map<string, unknown> } {
 const stroke = (id: string, points: Point[] = [[10.04, 20.06, 0.5]]): StrokeNode =>
   createStrokeNode(points, { color: '#000000', size: 8, usesPressure: false }, id)
 
-function docWith(...nodes: StrokeNode[]): Doc {
+/** A rounded, turned rectangle, an ellipse and an arrow, with odd coordinates kept as they are. */
+function shapes(): [NodeOf<'rect'>, NodeOf<'ellipse'>, NodeOf<'line'>] {
+  const box = { x: 10.123, y: 20.456, width: 300.789, height: 100 }
+  const rect = createRectNode(box, { ...DEFAULT_SHAPE_STYLE, fill: '#ef4444' }, 'rect')
+  return [
+    { ...rect, cornerRadius: 12, transform: { ...rect.transform, rotation: 30 } },
+    createEllipseNode(box, { ...DEFAULT_SHAPE_STYLE, opacity: 0.5 }, 'ellipse'),
+    { ...createLineNode([0, 0], [55.55, -20], DEFAULT_SHAPE_STYLE, 'line'), arrowEnd: true },
+  ]
+}
+
+function docWith(...nodes: VectorNode[]): Doc {
   const doc = emptyDoc()
   for (const node of nodes) {
     doc.nodes[node.id] = node
@@ -104,16 +128,39 @@ describe('sanitizeDoc', () => {
 
   it('drops node types that have no checks yet', () => {
     const doc = docWith(stroke('a'))
-    doc.nodes.r = {
-      ...stroke('r'),
-      type: 'rect',
-      width: 10,
-      height: 10,
-      cornerRadius: 0,
-    } as unknown as StrokeNode
-    doc.rootIds.push('r')
+    doc.nodes.p = { ...stroke('p'), type: 'path', anchors: [], closed: false } as VectorNode
+    doc.rootIds.push('p')
 
     expect(sanitizeDoc(doc).rootIds).toEqual(['a'])
+  })
+
+  it('keeps rectangles, ellipses and lines', () => {
+    const doc = docWith(...shapes())
+
+    expect(sanitizeDoc(doc)).toEqual(doc)
+  })
+
+  it('drops malformed shapes', () => {
+    const [rect, ellipse, line] = shapes()
+    const doc = docWith(
+      { ...rect, id: 'r1', width: -1 },
+      { ...rect, id: 'r2', cornerRadius: Number.NaN },
+      { ...ellipse, id: 'e1', ry: '5' } as unknown as VectorNode,
+      { ...line, id: 'l1', points: [0, 0, 10] } as unknown as VectorNode,
+      { ...line, id: 'l2', arrowEnd: undefined } as unknown as VectorNode,
+      rect,
+    )
+
+    expect(sanitizeDoc(doc).rootIds).toEqual([rect.id])
+  })
+
+  it('round-trips shapes through storage unchanged', async () => {
+    const kv = memoryStore()
+    const doc = docWith(...shapes())
+
+    await saveDoc(doc, kv)
+
+    expect(await loadDoc(kv)).toEqual(doc)
   })
 })
 

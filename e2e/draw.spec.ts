@@ -545,3 +545,249 @@ test('marquee, select all, delete, duplicate, nudge and paste from the keyboard'
   await page.keyboard.press('Escape')
   expect(await selectedCount(page)).toBe(0)
 })
+
+const RED = [239, 68, 68, 255]
+const GREEN = [34, 197, 94, 255]
+const BLUE = [59, 130, 246, 255]
+
+/** The export pixel at an artboard point given as fractions of its width and height. */
+const exportPixel = ([fx, fy]: Xy): Xy => [Math.round(fx * 3200), Math.round(fy * 2000)]
+
+/** The Konva class of every shape on the content layer, bottom to top. */
+function shownShapes(page: Page): Promise<string[]> {
+  return page.evaluate(() =>
+    (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+      .getLayers()[1]
+      .getChildren()
+      .map((n) => n.getClassName()),
+  )
+}
+
+/** A Konva attribute of every shape on the content layer, bottom to top. */
+function shownAttr(page: Page, attr: string): Promise<unknown[]> {
+  return page.evaluate(
+    (attr) =>
+      (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+        .getLayers()[1]
+        .getChildren()
+        .map((n) => n.getAttrs()[attr]),
+    attr,
+  )
+}
+
+/** The page point at the middle of a named overlay shape, such as a line's 'line-end' handle. */
+function overlayPointOf(page: Page, name: string): Promise<Xy> {
+  return page.evaluate((name) => {
+    const stage = (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+    const rect = stage.findOne(`.${name}`)!.getClientRect()
+    const origin = stage.container().getBoundingClientRect()
+    return [origin.x + rect.x + rect.width / 2, origin.y + rect.y + rect.height / 2] as Xy
+  }, name)
+}
+
+test('rectangles, ellipses and lines draw, restyle and undo one step at a time', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const select = page.getByRole('button', { name: 'Select' })
+  const rectInside = exportPixel([0.2, 0.2])
+  const ellipseInside = exportPixel([0.5, 0.2])
+  const ellipseCorner = exportPixel([0.41, 0.11]) // inside its box, outside the ellipse
+  const onLine = exportPixel([0.4, 0.8])
+  // Canvas (940, 807): 7 units beside the line, 20 before its end, inside an arrowhead there.
+  const besideTip: Xy = [1880, 1614]
+
+  // A drawn shape is selected, with the select tool, so its style is right there to change.
+  await page.getByRole('button', { name: 'Rectangle' }).click()
+  await drawLine(page, [0.1, 0.1], [0.3, 0.3])
+  await expect(select).toHaveAttribute('aria-pressed', 'true')
+  expect(await shownShapes(page)).toEqual(['Rect'])
+  expect(await selectedCount(page)).toBe(1)
+  // New shapes are outlines without a fill.
+  expect((await exportPixels(page, [rectInside])).values).toEqual([WHITE])
+  await page.getByRole('button', { name: 'Fill #ef4444' }).click()
+
+  await page.keyboard.press('o')
+  await expect(page.getByRole('heading', { name: 'New ellipse' })).toBeVisible()
+  await drawLine(page, [0.4, 0.1], [0.6, 0.3])
+  await page.getByRole('button', { name: 'Fill #3b82f6' }).click()
+
+  // A line gets a handle on each end instead of the Transformer's box.
+  await page.keyboard.press('l')
+  await drawLine(page, [0.2, 0.8], [0.6, 0.8])
+  expect(await selectedCount(page)).toBe(0)
+  await page.getByRole('slider', { name: 'Stroke width' }).focus()
+  for (let i = 0; i < 8; i++) await page.keyboard.press('ArrowRight')
+  await expect(page.getByRole('group', { name: 'Width' })).toContainText('12')
+  await page.getByRole('button', { name: 'Stroke #ef4444' }).click()
+  await page.getByRole('button', { name: 'End arrowhead' }).click()
+  await expect(page.getByRole('button', { name: 'End arrowhead' })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+
+  expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse', 'Arrow'])
+  expect(
+    (await exportPixels(page, [rectInside, ellipseInside, ellipseCorner, onLine, besideTip]))
+      .values,
+  ).toEqual([RED, BLUE, WHITE, RED, RED])
+
+  // The line: arrowhead, color and the whole slider drag of its width are a step each.
+  await undo.click()
+  expect((await exportPixels(page, [onLine, besideTip])).values).toEqual([RED, WHITE])
+  await undo.click()
+  expect((await exportPixels(page, [onLine])).values).toEqual([BLACK])
+  await undo.click()
+  expect(await shownAttr(page, 'strokeWidth')).toEqual([4, 4, 4])
+  await undo.click()
+  expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
+
+  // The ellipse and the rectangle: a fill and the shape itself each.
+  await undo.click()
+  expect((await exportPixels(page, [ellipseInside])).values).toEqual([WHITE])
+  await undo.click()
+  await undo.click()
+  expect((await exportPixels(page, [rectInside])).values).toEqual([WHITE])
+  await undo.click()
+  await expect(undo).toBeDisabled()
+  expect(await shownShapes(page)).toEqual([])
+})
+
+test('the properties panel shows mixed values and restyles a whole selection as one step', async ({
+  page,
+}) => {
+  const inside = [exportPixel([0.2, 0.2]), exportPixel([0.5, 0.2])]
+  await page.keyboard.press('r')
+  await drawLine(page, [0.1, 0.1], [0.3, 0.3])
+  await page.getByRole('button', { name: 'Fill #ef4444' }).click()
+  await page.keyboard.press('o')
+  await drawLine(page, [0.4, 0.1], [0.6, 0.3])
+  await page.getByRole('button', { name: 'Fill #3b82f6' }).click()
+
+  await page.keyboard.press('Control+a')
+  await expect(page.getByRole('heading', { name: '2 objects' })).toBeVisible()
+  const fill = page.getByRole('group', { name: 'Fill' })
+  await expect(fill).toContainText('Mixed')
+  await page.getByRole('button', { name: 'Fill #22c55e' }).click()
+  await expect(fill).not.toContainText('Mixed')
+  expect((await exportPixels(page, inside)).values).toEqual([GREEN, GREEN])
+
+  // Moving a slider step by step is one undo step too.
+  await page.getByRole('slider', { name: 'Stroke width' }).focus()
+  for (let i = 0; i < 10; i++) await page.keyboard.press('ArrowRight')
+  expect(await shownAttr(page, 'strokeWidth')).toEqual([14, 14])
+
+  await page.keyboard.press('Control+z')
+  expect(await shownAttr(page, 'strokeWidth')).toEqual([4, 4])
+  await page.keyboard.press('Control+z')
+  expect((await exportPixels(page, inside)).values).toEqual([RED, BLUE])
+
+  // Shapes are saved and come back after a reload.
+  await expect.poll(() => savedNodeCount(page)).toBe(2)
+  await page.reload()
+  await waitForCanvas(page)
+  expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
+  expect((await exportPixels(page, inside)).values).toEqual([RED, BLUE])
+})
+
+test('duplicate, delete and z-order have buttons for touch screens', async ({ page }) => {
+  await page.keyboard.press('r')
+  await drawLine(page, [0.1, 0.1], [0.3, 0.3])
+  await page.keyboard.press('o')
+  await drawLine(page, [0.2, 0.2], [0.4, 0.4])
+
+  await page.getByRole('button', { name: 'Send to back' }).click()
+  expect(await shownShapes(page)).toEqual(['Ellipse', 'Rect'])
+  await page.getByRole('button', { name: 'Bring forward' }).click()
+  expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
+  await page.getByRole('button', { name: 'Duplicate' }).click()
+  expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse', 'Ellipse'])
+  await page.getByRole('button', { name: 'Delete' }).click()
+  expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
+  await expect(page.getByRole('heading', { name: 'Nothing selected' })).toBeVisible()
+
+  // Delete, duplicate and bring forward, then send to back.
+  for (let i = 0; i < 3; i++) await page.keyboard.press('Control+z')
+  expect(await shownShapes(page)).toEqual(['Ellipse', 'Rect'])
+  await page.keyboard.press('Control+z')
+  expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
+})
+
+test('a line end drags and snaps to 45° with Shift, as one undo step', async ({ page }) => {
+  await page.keyboard.press('l')
+  // Canvas (320, 500) to (640, 500).
+  await drawLine(page, [0.2, 0.5], [0.4, 0.5])
+  const box = await artboardBox(page)
+  const end = await overlayPointOf(page, 'line-end')
+
+  await page.keyboard.down('Shift')
+  await drag(page, end, onArtboard(box, [0.35, 0.25]))
+  await page.keyboard.up('Shift')
+
+  const [[x1, y1, x2, y2]] = (await shownAttr(page, 'points')) as number[][]
+  expect(x2 - x1).toBeCloseTo(-(y2 - y1), 6)
+  expect(y2 - y1).toBeLessThan(-100)
+
+  await page.keyboard.press('Control+z')
+  const [points] = (await shownAttr(page, 'points')) as number[][]
+  expect(Math.abs(points[3] - points[1])).toBeLessThan(2)
+  await expect(page.getByRole('button', { name: 'Undo' })).toBeEnabled()
+})
+
+/** A one-finger drag between two page points. */
+async function touchDrag(page: Page, from: Xy, to: Xy, steps = 8) {
+  await touch(page, 'pointerdown', 1, from)
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps
+    await touch(page, 'pointermove', 1, [
+      from[0] + (to[0] - from[0]) * t,
+      from[1] + (to[1] - from[1]) * t,
+    ])
+  }
+  await touch(page, 'pointerup', 1, to)
+}
+
+test.describe('on a 375 px phone', () => {
+  test.use({ viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: true })
+
+  test('each shape draws by touch, restyles and undoes, with the panel as a bottom sheet', async ({
+    page,
+  }) => {
+    const undo = page.getByRole('button', { name: 'Undo' })
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(375)
+    const canvas = (await page.getByTestId('canvas').boundingBox())!
+    const panel = (await page.getByRole('complementary', { name: 'Properties' }).boundingBox())!
+    expect(panel.y).toBeGreaterThanOrEqual(canvas.y + canvas.height - 1)
+    expect(panel.width).toBe(375)
+
+    const shapes = [
+      { tool: 'Rectangle', from: [0.1, 0.2], to: [0.3, 0.6], color: 'Fill #22c55e' },
+      { tool: 'Ellipse', from: [0.4, 0.2], to: [0.6, 0.6], color: 'Fill #22c55e' },
+      { tool: 'Line', from: [0.1, 0.8], to: [0.6, 0.8], color: 'Stroke #22c55e' },
+    ] satisfies { tool: string; from: Xy; to: Xy; color: string }[]
+    for (const { tool, from, to, color } of shapes) {
+      await page.getByRole('button', { name: tool }).tap()
+      const box = await artboardBox(page)
+      await touchDrag(page, onArtboard(box, from), onArtboard(box, to))
+      await expect(page.getByRole('button', { name: 'Select' })).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      )
+      await page.getByRole('button', { name: color }).tap()
+    }
+
+    expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse', 'Arrow'])
+    expect(await shownAttr(page, 'stroke')).toEqual(['#000000', '#000000', '#22c55e'])
+    const inside = [exportPixel([0.2, 0.4]), exportPixel([0.5, 0.4])]
+    expect((await exportPixels(page, inside)).values).toEqual([GREEN, GREEN])
+
+    // A shape and its color are two steps each.
+    await undo.tap()
+    expect(await shownAttr(page, 'stroke')).toEqual(['#000000', '#000000', '#000000'])
+    for (let i = 0; i < 3; i++) await undo.tap()
+    expect((await exportPixels(page, inside)).values).toEqual([GREEN, WHITE])
+    for (let i = 0; i < 2; i++) await undo.tap()
+    await expect(undo).toBeDisabled()
+    expect(await shownShapes(page)).toEqual([])
+  })
+})

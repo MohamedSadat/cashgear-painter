@@ -8,6 +8,24 @@ export function normalizeRotation(degrees: number): number {
   return rounded === -180 ? 180 : rounded
 }
 
+/**
+ * `to`, swung around `from` to the nearest multiple of `stepDegrees` while keeping its distance:
+ * Shift's 45° snap for lines. Float noise such as 6e-17 is rounded away.
+ */
+export function snapAngle(
+  from: readonly [number, number],
+  to: readonly [number, number],
+  stepDegrees = 45,
+): [number, number] {
+  const dx = to[0] - from[0]
+  const dy = to[1] - from[1]
+  const length = Math.hypot(dx, dy)
+  const step = (stepDegrees * Math.PI) / 180
+  const angle = Math.round(Math.atan2(dy, dx) / step) * step
+  const clean = (n: number) => Math.round(n * 1e9) / 1e9
+  return [clean(from[0] + Math.cos(angle) * length), clean(from[1] + Math.sin(angle) * length)]
+}
+
 export function sameTransform(a: Transform, b: Transform): boolean {
   return (
     a.x === b.x &&

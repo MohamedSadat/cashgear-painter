@@ -1,5 +1,14 @@
-import type { StrokeNode, VectorNode } from '../../types'
-import { applyTransform, boxesOverlap, isIdentity, nodeBounds, pointsBox, type Vec } from './bounds'
+import type { ShapeNode, StrokeNode, VectorNode } from '../../types'
+import {
+  applyTransform,
+  arrowHeadSize,
+  boxesOverlap,
+  isIdentity,
+  nodeBounds,
+  outlineReach,
+  pointsBox,
+  type Vec,
+} from './bounds'
 
 /** Distance from (px, py) to the segment a–b; a zero-length segment is a point. */
 export function distToSegment(px: number, py: number, a: Vec, b: Vec): number {
@@ -32,6 +41,22 @@ export function segmentsDistance(a: Vec, b: Vec, c: Vec, d: Vec): number {
   )
 }
 
+/** Whether the point lies inside the polygon (even-odd rule). */
+export function pointInPolygon(p: Vec, polygon: ReadonlyArray<Vec>): boolean {
+  let inside = false
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const a = polygon[i]
+    const b = polygon[j]
+    if (
+      a[1] > p[1] !== b[1] > p[1] &&
+      p[0] < ((b[0] - a[0]) * (p[1] - a[1])) / (b[1] - a[1]) + a[0]
+    ) {
+      inside = !inside
+    }
+  }
+  return inside
+}
+
 const canvasPointsCache = new WeakMap<StrokeNode, Vec[]>()
 
 /** A stroke's points in canvas units, after its transform. */
@@ -45,21 +70,148 @@ function canvasPoints(node: StrokeNode): ReadonlyArray<Vec> {
   return points
 }
 
+/** A piece of a shape's outline in canvas units; filled pieces are hit inside too. */
+interface Contour {
+  points: Vec[]
+  closed: boolean
+  filled: boolean
+}
+
+// Segments per quarter of a rounded corner, and around a whole ellipse.
+const ARC_STEPS = 8
+const ELLIPSE_STEPS = 64
+
+function roundedRectPoints(width: number, height: number, cornerRadius: number): Vec[] {
+  const r = Math.max(0, Math.min(cornerRadius, width / 2, height / 2))
+  if (r === 0) {
+    return [
+      [0, 0],
+      [width, 0],
+      [width, height],
+      [0, height],
+    ]
+  }
+  // Each corner's center and the angle its arc starts at, clockwise from the top right.
+  const corners: [number, number, number][] = [
+    [width - r, r, -90],
+    [width - r, height - r, 0],
+    [r, height - r, 90],
+    [r, r, 180],
+  ]
+  const points: Vec[] = []
+  for (const [cx, cy, start] of corners) {
+    for (let i = 0; i <= ARC_STEPS; i++) {
+      const angle = ((start + (90 * i) / ARC_STEPS) * Math.PI) / 180
+      points.push([cx + r * Math.cos(angle), cy + r * Math.sin(angle)])
+    }
+  }
+  return points
+}
+
+/** The arrowhead at `tip`, pointing away from `from`, as Konva's Arrow draws it. */
+function arrowHead(tip: Vec, from: Vec, size: number): Vec[] {
+  const angle = Math.atan2(tip[1] - from[1], tip[0] - from[0]) // 0 for a zero-length line
+  const ux = Math.cos(angle)
+  const uy = Math.sin(angle)
+  const bx = tip[0] - ux * size
+  const by = tip[1] - uy * size
+  const half = size / 2
+  return [tip, [bx - uy * half, by + ux * half], [bx + uy * half, by - ux * half]]
+}
+
+/** A shape's outline pieces in its own coordinates. */
+function localContours(node: ShapeNode): Contour[] {
+  switch (node.type) {
+    case 'rect':
+      return [
+        {
+          points: roundedRectPoints(node.width, node.height, node.cornerRadius),
+          closed: true,
+          filled: node.style.fill !== null,
+        },
+      ]
+    case 'ellipse': {
+      const points: Vec[] = []
+      for (let i = 0; i < ELLIPSE_STEPS; i++) {
+        const angle = (i / ELLIPSE_STEPS) * Math.PI * 2
+        points.push([node.rx * Math.cos(angle), node.ry * Math.sin(angle)])
+      }
+      return [{ points, closed: true, filled: node.style.fill !== null }]
+    }
+    case 'line': {
+      const [x1, y1, x2, y2] = node.points
+      const start: Vec = [x1, y1]
+      const end: Vec = [x2, y2]
+      const contours: Contour[] = [{ points: [start, end], closed: false, filled: false }]
+      // Arrowheads are filled with the line's color.
+      const size = arrowHeadSize(node.style.strokeWidth)
+      const filled = node.style.stroke !== null
+      if (node.arrowEnd)
+        contours.push({ points: arrowHead(end, start, size), closed: true, filled })
+      if (node.arrowStart) {
+        contours.push({ points: arrowHead(start, end, size), closed: true, filled })
+      }
+      return contours
+    }
+  }
+}
+
+const contoursCache = new WeakMap<ShapeNode, Contour[]>()
+
+/** A shape's outline pieces in canvas units, after its transform. */
+function canvasContours(node: ShapeNode): Contour[] {
+  let contours = contoursCache.get(node)
+  if (!contours) {
+    contours = localContours(node).map((c) => ({
+      ...c,
+      points: c.points.map((p) => applyTransform(node.transform, p[0], p[1])),
+    }))
+    contoursCache.set(node, contours)
+  }
+  return contours
+}
+
+/** Shortest distance from the segment a–b to the contour's edges. */
+function contourDistance({ points, closed }: Contour, a: Vec, b: Vec): number {
+  let best = Infinity
+  const count = closed ? points.length : points.length - 1
+  for (let i = 0; i < count; i++) {
+    best = Math.min(best, segmentsDistance(points[i], points[(i + 1) % points.length], a, b))
+    if (best === 0) break
+  }
+  return best
+}
+
+const isShape = (node: VectorNode): node is ShapeNode =>
+  node.type === 'rect' || node.type === 'ellipse' || node.type === 'line'
+
 /**
  * Whether a circle of `radius` swept from a to b touches the node's ink. Testing the swept segment,
- * not just its ends, keeps a fast swipe from skipping strokes between two pointer samples.
+ * not just its ends, keeps a fast swipe from skipping strokes between two pointer samples. An
+ * unfilled shape is touched only on its outline, as it is picked on the canvas.
  */
 export function nodeHitsSegment(node: VectorNode, a: Vec, b: Vec, radius: number): boolean {
-  if (node.type !== 'stroke') return false
+  if (node.type !== 'stroke' && !isShape(node)) return false
   const bounds = nodeBounds(node)
   if (!bounds || !boxesOverlap(bounds, pointsBox([a, b], radius))) return false
-
+  // Outlines scale with their node, so the ink's half-width does too.
   const { scaleX, scaleY } = node.transform
-  const reach = radius + (node.size / 2) * ((Math.abs(scaleX) + Math.abs(scaleY)) / 2)
-  const points = canvasPoints(node)
-  if (points.length === 1) return distToSegment(points[0][0], points[0][1], a, b) <= reach
-  for (let i = 1; i < points.length; i++) {
-    if (segmentsDistance(points[i - 1], points[i], a, b) <= reach) return true
+  const scale = (Math.abs(scaleX) + Math.abs(scaleY)) / 2
+
+  if (node.type === 'stroke') {
+    const reach = radius + (node.size / 2) * scale
+    const points = canvasPoints(node)
+    if (points.length === 1) return distToSegment(points[0][0], points[0][1], a, b) <= reach
+    for (let i = 1; i < points.length; i++) {
+      if (segmentsDistance(points[i - 1], points[i], a, b) <= reach) return true
+    }
+    return false
   }
-  return false
+
+  const reach = radius + outlineReach(node) * scale
+  return canvasContours(node).some(
+    (contour) =>
+      contourDistance(contour, a, b) <= reach ||
+      (contour.filled && pointInPolygon(a, contour.points)),
+  )
 }

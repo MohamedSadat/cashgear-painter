@@ -151,7 +151,7 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
     // The padding only shapes the fit; the Stage fills the whole area, padding included.
     <div
       ref={containerRef}
-      className="relative min-h-0 flex-1 touch-none overflow-hidden p-2 select-none [-webkit-touch-callout:none] sm:p-4"
+      className="relative min-h-0 min-w-0 flex-1 touch-none overflow-hidden p-2 select-none [-webkit-touch-callout:none] sm:p-4"
     >
       {viewport.fit > 0 && (
         <div
