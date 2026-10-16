@@ -102,6 +102,8 @@ function isStyle(value: unknown): boolean {
 const isLength = (value: unknown) => isFiniteNumber(value) && value >= 0
 
 const ANCHOR_KINDS: ReadonlySet<unknown> = new Set(['corner', 'smooth', 'symmetric'])
+const FONT_STYLES: ReadonlySet<unknown> = new Set(['normal', 'bold', 'italic', 'bold italic'])
+const ALIGNS: ReadonlySet<unknown> = new Set(['left', 'center', 'right'])
 
 function isAnchor(value: unknown): boolean {
   return (
@@ -111,7 +113,7 @@ function isAnchor(value: unknown): boolean {
   )
 }
 
-// Other node types get their checks in their own milestones; until then they are dropped.
+// Unknown node types are dropped.
 const TYPE_CHECKS: Record<string, (node: Record<string, unknown>) => boolean> = {
   stroke: (node) =>
     Array.isArray(node.points) &&
@@ -133,6 +135,18 @@ const TYPE_CHECKS: Record<string, (node: Record<string, unknown>) => boolean> = 
     node.anchors.length >= 2 &&
     node.anchors.every(isAnchor) &&
     typeof node.closed === 'boolean',
+  // Empty text is deleted when its edit ends, so a saved one is a leftover.
+  text: (node) =>
+    typeof node.text === 'string' &&
+    node.text.trim() !== '' &&
+    typeof node.fontFamily === 'string' &&
+    isFiniteNumber(node.fontSize) &&
+    node.fontSize > 0 &&
+    FONT_STYLES.has(node.fontStyle) &&
+    ALIGNS.has(node.align) &&
+    isLength(node.width),
+  // Children are checked one by one as the tree is walked.
+  group: (node) => Array.isArray(node.childIds),
 }
 
 function isNode(id: string, value: unknown): value is VectorNode {
@@ -153,7 +167,9 @@ function isNode(id: string, value: unknown): value is VectorNode {
 
 /**
  * A doc that is safe to render: unreadable data becomes an empty doc, and malformed nodes are
- * dropped. Only top-level nodes are kept for now; groups arrive in M12.
+ * dropped. The tree is walked from the roots: a node is kept only under the parent its `parentId`
+ * names, once, and a group keeps the children that pass; a group left empty goes too, as do
+ * nodes no list reaches.
  */
 export function sanitizeDoc(value: unknown): Doc {
   const doc = emptyDoc()
@@ -162,13 +178,24 @@ export function sanitizeDoc(value: unknown): Doc {
   if (typeof value.background === 'string') doc.background = value.background
 
   const nodes = value.nodes
-  for (const id of new Set(value.rootIds)) {
-    if (typeof id !== 'string' || !Object.hasOwn(nodes, id)) continue
-    const node = nodes[id]
-    if (!isNode(id, node) || node.parentId !== null) continue
-    doc.nodes[id] = node
-    doc.rootIds.push(id)
-  }
+  const seen = new Set<string>()
+  // The ids among `ids` that pass, added to doc.nodes with their checked subtrees.
+  const keep = (ids: unknown[], parentId: string | null): string[] =>
+    ids.flatMap((id) => {
+      if (typeof id !== 'string' || seen.has(id) || !Object.hasOwn(nodes, id)) return []
+      const node = nodes[id]
+      if (!isNode(id, node) || node.parentId !== parentId) return []
+      seen.add(id)
+      if (node.type !== 'group') {
+        doc.nodes[id] = node
+        return [id]
+      }
+      const childIds = keep(node.childIds, id)
+      if (childIds.length === 0) return []
+      doc.nodes[id] = { ...node, childIds }
+      return [id]
+    })
+  doc.rootIds = keep(value.rootIds, null)
   return doc
 }
 

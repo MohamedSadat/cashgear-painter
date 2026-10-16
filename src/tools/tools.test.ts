@@ -1,15 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   DEFAULT_SHAPE_STYLE,
+  DEFAULT_TEXT_STYLE,
   createEllipseNode,
   createLineNode,
   createPathNode,
   createRectNode,
   createStrokeNode,
+  createTextNode,
   useEditorStore,
   zoomOf,
 } from '../store/editorStore'
-import type { Anchor, PathNode, Point, StrokeNode } from '../types'
+import type { Anchor, PathNode, Point, StrokeNode, TextNode } from '../types'
 import { brushTool } from './brushTool'
 import {
   deleteActiveAnchor,
@@ -23,6 +25,7 @@ import { handTool } from './handTool'
 import { finishPath, penTool } from './penTool'
 import { selectTool } from './selectTool'
 import { dragBox, ellipseTool, lineStyleOf, lineTool, rectTool } from './shapeTools'
+import { cancelTextEdit, finishTextEdit, startTextEdit, textTool } from './textTool'
 import { toolFor } from './index'
 import type { ToolEvent } from './types'
 
@@ -58,7 +61,7 @@ beforeEach(() => {
 })
 
 describe('toolFor', () => {
-  it('finds the select tools, the brush, the eraser, the shapes, the pen and the hand', () => {
+  it('finds every tool', () => {
     expect(toolFor('select')).toBe(selectTool)
     expect(toolFor('direct')).toBe(directTool)
     expect(toolFor('brush')).toBe(brushTool)
@@ -68,7 +71,7 @@ describe('toolFor', () => {
     expect(toolFor('line')).toBe(lineTool)
     expect(toolFor('hand')).toBe(handTool)
     expect(toolFor('pen')).toBe(penTool)
-    expect(toolFor('text')).toBeUndefined()
+    expect(toolFor('text')).toBe(textTool)
   })
 })
 
@@ -979,5 +982,210 @@ describe('selectTool double-click', () => {
     click(51, 1, path.id)
     expect(store().tool).toBe('direct')
     expect(store().selection).toEqual([path.id])
+  })
+
+  it('enters a group and picks within it until a click lands outside; Esc goes back out', () => {
+    const a = addLine(0)
+    const b = addLine(100)
+    const c = addLine(300)
+    store().group([a.id, b.id])
+    const [groupId] = store().selection
+    store().select([])
+    vi.advanceTimersByTime(1000)
+
+    click(50, 0, a.id)
+    expect(store().selection).toEqual([groupId])
+    click(50, 0, a.id)
+    expect(store().selection).toEqual([a.id])
+    vi.advanceTimersByTime(1000)
+    click(50, 100, b.id)
+    expect(store().selection).toEqual([b.id])
+    vi.advanceTimersByTime(1000)
+    click(50, 300, c.id)
+    expect(store().selection).toEqual([c.id])
+
+    store().select([a.id])
+    expect(selectTool.onKey?.(keyEvent('Escape'))).toBe(true)
+    expect(store().selection).toEqual([groupId])
+    expect(selectTool.onKey?.(keyEvent('Escape'))).toBe(true)
+    expect(store().selection).toEqual([])
+  })
+
+  it('opens a text editor on a double-click, on release', () => {
+    const text = createTextNode(0, 0, 200, DEFAULT_TEXT_STYLE, 'Hi')
+    store().addNodes([text])
+    click(10, 10, text.id)
+    const e = { ...at(10, 10), target: text.id }
+    selectTool.onDown(e)
+    expect(store().editingText).toBeNull()
+    selectTool.onUp(e)
+    expect(store().editingText).toBe(text.id)
+    cancelTextEdit()
+  })
+})
+
+describe('selectTool groups from the keyboard', () => {
+  it('groups with Ctrl+G and ungroups every selected group with Ctrl+Shift+G, one step each', () => {
+    const a = addLine(0)
+    const b = addLine(100)
+    const c = addLine(200)
+    const d = addLine(300)
+    store().group([a.id, b.id])
+    const [first] = store().selection
+    store().select([c.id, d.id])
+
+    expect(selectTool.onKey?.(keyEvent('g', { ctrlKey: true }))).toBe(true)
+    const [second] = store().selection
+    expect(store().doc.rootIds).toEqual([first, second])
+    const steps = store().past.length
+
+    store().select([first, second])
+    expect(selectTool.onKey?.(keyEvent('G', { ctrlKey: true, shiftKey: true }))).toBe(true)
+    expect(store().doc.rootIds).toEqual([a.id, b.id, c.id, d.id])
+    expect(store().selection).toEqual([a.id, b.id, c.id, d.id])
+    expect(store().past).toHaveLength(steps + 1)
+  })
+
+  it('edits a selected text, or goes into a selected group, on Enter', () => {
+    const text = createTextNode(0, 0, 200, DEFAULT_TEXT_STYLE, 'Hi')
+    store().addNodes([text])
+    const a = addLine(0)
+    store().group([a.id])
+    const [groupId] = store().selection
+
+    expect(selectTool.onKey?.(keyEvent('Enter'))).toBe(true)
+    expect(store().selection).toEqual([a.id])
+    store().select([text.id])
+    expect(selectTool.onKey?.(keyEvent('Enter'))).toBe(true)
+    expect(store().editingText).toBe(text.id)
+    cancelTextEdit()
+    expect(store().selection).toEqual([text.id])
+    expect(groupId in store().doc.nodes).toBe(true)
+  })
+})
+
+describe('textTool', () => {
+  // At zoom 1, canvas units are screen pixels.
+  beforeEach(() => {
+    store().setViewport({ width: 1000, height: 700, fit: 1 })
+    store().setTool('text')
+  })
+  afterEach(() => {
+    cancelTextEdit()
+    textTool.onCancel?.()
+  })
+
+  const type = (text: string) => {
+    const id = store().editingText!
+    store().updateNodes({ [id]: { text } })
+  }
+  const textOf = (id: string) => store().doc.nodes[id] as TextNode
+
+  it('places a text on a click and keeps what is typed as one undo step', () => {
+    const { fontSize } = store().textStyle
+    textTool.onDown(at(100, 200))
+    textTool.onUp(at(100, 200))
+    const id = store().editingText!
+    expect(store().selection).toEqual([id])
+    // A click places the text centered on its first line, ten font sizes wide.
+    expect(textOf(id).transform).toMatchObject({ x: 100, y: 200 - (fontSize * 1.2) / 2 })
+    expect(textOf(id).width).toBe(fontSize * 10)
+
+    type('H')
+    type('Hello')
+    finishTextEdit()
+
+    expect(store().editingText).toBeNull()
+    expect(textOf(id).text).toBe('Hello')
+    expect(store().past).toHaveLength(1)
+    expect(store().tool).toBe('select')
+    expect(store().selection).toEqual([id])
+    store().undo()
+    expect(store().doc.rootIds).toEqual([])
+  })
+
+  it('sets the width with a drag, showing the box meanwhile', () => {
+    textTool.onDown(at(300, 100))
+    textTool.onMove(at(250, 120))
+    expect(store().marquee).toMatchObject({ x: 250, width: 50 })
+    textTool.onMove(at(100, 150))
+    textTool.onUp(at(100, 150))
+
+    expect(store().marquee).toBeNull()
+    const id = store().editingText!
+    expect(textOf(id)).toMatchObject({ width: 200, transform: { x: 100 } })
+  })
+
+  it('leaves nothing for a text left empty, and Esc puts an edit back', () => {
+    textTool.onDown(at(100, 200))
+    textTool.onUp(at(100, 200))
+    type('   ')
+    finishTextEdit()
+    expect(store().doc.rootIds).toEqual([])
+    expect(store().past).toHaveLength(0)
+    expect(store().tool).toBe('text')
+
+    textTool.onDown(at(100, 200))
+    textTool.onUp(at(100, 200))
+    type('Gone')
+    cancelTextEdit()
+    expect(store().doc.rootIds).toEqual([])
+    expect(store().past).toHaveLength(0)
+  })
+
+  it('edits a text it clicks on; emptying it deletes it, one undo step each', () => {
+    const text = createTextNode(0, 0, 200, DEFAULT_TEXT_STYLE, 'Hi')
+    store().addNodes([text])
+    const e = { ...at(10, 10), target: text.id }
+    textTool.onDown(e)
+    textTool.onUp(e)
+    expect(store().editingText).toBe(text.id)
+    expect(store().doc.rootIds).toHaveLength(1)
+
+    type('Hi there')
+    finishTextEdit()
+    expect(store().past).toHaveLength(2)
+
+    startTextEdit(text.id)
+    type('')
+    finishTextEdit()
+    expect(store().doc.rootIds).toEqual([])
+    expect(store().past).toHaveLength(3)
+    store().undo()
+    expect(textOf(text.id).text).toBe('Hi there')
+  })
+
+  it('does not edit hidden or locked text', () => {
+    const text = { ...createTextNode(0, 0, 200, DEFAULT_TEXT_STYLE, 'Hi'), locked: true }
+    store().addNodes([text])
+    startTextEdit(text.id)
+    expect(store().editingText).toBeNull()
+  })
+})
+
+describe('eraserTool in groups', () => {
+  it('erases the touched child where its group puts it, and a group it empties', () => {
+    const a = addLine(0)
+    const b = addLine(100)
+    store().group([a.id, b.id])
+    const [groupId] = store().selection
+    // Moved down by 500, the group's strokes lie along y = 500 and 600.
+    store().updateNodes({
+      [groupId]: { transform: { x: 0, y: 500, rotation: 0, scaleX: 1, scaleY: 1 } },
+    })
+
+    eraserTool.onDown(at(50, -5))
+    eraserTool.onUp(at(50, -5))
+    expect(store().doc.nodes[a.id]).toBeDefined()
+
+    eraserTool.onDown(at(50, 495))
+    eraserTool.onMove(at(50, 505))
+    eraserTool.onUp(at(50, 505))
+    expect(a.id in store().doc.nodes).toBe(false)
+    expect(store().doc.rootIds).toEqual([groupId])
+
+    eraserTool.onDown(at(50, 600))
+    eraserTool.onUp(at(50, 600))
+    expect(store().doc.nodes).toEqual({})
   })
 })

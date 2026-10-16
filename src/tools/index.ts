@@ -6,10 +6,11 @@ import { handTool } from './handTool'
 import { penTool } from './penTool'
 import { selectTool } from './selectTool'
 import { ellipseTool, lineTool, rectTool } from './shapeTools'
+import { textTool } from './textTool'
 import type { ToolController } from './types'
 
-// Each milestone registers its tools here; CanvasStage only asks for the active one.
-const TOOLS: Partial<Record<ToolId, ToolController>> = {
+// CanvasStage only asks for the active tool here; it never names one.
+const TOOLS: Record<ToolId, ToolController> = {
   select: selectTool,
   direct: directTool,
   brush: brushTool,
@@ -18,6 +19,7 @@ const TOOLS: Partial<Record<ToolId, ToolController>> = {
   ellipse: ellipseTool,
   line: lineTool,
   pen: penTool,
+  text: textTool,
   hand: handTool,
 }
 

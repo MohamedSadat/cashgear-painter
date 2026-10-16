@@ -2,19 +2,24 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createStore } from 'zustand/vanilla'
 import {
   DEFAULT_SHAPE_STYLE,
+  DEFAULT_TEXT_STYLE,
   createEllipseNode,
+  createGroupNode,
   createLineNode,
   createPathNode,
   createRectNode,
   createStrokeNode,
+  createTextNode,
 } from '../store/editorStore'
 import {
   emptyDoc,
   type Doc,
+  type GroupNode,
   type NodeOf,
   type PathNode,
   type Point,
   type StrokeNode,
+  type TextNode,
   type VectorNode,
 } from '../types'
 import {
@@ -65,6 +70,38 @@ function path(id = 'path'): PathNode {
     { ...DEFAULT_SHAPE_STYLE, fill: '#3b82f6' },
     id,
   )
+}
+
+/** A bold, centered, turned text with odd coordinates kept as they are. */
+function text(id = 'text'): TextNode {
+  const node = createTextNode(
+    10.123,
+    20.456,
+    300,
+    { ...DEFAULT_TEXT_STYLE, fontStyle: 'bold', align: 'center' },
+    'Hello\nthere',
+    id,
+  )
+  return { ...node, transform: { ...node.transform, rotation: 15 } }
+}
+
+/**
+ * A turned group holding a stroke and a group with a text, after a top-level stroke 'a'; the
+ * inner group is hidden and the text locked.
+ */
+function groups(): Doc {
+  // Points already rounded, as storage keeps them.
+  const doc = docWith(stroke('a', [[10, 20.1, 0.5]]))
+  const outer: GroupNode = {
+    ...createGroupNode(['s', 'inner'], null, 'outer'),
+    transform: { x: 5, y: 6, rotation: 30, scaleX: 1, scaleY: 1 },
+  }
+  doc.nodes.outer = outer
+  doc.nodes.s = { ...stroke('s', [[1.5, 2, 0.25]]), parentId: 'outer' }
+  doc.nodes.inner = { ...createGroupNode(['t'], 'outer', 'inner'), hidden: true }
+  doc.nodes.t = { ...text('t'), parentId: 'inner', locked: true }
+  doc.rootIds.push('outer')
+  return doc
 }
 
 function docWith(...nodes: VectorNode[]): Doc {
@@ -142,12 +179,55 @@ describe('sanitizeDoc', () => {
     expect(sanitizeDoc(doc)).toEqual(docWith(valid))
   })
 
-  it('drops node types that have no checks yet', () => {
+  it('drops unknown node types', () => {
     const doc = docWith(stroke('a'))
-    doc.nodes.t = { ...stroke('t'), type: 'text', text: 'Hi' } as unknown as VectorNode
-    doc.rootIds.push('t')
+    doc.nodes.s = { ...stroke('s'), type: 'star' } as unknown as VectorNode
+    doc.rootIds.push('s')
 
     expect(sanitizeDoc(doc).rootIds).toEqual(['a'])
+  })
+
+  it('keeps text, and drops malformed or empty text', () => {
+    const valid = text()
+    const doc = docWith(
+      { ...valid, id: 't1', text: '  \n' },
+      { ...valid, id: 't2', fontSize: 0 },
+      { ...valid, id: 't3', fontStyle: 'heavy' } as unknown as VectorNode,
+      { ...valid, id: 't4', align: 'justify' } as unknown as VectorNode,
+      { ...valid, id: 't5', width: Number.NaN },
+      { ...valid, id: 't6', fontFamily: undefined } as unknown as VectorNode,
+      valid,
+    )
+
+    expect(sanitizeDoc(doc)).toEqual(docWith(valid))
+  })
+
+  it('keeps groups with their children, nested', () => {
+    expect(sanitizeDoc(groups())).toEqual(groups())
+  })
+
+  it('keeps only children whose parent agrees, once, and drops groups left empty', () => {
+    const doc = groups()
+    const outer = doc.nodes.outer as GroupNode
+    // A child claimed by the wrong group, one listed twice, a missing one, and the group itself.
+    doc.nodes.stray = { ...stroke('stray'), parentId: 'elsewhere' }
+    doc.nodes.outer = { ...outer, childIds: [...outer.childIds, 'stray', 'a', 'gone', 'outer'] }
+    // A group whose only child is malformed, and a node no list reaches.
+    doc.nodes.empty = { ...createGroupNode(['bad'], null, 'empty') }
+    doc.nodes.bad = { ...stroke('bad'), parentId: 'empty', points: [] }
+    doc.nodes.orphan = { ...stroke('orphan'), parentId: 'outer' }
+    doc.rootIds.push('empty', 'a')
+
+    expect(sanitizeDoc(doc)).toEqual(groups())
+  })
+
+  it('round-trips text and groups through storage unchanged', async () => {
+    const kv = memoryStore()
+    const doc = groups()
+
+    await saveDoc(doc, kv)
+
+    expect(await loadDoc(kv)).toEqual(doc)
   })
 
   it('keeps paths', () => {

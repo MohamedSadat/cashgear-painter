@@ -1,10 +1,19 @@
 import { memo } from 'react'
-import { Arrow, Ellipse, Path, Rect } from 'react-konva'
+import { Arrow, Ellipse, Group, Path, Rect, Text } from 'react-konva'
 import { arrowHeadSize } from '../lib/geometry/bounds'
 import { cachedPathData } from '../lib/geometry/pathData'
+import { TEXT_LINE_HEIGHT } from '../lib/geometry/textLayout'
 import { strokeToPath } from '../lib/strokePath'
 import { useEditorStore, zoomOf } from '../store/editorStore'
-import type { Point, ShapeNode, StrokeNode, VectorNode } from '../types'
+import type {
+  GroupNode,
+  NodeId,
+  Point,
+  ShapeNode,
+  StrokeNode,
+  TextNode,
+  VectorNode,
+} from '../types'
 
 const DIMMED_OPACITY = 0.3
 // Thin strokes are easy to grab: the hit area reaches this many screen pixels around the ink.
@@ -97,6 +106,47 @@ function ShapeView({ node, common }: { node: ShapeNode; common: CommonProps }) {
   }
 }
 
+/**
+ * Text wrapped at words in its fixed width. Konva picks it anywhere in its box. While the
+ * textarea overlay edits it, the Konva text hides so the two don't show at once.
+ */
+function TextView({ node, common }: { node: TextNode; common: CommonProps }) {
+  const editing = useEditorStore((s) => s.editingText === node.id)
+  return (
+    <Text
+      {...common}
+      visible={!editing}
+      text={node.text}
+      fontFamily={node.fontFamily}
+      fontSize={node.fontSize}
+      fontStyle={node.fontStyle}
+      align={node.align}
+      width={node.width}
+      wrap="word"
+      lineHeight={TEXT_LINE_HEIGHT}
+      fill={node.style.fill ?? undefined}
+    />
+  )
+}
+
+/** A child of a group, read from the store, so a changed child re-renders without its group. */
+function ChildView({ id }: { id: NodeId }) {
+  const node = useEditorStore((s) => s.doc.nodes[id])
+  const dimmed = useEditorStore((s) => s.erasing.includes(id))
+  return node ? <NodeView node={node} dimmed={dimmed} /> : null
+}
+
+/** A Konva Group: its transform and opacity apply to its children; locked, none of them is picked. */
+function GroupView({ node, common }: { node: GroupNode; common: CommonProps }) {
+  return (
+    <Group {...common}>
+      {node.childIds.map((id) => (
+        <ChildView key={id} id={id} />
+      ))}
+    </Group>
+  )
+}
+
 interface NodeViewProps {
   node: VectorNode
   dimmed?: boolean // touched by the eraser, about to be deleted
@@ -104,8 +154,9 @@ interface NodeViewProps {
 }
 
 /**
- * One Konva shape per node, named by the node id so tools can tell what was hit. Hits only count
- * while the content layer listens, which only tools that pick nodes turn on.
+ * One Konva shape per node, named by the node id so tools can tell what was hit; a group is a
+ * Konva Group of its children's views. Hits only count while the content layer listens, which
+ * only tools that pick nodes turn on. Hidden nodes aren't drawn, and locked ones aren't picked.
  */
 export const NodeView = memo(function NodeView({
   node,
@@ -146,8 +197,9 @@ export const NodeView = memo(function NodeView({
     case 'line':
     case 'path':
       return <ShapeView node={node} common={common} />
-    // Text and groups render from M12 on.
-    default:
-      return null
+    case 'text':
+      return <TextView node={node} common={common} />
+    case 'group':
+      return <GroupView node={node} common={common} />
   }
 })

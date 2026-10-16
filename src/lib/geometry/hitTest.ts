@@ -1,5 +1,5 @@
 import { Bezier } from 'bezier-js'
-import type { PathNode, ShapeNode, StrokeNode, VectorNode } from '../../types'
+import type { PathNode, ShapeNode, StrokeNode, TextNode, VectorNode } from '../../types'
 import {
   applyTransform,
   arrowHeadSize,
@@ -9,6 +9,7 @@ import {
   nodeBounds,
   outlineReach,
   pointsBox,
+  textBox,
   type Vec,
 } from './bounds'
 import { pathSegments, type Cubic } from './pathData'
@@ -219,13 +220,30 @@ function contourDistance({ points, closed }: Contour, a: Vec, b: Vec): number {
 const isShape = (node: VectorNode): node is ShapeNode =>
   node.type === 'rect' || node.type === 'ellipse' || node.type === 'line' || node.type === 'path'
 
+/** A text's box in canvas units, after its transform: Konva picks text anywhere in its box. */
+function textContour(node: TextNode): Contour {
+  const box = textBox(node)
+  const corners: Vec[] = [
+    [box.minX, box.minY],
+    [box.maxX, box.minY],
+    [box.maxX, box.maxY],
+    [box.minX, box.maxY],
+  ]
+  return {
+    points: corners.map((p) => applyTransform(node.transform, p[0], p[1])),
+    closed: true,
+    filled: true,
+  }
+}
+
 /**
  * Whether a circle of `radius` swept from a to b touches the node's ink. Testing the swept segment,
  * not just its ends, keeps a fast swipe from skipping strokes between two pointer samples. An
- * unfilled shape is touched only on its outline, as it is picked on the canvas.
+ * unfilled shape is touched only on its outline, as it is picked on the canvas; a text anywhere
+ * in its box. Groups are never touched themselves, only what they hold, in canvas units.
  */
 export function nodeHitsSegment(node: VectorNode, a: Vec, b: Vec, radius: number): boolean {
-  if (node.type !== 'stroke' && !isShape(node)) return false
+  if (node.type === 'group') return false
   const bounds = nodeBounds(node)
   if (!bounds || !boxesOverlap(bounds, pointsBox([a, b], radius))) return false
   // Outlines scale with their node, so the ink's half-width does too.
@@ -242,6 +260,12 @@ export function nodeHitsSegment(node: VectorNode, a: Vec, b: Vec, radius: number
     return false
   }
 
+  if (node.type === 'text') {
+    const contour = textContour(node)
+    return contourDistance(contour, a, b) <= radius || pointInPolygon(a, contour.points)
+  }
+
+  if (!isShape(node)) return false
   const reach = radius + outlineReach(node) * scale
   return canvasContours(node).some(
     (contour) =>

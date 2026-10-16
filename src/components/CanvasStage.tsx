@@ -6,12 +6,14 @@ import { useViewport } from '../hooks/useViewport'
 import { OVERLAY_LAYER_NAME } from '../lib/exportPng'
 import { useEditorStore } from '../store/editorStore'
 import { toolFor } from '../tools'
+import { finishTextEdit } from '../tools/textTool'
 import type { ToolEvent } from '../tools/types'
 import { CANVAS_HEIGHT, CANVAS_WIDTH, type NodeId } from '../types'
 import { BrushCursor } from './BrushCursor'
 import { NodeView } from './NodeView'
 import { PathEditOverlay } from './PathEditOverlay'
 import { SelectionOverlay } from './SelectionOverlay'
+import { TextEditor } from './TextEditor'
 
 interface CanvasStageProps {
   stageRef: Ref<Konva.Stage>
@@ -115,10 +117,19 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
   }
 
   const handlePointerDown = ({ evt, target }: KonvaEventObject<PointerEvent>) => {
+    // A tap is followed by emulated mouse events, whose mousedown would take the focus from a
+    // text editor the tap has just opened; cancelling the pointerdown drops them.
+    if (evt.pointerType !== 'mouse' && evt.cancelable) evt.preventDefault()
     moveCursor(evt)
     // Ignore a second finger while a gesture is in progress, and any mouse button but the main one.
     if (activePointerId.current !== null) return
     if (evt.pointerType === 'mouse' && evt.button !== 0) return
+    // A press on the canvas while a text is being edited only ends the edit; a tap may not blur
+    // the textarea on touch screens.
+    if (useEditorStore.getState().editingText !== null) {
+      finishTextEdit()
+      return
+    }
     const content = contentLayerRef.current
     // A press on the overlay (the Transformer's handles) is the overlay's own drag.
     const layer = target.getLayer()
@@ -156,9 +167,12 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
 
   return (
     // The padding only shapes the fit; the Stage fills the whole area, padding included.
+    // A browser keeping the text editor's caret in view may scroll this box; the view does the
+    // panning here, so it goes straight back.
     <div
       ref={containerRef}
       className="relative min-h-0 min-w-0 flex-1 touch-none overflow-hidden p-2 select-none [-webkit-touch-callout:none] sm:p-4"
+      onScroll={(e) => e.currentTarget.scrollTo(0, 0)}
     >
       {viewport.fit > 0 && (
         <div
@@ -220,6 +234,7 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
               <BrushCursor ref={cursorRef} tool={tool} size={size} />
             </Layer>
           </Stage>
+          <TextEditor />
         </div>
       )}
     </div>

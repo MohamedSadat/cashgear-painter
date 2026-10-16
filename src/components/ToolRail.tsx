@@ -11,6 +11,7 @@ import {
   SplinePointer,
   Square,
   Trash2,
+  Type,
   Undo2,
   type LucideIcon,
 } from 'lucide-react'
@@ -24,6 +25,7 @@ interface IconButtonProps {
   pressed?: boolean | 'mixed'
   disabled?: boolean
   danger?: boolean
+  narrow?: boolean // 32 px wide on phones instead of 36
   onClick(): void
   children: ReactNode
 }
@@ -34,6 +36,7 @@ export function IconButton({
   pressed,
   disabled,
   danger,
+  narrow,
   onClick,
   children,
 }: IconButtonProps) {
@@ -51,7 +54,7 @@ export function IconButton({
       aria-pressed={pressed}
       disabled={disabled}
       onClick={onClick}
-      className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-35 ${tone} ${
+      className={`flex h-9 ${narrow ? 'w-8 sm:w-9' : 'w-9'} shrink-0 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-35 ${tone} ${
         pressed === 'mixed' ? 'bg-neutral-100' : ''
       }`}
     >
@@ -85,6 +88,7 @@ const TOOL_GROUPS: ToolButton[][] = [
     { id: 'ellipse', label: 'Ellipse', title: 'Ellipse (O)', icon: Circle },
     { id: 'line', label: 'Line', title: 'Line / arrow (L)', icon: Slash },
     { id: 'pen', label: 'Pen', title: 'Pen (P)', icon: PenTool },
+    { id: 'text', label: 'Text', title: 'Text (T)', icon: Type },
   ],
   [{ id: 'hand', label: 'Hand', title: 'Hand (H, or hold Space)', icon: Hand }],
 ]
@@ -109,7 +113,8 @@ export function ToolRail({ onExport }: ToolRailProps) {
 
   return (
     <nav className="flex shrink-0 flex-wrap items-center gap-1 border-b border-neutral-200 bg-white px-2 py-1 sm:flex-col sm:flex-nowrap sm:border-r sm:border-b-0 sm:px-1 sm:py-2">
-      {/* No gaps on phones, so the nine tools fit one row from 360 px up; narrower ones wrap. */}
+      {/* No gaps and narrower buttons on phones, so the ten tools fit one row from 360 px up;
+          narrower screens wrap them. */}
       <div
         role="group"
         aria-label="Tools"
@@ -124,6 +129,7 @@ export function ToolRail({ onExport }: ToolRailProps) {
                 label={label}
                 title={title}
                 pressed={tool === id}
+                narrow
                 onClick={() => setTool(id)}
               >
                 <Icon size={20} />

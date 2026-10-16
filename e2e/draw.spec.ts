@@ -994,3 +994,265 @@ test.describe('paths on a 375 px phone', () => {
     expect(await shownShapes(page)).toEqual([])
   })
 })
+
+/** The Konva class and x of every shape inside the group at `index` on the content layer. */
+function groupChildren(page: Page, index = 0): Promise<{ type: string; x: number }[]> {
+  return page.evaluate((index) => {
+    const group = (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+      .getLayers()[1]
+      .getChildren()[index] as Konva.Group
+    return group.getChildren().map((n) => ({ type: n.getClassName(), x: n.x() }))
+  }, index)
+}
+
+/** The text of every Text on the content layer, bottom to top. */
+const shownTexts = async (page: Page) => (await shownAttr(page, 'text')).filter(Boolean)
+
+test('a text is placed, typed and edited, one undo step per edit', async ({ page }) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const redo = page.getByRole('button', { name: 'Redo' })
+  const editor = page.getByRole('textbox', { name: 'Text' })
+  const select = page.getByRole('button', { name: 'Select', exact: true })
+
+  await page.keyboard.press('t')
+  await expect(page.getByRole('heading', { name: 'New text' })).toBeVisible()
+  const box = await artboardBox(page)
+  await page.mouse.click(...onArtboard(box, [0.3, 0.3]))
+  await expect(editor).toBeFocused()
+  // Letters that are tool shortcuts go into the text, not to the canvas.
+  await page.keyboard.type('Hello, world')
+  await page.keyboard.press('Control+Enter')
+  await expect(editor).toHaveCount(0)
+
+  // The text is selected, with the select tool; typing it was one step.
+  await expect(select).toHaveAttribute('aria-pressed', 'true')
+  expect(await shownShapes(page)).toEqual(['Text'])
+  expect(await shownTexts(page)).toEqual(['Hello, world'])
+  expect(await selectedCount(page)).toBe(1)
+  await undo.click()
+  expect(await shownShapes(page)).toEqual([])
+  await expect(undo).toBeDisabled()
+  await redo.click()
+  expect(await shownTexts(page)).toEqual(['Hello, world'])
+
+  // A double-click opens it again; Esc puts it back as it was.
+  const onText = onArtboard(box, [0.32, 0.3])
+  await page.mouse.dblclick(...onText)
+  await expect(editor).toHaveValue('Hello, world')
+  await page.keyboard.press('Control+a')
+  await page.keyboard.type('Gone')
+  await page.keyboard.press('Escape')
+  await expect(editor).toHaveCount(0)
+  expect(await shownTexts(page)).toEqual(['Hello, world'])
+
+  // A click on the canvas ends an edit; emptying a text deletes it, one step.
+  await page.mouse.dblclick(...onText)
+  await page.keyboard.press('End')
+  await page.keyboard.type('!')
+  await page.mouse.click(...onArtboard(box, [0.8, 0.8]))
+  await expect(editor).toHaveCount(0)
+  expect(await shownTexts(page)).toEqual(['Hello, world!'])
+  await page.keyboard.press('Enter')
+  await page.keyboard.press('Control+a')
+  await page.keyboard.press('Delete')
+  await page.keyboard.press('Control+Enter')
+  expect(await shownShapes(page)).toEqual([])
+  await undo.click()
+  expect(await shownTexts(page)).toEqual(['Hello, world!'])
+  await undo.click()
+  expect(await shownTexts(page)).toEqual(['Hello, world'])
+
+  // Text is saved and comes back after a reload.
+  await expect.poll(() => savedNodeCount(page)).toBe(1)
+  await page.reload()
+  await waitForCanvas(page)
+  expect(await shownTexts(page)).toEqual(['Hello, world'])
+  expect(await paintedPixels(page)).toBeGreaterThan(0)
+})
+
+test('groups, a group entered by double-click, and ungroup, one undo step each', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  await page.keyboard.press('r')
+  await drawLine(page, [0.1, 0.1], [0.3, 0.3])
+  await page.getByRole('button', { name: 'Fill #ef4444' }).click()
+  await page.keyboard.press('o')
+  await drawLine(page, [0.5, 0.1], [0.7, 0.3])
+  await page.getByRole('button', { name: 'Fill #3b82f6' }).click()
+
+  await page.keyboard.press('Control+a')
+  await page.keyboard.press('Control+g')
+  expect(await shownShapes(page)).toEqual(['Group'])
+  await expect(page.getByRole('heading', { name: 'Group' })).toBeVisible()
+  const [rect, ellipse] = await groupChildren(page)
+
+  // A click on a child picks the group; a double-click goes in and picks the child.
+  const box = await artboardBox(page)
+  await page.keyboard.press('Escape')
+  await page.mouse.click(...onArtboard(box, [0.6, 0.2]))
+  await expect(page.getByRole('heading', { name: 'Group' })).toBeVisible()
+  await page.mouse.dblclick(...onArtboard(box, [0.6, 0.2]))
+  await expect(page.getByRole('heading', { name: 'Ellipse' })).toBeVisible()
+
+  // Inside, a drag moves only the child.
+  await drag(page, onArtboard(box, [0.6, 0.2]), onArtboard(box, [0.6 + 0.1, 0.2]))
+  const moved = await groupChildren(page)
+  expect(Math.abs(moved[1].x - ellipse.x - 160)).toBeLessThan(2)
+  expect(moved[0].x).toBe(rect.x)
+  expect((await exportPixels(page, [exportPixel([0.7, 0.2])])).values).toEqual([BLUE])
+
+  // Esc goes back out to the group, and Ctrl+Shift+G ungroups it in place.
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('heading', { name: 'Group' })).toBeVisible()
+  await page.keyboard.press('Control+Shift+g')
+  expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
+  await expect(page.getByRole('heading', { name: '2 objects' })).toBeVisible()
+  expect(
+    (await exportPixels(page, [exportPixel([0.2, 0.2]), exportPixel([0.7, 0.2])])).values,
+  ).toEqual([RED, BLUE])
+
+  // Ungroup, move and group: a step each.
+  await undo.click()
+  expect(await shownShapes(page)).toEqual(['Group'])
+  await undo.click()
+  expect((await groupChildren(page))[1].x).toBe(ellipse.x)
+  await undo.click()
+  expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
+})
+
+test('layers hide, lock, rename and reorder; hidden and locked objects are not picked', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const layers = page.getByRole('complementary', { name: 'Layers' })
+  const nothing = page.getByRole('heading', { name: 'Nothing selected' })
+  const rectInside = exportPixel([0.2, 0.2])
+  const ellipseInside = exportPixel([0.6, 0.2])
+
+  await page.keyboard.press('r')
+  await drawLine(page, [0.1, 0.1], [0.3, 0.3])
+  await page.getByRole('button', { name: 'Fill #ef4444' }).click()
+  await page.keyboard.press('o')
+  await drawLine(page, [0.5, 0.1], [0.7, 0.3])
+  await page.getByRole('button', { name: 'Fill #3b82f6' }).click()
+  // Front-most on top.
+  await expect(layers.getByRole('treeitem')).toHaveText(['Ellipse', 'Rectangle'])
+
+  // Hidden: not drawn, not picked, not selected by the marquee or Ctrl+A.
+  await layers.getByRole('button', { name: 'Hide Rectangle' }).click()
+  expect((await exportPixels(page, [rectInside])).values).toEqual([WHITE])
+  const box = await artboardBox(page)
+  await page.mouse.click(...onArtboard(box, [0.2, 0.2]))
+  await expect(nothing).toBeVisible()
+  await drag(page, onArtboard(box, [0.05, 0.05]), onArtboard(box, [0.9, 0.5]))
+  expect(await selectedCount(page)).toBe(1)
+  await page.keyboard.press('Control+a')
+  await expect(page.getByRole('heading', { name: 'Ellipse' })).toBeVisible()
+  await layers.getByRole('button', { name: 'Show Rectangle' }).click()
+  expect((await exportPixels(page, [rectInside])).values).toEqual([RED])
+
+  // Locked: drawn, but not picked, moved or erased.
+  await layers.getByRole('button', { name: 'Lock Ellipse' }).click()
+  await expect(nothing).toBeVisible()
+  await page.mouse.click(...onArtboard(box, [0.6, 0.2]))
+  await expect(nothing).toBeVisible()
+  await drag(page, onArtboard(box, [0.6, 0.2]), onArtboard(box, [0.6, 0.5]))
+  await page.keyboard.press('e')
+  await drawLine(page, [0.55, 0.05], [0.65, 0.35])
+  expect((await exportPixels(page, [ellipseInside])).values).toEqual([BLUE])
+  await page.keyboard.press('v')
+
+  // A double-click on a name renames the layer, one step.
+  await layers.getByRole('button', { name: 'Rectangle', exact: true }).dblclick()
+  await layers.getByRole('textbox', { name: 'Layer name' }).fill('Door')
+  await page.keyboard.press('Enter')
+  await expect(layers.getByRole('treeitem')).toHaveText(['Ellipse', 'Door'])
+
+  // Dragging a row above another brings it in front.
+  const door = (await layers.getByRole('treeitem', { name: 'Door' }).boundingBox())!
+  const top = (await layers.getByRole('treeitem', { name: 'Ellipse' }).boundingBox())!
+  await drag(
+    page,
+    [door.x + door.width / 2, door.y + door.height / 2],
+    [top.x + top.width / 2, top.y + 4],
+  )
+  await expect(layers.getByRole('treeitem')).toHaveText(['Door', 'Ellipse'])
+  expect(await shownShapes(page)).toEqual(['Ellipse', 'Rect'])
+
+  // Reorder, rename, lock, show and hide: a step each.
+  await undo.click()
+  expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
+  await undo.click()
+  await expect(layers.getByRole('treeitem')).toHaveText(['Ellipse', 'Rectangle'])
+  await undo.click()
+  await expect(layers.getByRole('button', { name: 'Lock Ellipse' })).toBeVisible()
+  await undo.click()
+  await undo.click()
+  await expect(layers.getByRole('button', { name: 'Hide Rectangle' })).toBeVisible()
+})
+
+test.describe('text, groups and layers on a 375 px phone', () => {
+  test.use({ viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: true })
+
+  test('place a text, group, hide and reorder by touch, and undo', async ({ page }) => {
+    const finger = await fingerOn(page)
+    const undo = page.getByRole('button', { name: 'Undo' })
+    const layers = page.getByRole('complementary', { name: 'Layers' })
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(375)
+    // The ten tools fit one row.
+    const first = (await page.getByRole('button', { name: 'Select', exact: true }).boundingBox())!
+    const last = (await page.getByRole('button', { name: 'Hand' }).boundingBox())!
+    expect(last.y).toBe(first.y)
+
+    // A tap places a text, the keyboard types it, and a tap on the canvas ends it.
+    await page.getByRole('button', { name: 'Text', exact: true }).tap()
+    const box = await artboardBox(page)
+    await finger.tap(onArtboard(box, [0.2, 0.3]))
+    await expect(page.getByRole('textbox', { name: 'Text' })).toBeFocused()
+    await page.keyboard.type('Hi')
+    await finger.tap(onArtboard(box, [0.8, 0.9]))
+    await expect(page.getByRole('textbox', { name: 'Text' })).toHaveCount(0)
+    expect(await shownTexts(page)).toEqual(['Hi'])
+
+    // A rectangle, then both selected by a marquee and grouped from the panel.
+    await page.getByRole('button', { name: 'Rectangle' }).tap()
+    await finger.drag(onArtboard(box, [0.5, 0.5]), onArtboard(box, [0.7, 0.8]))
+    await page.getByRole('button', { name: 'Fill #22c55e' }).tap()
+    await finger.drag(onArtboard(box, [0.02, 0.02]), onArtboard(box, [0.98, 0.98]))
+    await expect(page.getByRole('heading', { name: '2 objects' })).toBeVisible()
+    await page.getByRole('button', { name: 'Group', exact: true }).tap()
+    expect(await shownShapes(page)).toEqual(['Group'])
+
+    // The layers tab: the group opens to its children; hide one, rename the group.
+    await page.getByRole('tab', { name: 'Layers' }).tap()
+    await expect(layers.getByRole('treeitem')).toHaveText(['Group', 'Rectangle', 'Text'])
+    await layers.getByRole('button', { name: 'Hide Rectangle' }).tap()
+    expect((await exportPixels(page, [exportPixel([0.6, 0.65])])).values).toEqual([WHITE])
+    await layers.getByRole('button', { name: 'Group', exact: true }).tap()
+    await layers.getByRole('button', { name: 'Group', exact: true }).tap()
+    await layers.getByRole('textbox', { name: 'Layer name' }).fill('Sign')
+    await page.keyboard.press('Enter')
+    await expect(layers.getByRole('treeitem', { name: 'Sign' })).toBeVisible()
+
+    // A finger drags a row by its grip: the text goes in front of the rectangle.
+    const grip = async (name: string): Promise<Xy> => {
+      const handle = layers.getByRole('treeitem', { name }).locator('[data-grip]')
+      const { x, y, width, height } = (await handle.boundingBox())!
+      return [x + width / 2, y + height / 2]
+    }
+    const [x, y] = await grip('Text')
+    const rect = await grip('Rectangle')
+    await finger.drag([x, y], [x, rect[1] - 12])
+    await expect(layers.getByRole('treeitem')).toHaveText(['Sign', 'Text', 'Rectangle'])
+
+    // Reorder, rename, hide and group: a step each.
+    await undo.tap()
+    await expect(layers.getByRole('treeitem')).toHaveText(['Sign', 'Rectangle', 'Text'])
+    await undo.tap()
+    await undo.tap()
+    expect((await exportPixels(page, [exportPixel([0.6, 0.65])])).values).toEqual([GREEN])
+    await undo.tap()
+    expect(await shownShapes(page)).toEqual(['Text', 'Rect'])
+  })
+})

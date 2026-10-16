@@ -23,6 +23,7 @@ const TOOL_KEYS: Record<string, ToolId> = {
   o: 'ellipse',
   l: 'line',
   p: 'pen',
+  t: 'text',
   h: 'hand',
 }
 
@@ -38,8 +39,9 @@ export function isTextEntry(target: EventTarget | null): boolean {
  * The active tool sees each key first (the select tool's are in selectTool.ts); Esc otherwise
  * cancels what the tool is doing. Then: Ctrl/Cmd+Z undo · Ctrl/Cmd+Shift+Z or Ctrl+Y redo ·
  * Ctrl/Cmd+A select all · Ctrl/Cmd+V paste · Ctrl/Cmd+0 fit · Ctrl/Cmd+1 100% · V select ·
- * A direct select · B brush · E eraser · R rectangle · O ellipse · L line · P pen · H hand ·
- * [ and ] brush size. Space for the hand tool is in useViewport.
+ * A direct select · B brush · E eraser · R rectangle · O ellipse · L line · P pen · T text ·
+ * H hand · [ and ] brush size. Space for the hand tool is in useViewport. None of them reach
+ * the canvas while a text field, such as the text editor's textarea, has focus.
  */
 export function useShortcuts(): void {
   useEffect(() => {

@@ -62,6 +62,8 @@ export type NodeType = VectorNode['type']
 export type NodeOf<T extends NodeType> = Extract<VectorNode, { type: T }>
 export type StrokeNode = NodeOf<'stroke'>
 export type PathNode = NodeOf<'path'>
+export type TextNode = NodeOf<'text'>
+export type GroupNode = NodeOf<'group'>
 /** Nodes drawn as geometry with an optional outline: rectangles, ellipses, lines and paths. */
 export type ShapeNode = NodeOf<'rect' | 'ellipse' | 'line' | 'path'>
 

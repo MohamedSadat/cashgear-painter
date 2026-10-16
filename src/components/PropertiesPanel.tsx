@@ -1,19 +1,30 @@
 import {
+  AlignCenter,
+  AlignLeft,
+  AlignRight,
   ArrowDown,
   ArrowUp,
+  Bold,
   BringToFront,
   Check,
   CopyPlus,
+  Group,
+  Italic,
   MoveLeft,
   MoveRight,
+  PencilLine,
   SendToBack,
   Spline,
   Trash2,
+  Ungroup,
 } from 'lucide-react'
 import type { ReactNode } from 'react'
 import type { AnchorKind } from '../lib/geometry/pathData'
+import { WEB_SAFE_FONTS } from '../lib/geometry/textLayout'
 import {
+  MAX_FONT_SIZE,
   MAX_SIZE,
+  MIN_FONT_SIZE,
   MIN_SIZE,
   canConvertToPath,
   useEditorStore,
@@ -21,8 +32,10 @@ import {
 } from '../store/editorStore'
 import { activeAnchorOf, deleteActiveAnchor, setActiveAnchorKind } from '../tools/directTool'
 import { finishPath } from '../tools/penTool'
+import { ungroupSelection } from '../tools/selectTool'
 import { lineStyleOf } from '../tools/shapeTools'
-import type { NodeId, NodeOf, Style, VectorNode } from '../types'
+import { startTextEdit } from '../tools/textTool'
+import type { NodeId, NodeOf, Style, TextNode, VectorNode } from '../types'
 import { IconButton } from './ToolRail'
 
 const SWATCHES = [
@@ -50,11 +63,12 @@ function shared<T>(values: T[]): Value<T> {
 
 const store = () => useEditorStore.getState()
 
-// Which style each node type has: freehand strokes are all fill and lines all outline, so neither
-// can do without its color. Rectangles, ellipses and paths can do without either.
+// Which style each node type has: freehand strokes and text are all fill and lines all outline,
+// so none of them can do without its color. Rectangles, ellipses and paths can do without either.
+// Groups only have their opacity.
 const canClearColor = (n: VectorNode) =>
   n.type === 'rect' || n.type === 'ellipse' || n.type === 'path'
-const hasFill = (n: VectorNode) => n.type === 'stroke' || canClearColor(n)
+const hasFill = (n: VectorNode) => n.type === 'stroke' || n.type === 'text' || canClearColor(n)
 const hasOutline = (n: VectorNode) => n.type === 'line' || canClearColor(n)
 
 /**
@@ -274,6 +288,134 @@ function AnchorRow() {
   )
 }
 
+type FontStyle = TextNode['fontStyle']
+type Align = TextNode['align']
+
+const isBold = (s: FontStyle) => s.includes('bold')
+const isItalic = (s: FontStyle) => s.includes('italic')
+const fontStyleOf = (bold: boolean, italic: boolean): FontStyle =>
+  bold && italic ? 'bold italic' : bold ? 'bold' : italic ? 'italic' : 'normal'
+
+const ALIGNS: { align: Align; label: string; icon: ReactNode }[] = [
+  { align: 'left', label: 'Align left', icon: <AlignLeft size={18} /> },
+  { align: 'center', label: 'Align center', icon: <AlignCenter size={18} /> },
+  { align: 'right', label: 'Align right', icon: <AlignRight size={18} /> },
+]
+
+interface TextRowsProps {
+  family: Value<string>
+  size: Value<number>
+  fontStyle: Value<FontStyle>[] // one per text, so bold and italic can each be mixed
+  align: Value<Align>
+  onFamily(family: string): void
+  onSize(size: number): void
+  onFontStyle(change: (current: FontStyle) => FontStyle): void
+  onAlign(align: Align): void
+}
+
+/** Font, size, bold and italic, and alignment: for selected text and for new text. */
+function TextRows({
+  family,
+  size,
+  fontStyle,
+  align,
+  onFamily,
+  onSize,
+  onFontStyle,
+  onAlign,
+}: TextRowsProps) {
+  const styles = fontStyle.filter((s): s is FontStyle => s !== MIXED)
+  const bold = shared(styles.map(isBold))
+  const italic = shared(styles.map(isItalic))
+  const pressedOf = (v: Value<boolean>) => (v === MIXED ? 'mixed' : v)
+  // A family that isn't offered, from an older drawing, still shows as itself.
+  const known = family === MIXED || WEB_SAFE_FONTS.some((f) => f.family === family)
+  return (
+    <>
+      <Row label="Font" mixed={family === MIXED}>
+        <select
+          aria-label="Font"
+          value={family === MIXED ? '' : family}
+          onChange={(e) => onFamily(e.target.value)}
+          className="h-8 min-w-0 flex-1 rounded-md border border-neutral-300 bg-white px-1 text-sm text-neutral-800"
+        >
+          {family === MIXED && (
+            <option value="" disabled>
+              Mixed
+            </option>
+          )}
+          {!known && <option value={family}>{family.split(',')[0]}</option>}
+          {WEB_SAFE_FONTS.map((f) => (
+            <option key={f.family} value={f.family} style={{ fontFamily: f.family }}>
+              {f.label}
+            </option>
+          ))}
+        </select>
+      </Row>
+      <SliderRow
+        label="Size"
+        ariaLabel="Font size"
+        min={MIN_FONT_SIZE}
+        max={MAX_FONT_SIZE}
+        value={size === MIXED ? MIXED : Math.round(size)}
+        onChange={onSize}
+      />
+      <Row label="Style">
+        <IconButton
+          label="Bold"
+          pressed={pressedOf(bold)}
+          onClick={() => onFontStyle((s) => fontStyleOf(bold !== true, isItalic(s)))}
+        >
+          <Bold size={18} />
+        </IconButton>
+        <IconButton
+          label="Italic"
+          pressed={pressedOf(italic)}
+          onClick={() => onFontStyle((s) => fontStyleOf(isBold(s), italic !== true))}
+        >
+          <Italic size={18} />
+        </IconButton>
+        <div aria-hidden className="mx-1 h-6 w-px bg-neutral-200" />
+        {ALIGNS.map((option) => (
+          <IconButton
+            key={option.align}
+            label={option.label}
+            pressed={align === option.align}
+            onClick={() => onAlign(option.align)}
+          >
+            {option.icon}
+          </IconButton>
+        ))}
+      </Row>
+    </>
+  )
+}
+
+/** Text rows for the selected texts; each change is one undo step, a slider drag included. */
+function SelectedTextRows({ texts }: { texts: TextNode[] }) {
+  const apply = (change: (t: TextNode) => Partial<TextNode>, mergeKey?: string) => {
+    const patch: Record<NodeId, Partial<VectorNode>> = {}
+    for (const text of texts) {
+      const changes = change(text)
+      const same = (Object.keys(changes) as (keyof TextNode)[]).every((k) => changes[k] === text[k])
+      if (!same) patch[text.id] = changes
+    }
+    if (Object.keys(patch).length > 0) store().updateNodes(patch, mergeKey)
+  }
+  return (
+    <TextRows
+      family={shared(texts.map((t) => t.fontFamily))}
+      size={shared(texts.map((t) => Math.round(t.fontSize)))}
+      fontStyle={texts.map((t) => t.fontStyle)}
+      align={shared(texts.map((t) => t.align))}
+      onFamily={(fontFamily) => apply(() => ({ fontFamily }))}
+      onSize={(fontSize) => apply(() => ({ fontSize }), 'fontSize')}
+      onFontStyle={(change) => apply((t) => ({ fontStyle: change(t.fontStyle) }))}
+      onAlign={(align) => apply(() => ({ align }))}
+    />
+  )
+}
+
 function SelectionProperties() {
   const doc = useEditorStore((s) => s.doc)
   const selection = useEditorStore((s) => s.selection)
@@ -298,6 +440,9 @@ function SelectionProperties() {
   const rects = nodes.filter((n): n is NodeOf<'rect'> => n.type === 'rect')
   const convertible = nodes.filter((n) => canConvertToPath(n) && !n.locked)
   const lines = nodes.filter((n): n is NodeOf<'line'> => n.type === 'line')
+  const texts = nodes.filter((n): n is TextNode => n.type === 'text')
+  const hasGroup = nodes.some((n) => n.type === 'group')
+  const colorOnly = filled.every((n) => n.type === 'stroke' || n.type === 'text')
   // Konva and SVG round corners to at most half the shorter side.
   const radiusOf = (r: NodeOf<'rect'>) =>
     Math.round(Math.min(r.cornerRadius, r.width / 2, r.height / 2))
@@ -315,7 +460,24 @@ function SelectionProperties() {
   return (
     <>
       <Header title={nodes.length === 1 ? nodes[0].name : `${nodes.length} objects`}>
-        <div role="group" aria-label="Arrange" className="flex items-center gap-0.5">
+        <div role="group" aria-label="Arrange" className="flex flex-wrap items-center gap-0.5">
+          {texts.length === 1 && nodes.length === 1 && (
+            <IconButton
+              label="Edit text"
+              title="Edit text (Enter, or double-click)"
+              onClick={() => startTextEdit(texts[0].id)}
+            >
+              <PencilLine size={18} />
+            </IconButton>
+          )}
+          <IconButton label="Group" title="Group (Ctrl+G)" onClick={() => store().group(selection)}>
+            <Group size={18} />
+          </IconButton>
+          {hasGroup && (
+            <IconButton label="Ungroup" title="Ungroup (Ctrl+Shift+G)" onClick={ungroupSelection}>
+              <Ungroup size={18} />
+            </IconButton>
+          )}
           {convertible.length > 0 && (
             <IconButton
               label="Convert to path"
@@ -355,7 +517,7 @@ function SelectionProperties() {
       {direct && <AnchorRow />}
       {filled.length > 0 && (
         <ColorRow
-          label={filled.every((n) => n.type === 'stroke') ? 'Color' : 'Fill'}
+          label={colorOnly ? 'Color' : 'Fill'}
           value={shared(filled.map((n) => n.style.fill))}
           allowNone={filled.some(canClearColor)}
           onPick={(fill, mergeKey) =>
@@ -429,6 +591,39 @@ function SelectionProperties() {
           </IconButton>
         </Row>
       )}
+      {texts.length > 0 && <SelectedTextRows texts={texts} />}
+    </>
+  )
+}
+
+/** The color and font the next text gets; placing one selects it, so its own show next. */
+function TextDefaults() {
+  const textStyle = useEditorStore((s) => s.textStyle)
+  const { setTextStyle } = store()
+  return (
+    <>
+      <Header title="New text" />
+      <ColorRow
+        label="Color"
+        value={textStyle.fill}
+        allowNone={false}
+        onPick={(fill) => {
+          if (fill !== null) setTextStyle({ fill })
+        }}
+      />
+      <TextRows
+        family={textStyle.fontFamily}
+        size={textStyle.fontSize}
+        fontStyle={[textStyle.fontStyle]}
+        align={textStyle.align}
+        onFamily={(fontFamily) => setTextStyle({ fontFamily })}
+        onSize={(fontSize) => setTextStyle({ fontSize })}
+        onFontStyle={(change) => setTextStyle({ fontStyle: change(textStyle.fontStyle) })}
+        onAlign={(align) => setTextStyle({ align })}
+      />
+      <p className="text-xs text-neutral-500">
+        Tap or click to place a text, or drag to set its width.
+      </p>
     </>
   )
 }
@@ -531,23 +726,25 @@ function ShapeDefaults({ tool }: { tool: keyof typeof SHAPE_TITLES }) {
 
 /**
  * Style for what the active tool works on: the selection with the select, direct-select and hand
- * tools, the brush with the brush and eraser, and the next shape with the shape tools and the pen.
- * On the right from 640 px up; a bottom sheet of fixed height on phones, so the canvas doesn't
- * jump as it changes.
+ * tools, the brush with the brush and eraser, the next shape with the shape tools and the pen,
+ * and the next text with the text tool, or the text being edited. App places it: above the
+ * layers on the right from 640 px up, a tab of the bottom sheet on phones.
  */
-export function PropertiesPanel() {
+export function PropertiesPanel({ className = '' }: { className?: string }) {
   const tool = useEditorStore((s) => s.tool)
+  const editing = useEditorStore((s) => s.editingText !== null)
   let content: ReactNode
   if (tool === 'brush' || tool === 'eraser')
     content = <BrushProperties eraser={tool === 'eraser'} />
   else if (tool === 'rect' || tool === 'ellipse' || tool === 'line' || tool === 'pen') {
     content = <ShapeDefaults tool={tool} />
-  } else content = <SelectionProperties />
+  } else if (tool === 'text' && !editing) content = <TextDefaults />
+  else content = <SelectionProperties />
 
   return (
     <aside
       aria-label="Properties"
-      className="flex h-56 shrink-0 flex-col gap-2 overflow-y-auto border-t border-neutral-200 bg-white px-4 py-2 sm:h-auto sm:w-72 sm:gap-3 sm:border-t-0 sm:border-l sm:p-3"
+      className={`flex min-h-0 flex-col gap-2 overflow-y-auto px-4 py-2 sm:gap-3 sm:p-3 ${className}`}
     >
       {content}
     </aside>

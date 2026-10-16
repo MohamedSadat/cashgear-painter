@@ -1,6 +1,7 @@
 import { nodeHitsSegment } from '../lib/geometry/hitTest'
-import { useEditorStore } from '../store/editorStore'
-import type { NodeId } from '../types'
+import { absoluteTransform, sameTransform } from '../lib/geometry/transform'
+import { isPickable, useEditorStore } from '../store/editorStore'
+import type { Doc, NodeId, VectorNode } from '../types'
 import type { ToolController } from './types'
 
 const store = () => useEditorStore.getState()
@@ -8,14 +9,31 @@ const store = () => useEditorStore.getState()
 let last: [number, number] | null = null
 const hits = new Set<NodeId>()
 
-/** Collects the visible, unlocked nodes the eraser circle touches on its way from a to b. */
+// A node in a group as it lies on the canvas, kept while neither it nor its groups' transforms
+// change, so the hit test's own caches keep working.
+const placedCache = new WeakMap<VectorNode, VectorNode>()
+
+function onCanvas(doc: Doc, node: VectorNode): VectorNode {
+  if (node.parentId === null) return node
+  const transform = absoluteTransform(doc.nodes, node.id)
+  const cached = placedCache.get(node)
+  if (cached && sameTransform(cached.transform, transform)) return cached
+  const placed = { ...node, transform }
+  placedCache.set(node, placed)
+  return placed
+}
+
+/**
+ * Collects the objects the eraser circle touches on its way from a to b: visible, unlocked ones,
+ * including those inside groups, which it erases one by one rather than the whole group.
+ */
 function sweep(a: [number, number], b: [number, number]) {
   const { doc, brush } = store()
   const radius = brush.size / 2
   let found = false
   for (const node of Object.values(doc.nodes)) {
-    if (hits.has(node.id) || node.hidden || node.locked) continue
-    if (nodeHitsSegment(node, a, b, radius)) {
+    if (node.type === 'group' || hits.has(node.id) || !isPickable(doc, node.id)) continue
+    if (nodeHitsSegment(onCanvas(doc, node), a, b, radius)) {
       hits.add(node.id)
       found = true
     }
@@ -23,7 +41,10 @@ function sweep(a: [number, number], b: [number, number]) {
   if (found) store().setErasing([...hits])
 }
 
-/** Object eraser: touched nodes dim while erasing and are deleted together, one undo step, on release. */
+/**
+ * Object eraser: touched objects dim while erasing and are deleted together, one undo step, on
+ * release. A group it empties goes too.
+ */
 export const eraserTool: ToolController = {
   cursor: 'crosshair',
 

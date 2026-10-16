@@ -8,7 +8,18 @@ import {
   type Point,
   type Transform,
 } from '../../types'
-import { bakeTransform, normalizeRotation, snapAngle } from './transform'
+import {
+  absoluteTransform,
+  bakeTransform,
+  bakeTransforms,
+  composeTransform,
+  deltaInParent,
+  isAxisAligned,
+  normalizeRotation,
+  relativeTransform,
+  scaleAlong,
+  snapAngle,
+} from './transform'
 
 const base: BaseNode = {
   id: 'n',
@@ -122,5 +133,94 @@ describe('bakeTransform', () => {
   it('only moves a shape that was moved or turned without scaling', () => {
     const rect: NodeOf<'rect'> = { ...base, type: 'rect', width: 100, height: 50, cornerRadius: 0 }
     expect(bakeTransform(rect, baked)).toEqual({ transform: baked })
+  })
+})
+
+// Rounded, so float noise from turning doesn't matter; `|| 0` turns -0 into 0.
+const round = (t: Transform) =>
+  Object.fromEntries(Object.entries(t).map(([k, v]) => [k, Math.round(v * 1e6) / 1e6 || 0]))
+
+describe('transforms through groups', () => {
+  const parent: Transform = { x: 100, y: 50, rotation: 90, scaleX: 1, scaleY: 1 }
+  const child: Transform = { x: 10, y: 0, rotation: 30, scaleX: 2, scaleY: 1 }
+
+  it('composes a child transform with its parent, and takes it apart again', () => {
+    const absolute = composeTransform(parent, child)
+    expect(round(absolute)).toEqual({ x: 100, y: 60, rotation: 120, scaleX: 2, scaleY: 1 })
+    expect(round(relativeTransform(parent, absolute))).toEqual(child)
+  })
+
+  it('sees a parent scale along a turned child axes', () => {
+    expect(scaleAlong(2, 3, 0)).toEqual([2, 3])
+    expect(scaleAlong(2, 3, 90)).toEqual([3, 2])
+    expect(scaleAlong(2, 2, 30)).toEqual([2, 2])
+  })
+
+  it('finds a node transform on the canvas and moves it along the canvas', () => {
+    const group = { ...base, id: 'g', type: 'group' as const, childIds: ['c'], transform: parent }
+    const rect: NodeOf<'rect'> = {
+      ...base,
+      id: 'c',
+      parentId: 'g',
+      transform: child,
+      type: 'rect',
+      width: 10,
+      height: 10,
+      cornerRadius: 0,
+    }
+    const nodes = { g: group, c: rect }
+
+    expect(round(absoluteTransform(nodes, 'c'))).toEqual(round(composeTransform(parent, child)))
+    expect(absoluteTransform(nodes, 'g')).toBe(parent)
+    // The group is turned a quarter, so moving right on the canvas is moving up in the group.
+    const [dx, dy] = deltaInParent(nodes, 'c', 5, 0)
+    expect([Math.round(dx * 1e6) / 1e6 || 0, Math.round(dy * 1e6) / 1e6]).toEqual([0, -5])
+  })
+})
+
+describe('bakeTransforms', () => {
+  const rect: NodeOf<'rect'> = {
+    ...base,
+    id: 'r',
+    parentId: 'g',
+    transform: { ...IDENTITY_TRANSFORM, x: 10, y: 20 },
+    type: 'rect',
+    width: 100,
+    height: 50,
+    cornerRadius: 0,
+  }
+  const stroke = {
+    ...createStrokeNode([[0, 0, 0.5]], { color: '#000000', size: 8, usesPressure: false }, 's'),
+    parentId: 'g',
+    transform: { ...IDENTITY_TRANSFORM, rotation: 90 },
+  }
+  const group = { ...base, id: 'g', type: 'group' as const, childIds: ['r', 's'] }
+  const nodes = { g: group, r: rect, s: stroke }
+
+  it('passes a group scale to its children, so the group keeps a scale of 1', () => {
+    const next = { x: 5, y: 5, rotation: 0, scaleX: 2, scaleY: 3 }
+
+    expect(bakeTransforms(nodes, group, next)).toEqual({
+      g: { transform: { ...next, scaleX: 1, scaleY: 1 } },
+      r: { transform: { ...IDENTITY_TRANSFORM, x: 20, y: 60 }, width: 200, height: 150 },
+      // Turned a quarter, the stroke sees the group's scale with its axes swapped.
+      s: { transform: { ...IDENTITY_TRANSFORM, rotation: 90, scaleX: 3, scaleY: 2 } },
+    })
+  })
+
+  it('only moves a group that was moved or turned', () => {
+    const next = { ...IDENTITY_TRANSFORM, x: 5, rotation: 45 }
+    expect(bakeTransforms(nodes, group, next)).toEqual({ g: { transform: next } })
+    expect(bakeTransforms(nodes, rect, rect.transform)).toEqual({})
+  })
+
+  it('tells whether everything in a group is turned by multiples of 90°', () => {
+    expect(isAxisAligned(nodes, 'g')).toBe(true)
+    expect(
+      isAxisAligned(
+        { ...nodes, r: { ...rect, transform: { ...rect.transform, rotation: 30 } } },
+        'g',
+      ),
+    ).toBe(false)
   })
 })

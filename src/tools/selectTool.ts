@@ -1,6 +1,8 @@
-import { nodeBounds, type Box } from '../lib/geometry/bounds'
-import { useEditorStore, zoomOf, type Rect } from '../store/editorStore'
-import type { Doc, NodeId, Transform } from '../types'
+import { canvasBounds, nodeBounds, unionBoxes, type Box } from '../lib/geometry/bounds'
+import { deltaInParent } from '../lib/geometry/transform'
+import { outermost, useEditorStore, zoomOf, type Rect } from '../store/editorStore'
+import type { Doc, NodeId, Transform, VectorNode } from '../types'
+import { startTextEdit } from './textTool'
 import type { ToolController, ToolEvent } from './types'
 
 const store = () => useEditorStore.getState()
@@ -40,7 +42,8 @@ const ARROWS: Record<string, [number, number]> = {
 type Xy = [number, number]
 
 type Drag =
-  // Down, but not yet far enough to be a drag; `target` is the top-level node under the pointer.
+  // Down, but not yet far enough to be a drag; `target` is the node under the pointer at the
+  // level the selection is at.
   | {
       kind: 'press'
       start: Xy
@@ -51,6 +54,9 @@ type Drag =
     }
   | { kind: 'move'; start: Xy; origins: Map<NodeId, Transform> }
   | { kind: 'marquee'; start: Xy; base: NodeId[] }
+  // The second press of a double-click on a text: its editor opens on release, which phones
+  // accept as a gesture that may raise the keyboard.
+  | { kind: 'edit'; id: NodeId }
 
 let drag: Drag | null = null
 
@@ -61,23 +67,33 @@ export function topLevelId(doc: Doc, id: NodeId): NodeId | null {
   return node?.id ?? null
 }
 
-/** The box around the nodes' bounds; null when none of them has bounds. */
-export function unionBounds(doc: Doc, ids: NodeId[]): Box | null {
-  let union: Box | null = null
-  for (const id of ids) {
-    const node = doc.nodes[id]
-    const box = node ? nodeBounds(node) : null
-    if (!box) continue
-    union = union
-      ? {
-          minX: Math.min(union.minX, box.minX),
-          minY: Math.min(union.minY, box.minY),
-          maxX: Math.max(union.maxX, box.maxX),
-          maxY: Math.max(union.maxY, box.maxY),
-        }
-      : box
+/** The group the selection is inside, when every selected node has that same parent. */
+export function enteredGroup(doc: Doc, selection: NodeId[]): NodeId | null {
+  const parents = new Set(selection.map((id) => doc.nodes[id]?.parentId ?? null))
+  return parents.size === 1 ? [...parents][0] : null
+}
+
+/** The node `id` belongs to that sits right inside `parentId`; null when it isn't inside it. */
+export function childWithin(doc: Doc, id: NodeId, parentId: NodeId | null): NodeId | null {
+  let node: VectorNode | undefined = doc.nodes[id]
+  while (node && node.parentId !== parentId) {
+    node = node.parentId === null ? undefined : doc.nodes[node.parentId]
   }
-  return union
+  return node?.id ?? null
+}
+
+/**
+ * What a click on the shape `hit` picks: at the top level the outermost group it is in, and
+ * once a group has been entered (the selection is inside it) its child that holds the shape.
+ */
+export function pickTarget(doc: Doc, hit: NodeId, selection: NodeId[]): NodeId | null {
+  const entered = enteredGroup(doc, selection)
+  return (entered !== null && childWithin(doc, hit, entered)) || topLevelId(doc, hit)
+}
+
+/** The box on the canvas around the nodes' bounds; null when none of them has bounds. */
+export function unionBounds(doc: Doc, ids: NodeId[]): Box | null {
+  return unionBoxes(ids.map((id) => canvasBounds(doc.nodes, id)))
 }
 
 /** The visible, unlocked top-level nodes whose bounds lie fully inside the rectangle. */
@@ -85,7 +101,7 @@ export function nodesInRect(doc: Doc, rect: Rect): NodeId[] {
   return doc.rootIds.filter((id) => {
     const node = doc.nodes[id]
     if (!node || node.hidden || node.locked) return false
-    const box = nodeBounds(node)
+    const box = nodeBounds(node, doc.nodes)
     return (
       box !== null &&
       box.minX >= rect.x &&
@@ -108,23 +124,59 @@ function rectBetween(a: Xy, b: Xy): Rect {
 const boxContains = (box: Box, [x, y]: Xy) =>
   x >= box.minX && x <= box.maxX && y >= box.minY && y <= box.maxY
 
-/** Starts moving the unlocked selected nodes, as one undo step. */
+/** Starts moving the selected nodes, as one undo step; a group carries its children. */
 function startMove(start: Xy): Drag {
   const { doc, selection } = store()
   const origins = new Map<NodeId, Transform>()
-  for (const id of selection) {
+  for (const id of outermost(doc, selection)) {
     const node = doc.nodes[id]
-    if (node && !node.locked) origins.set(id, node.transform)
+    if (!node.locked) origins.set(id, node.transform)
   }
   store().beginGesture()
   return { kind: 'move', start, origins }
 }
 
 /**
+ * A double-click goes one level deeper: into a group, selecting its child under the pointer;
+ * from a path to direct select; into a text's editor. True when it did any of these.
+ */
+function openTarget(doc: Doc, target: NodeId, hit: NodeId): boolean {
+  const node = doc.nodes[target]
+  if (node.type === 'group') {
+    const child = childWithin(doc, hit, target)
+    if (child === null) return false
+    store().select([child])
+    return true
+  }
+  if (node.type === 'path') {
+    store().select([target])
+    store().setTool('direct')
+    return true
+  }
+  if (node.type === 'text') {
+    drag = { kind: 'edit', id: target }
+    return true
+  }
+  return false
+}
+
+/** Ungroups every selected group as one undo step. */
+export function ungroupSelection(): void {
+  const { doc, selection } = store()
+  const groups = selection.filter((id) => doc.nodes[id]?.type === 'group')
+  if (groups.length === 0) return
+  store().beginGesture()
+  for (const id of groups) store().ungroup(id)
+  store().endGesture()
+}
+
+/**
  * Click selects and Shift-click adds (or, on a selected node, removes). Dragging a node or the
  * inside of the selection moves the selection; dragging empty canvas draws a marquee that selects
  * what lies fully inside it. Resize and rotate belong to the Transformer in SelectionOverlay.
- * Double-clicking a path switches to direct select to edit its anchors.
+ * A click picks a whole group; a double-click enters it and selects the child under the pointer,
+ * and clicks then pick within it until one lands outside. Double-clicking a path switches to
+ * direct select to edit its anchors, and double-clicking a text edits it.
  */
 export const selectTool: ToolController = {
   cursor: 'default',
@@ -132,12 +184,8 @@ export const selectTool: ToolController = {
 
   onDown(e) {
     const { doc, selection } = store()
-    const target = e.target === null ? null : topLevelId(doc, e.target)
-    if (isDoublePress(e) && target !== null && doc.nodes[target].type === 'path') {
-      store().select([target])
-      store().setTool('direct')
-      return
-    }
+    const target = e.target === null ? null : pickTarget(doc, e.target, selection)
+    if (isDoublePress(e) && target !== null && openTarget(doc, target, e.target!)) return
     const wasSelected = target !== null && selection.includes(target)
     if (target !== null && !wasSelected) store().select([target], e.shift ? 'add' : 'replace')
     const box = target === null && !e.shift ? unionBounds(doc, selection) : null
@@ -152,7 +200,7 @@ export const selectTool: ToolController = {
   },
 
   onMove(e) {
-    if (!drag) return
+    if (!drag || drag.kind === 'edit') return
     if (drag.kind === 'press') {
       const travel = Math.hypot(e.point[0] - drag.start[0], e.point[1] - drag.start[1])
       if (travel * zoomOf(store()) < DRAG_SLOP) return
@@ -165,9 +213,13 @@ export const selectTool: ToolController = {
     if (drag.kind === 'move') {
       const dx = e.point[0] - drag.start[0]
       const dy = e.point[1] - drag.start[1]
+      const { nodes } = store().doc
       const patch: Record<NodeId, { transform: Transform }> = {}
-      for (const [id, t] of drag.origins)
-        patch[id] = { transform: { ...t, x: t.x + dx, y: t.y + dy } }
+      for (const [id, t] of drag.origins) {
+        // A node in a turned group moves along the canvas, not along the group's axes.
+        const [x, y] = deltaInParent(nodes, id, dx, dy)
+        patch[id] = { transform: { ...t, x: t.x + x, y: t.y + y } }
+      }
       store().updateNodes(patch)
     } else if (drag.kind === 'marquee') {
       const rect = rectBetween(drag.start, e.point)
@@ -180,7 +232,8 @@ export const selectTool: ToolController = {
     const finished = drag
     drag = null
     if (!finished) return
-    if (finished.kind === 'move') store().endGesture()
+    if (finished.kind === 'edit') startTextEdit(finished.id)
+    else if (finished.kind === 'move') store().endGesture()
     else if (finished.kind === 'marquee') store().setMarquee(null)
     else if (finished.target !== null) {
       // A click on a node that was already selected: Shift removes it, a plain click keeps only it.
@@ -195,16 +248,27 @@ export const selectTool: ToolController = {
         selectTool.onCancel?.()
         return true
       }
-      if (store().selection.length === 0) return false
-      store().select([])
+      const { doc, selection } = store()
+      if (selection.length === 0) return false
+      // Out of a group one level at a time, then nothing.
+      const entered = enteredGroup(doc, selection)
+      store().select(entered === null ? [] : [entered])
       return true
     }
-    const { selection } = store()
+    const { doc, selection } = store()
     if (drag || selection.length === 0 || e.altKey) return false
 
     if (!(e.ctrlKey || e.metaKey)) {
       if (e.key === 'Delete' || e.key === 'Backspace') {
         store().deleteNodes(selection)
+        return true
+      }
+      // Enter edits a text, or goes into a group, selecting what it holds.
+      if (e.key === 'Enter' && selection.length === 1) {
+        const node = doc.nodes[selection[0]]
+        if (node?.type === 'text') startTextEdit(node.id)
+        else if (node?.type === 'group') store().select(node.childIds)
+        else return false
         return true
       }
       const arrow = ARROWS[e.key]
@@ -215,7 +279,10 @@ export const selectTool: ToolController = {
     }
 
     const key = e.key.toLowerCase()
-    if (key === 'd') store().duplicate(selection)
+    if (key === 'g') {
+      if (e.shiftKey) ungroupSelection()
+      else store().group(selection)
+    } else if (key === 'd') store().duplicate(selection)
     else if (key === 'c') store().copy(selection)
     else if (key === 'x') {
       store().copy(selection)

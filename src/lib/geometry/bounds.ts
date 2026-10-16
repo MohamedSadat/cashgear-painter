@@ -1,5 +1,15 @@
-import type { PathNode, ShapeNode, Transform, VectorNode } from '../../types'
+import type {
+  GroupNode,
+  NodeId,
+  PathNode,
+  ShapeNode,
+  TextNode,
+  Transform,
+  VectorNode,
+} from '../../types'
 import { pathSegments, type Cubic } from './pathData'
+import { textHeight } from './textLayout'
+import { absoluteTransform, composeTransform } from './transform'
 
 /** Anything with x at 0 and y at 1: a [x, y] pair or a [x, y, pressure] point. */
 export type Vec = { readonly 0: number; readonly 1: number }
@@ -188,14 +198,80 @@ function shapeBounds(node: ShapeNode): Box | null {
   }
 }
 
+/** A text node's box in its own coordinates: its width, and a line height per line. */
+export function textBox(node: TextNode): Box {
+  return { minX: 0, minY: 0, maxX: node.width, maxY: textHeight(node) }
+}
+
+export function unionBoxes(boxes: Iterable<Box | null>): Box | null {
+  let union: Box | null = null
+  for (const box of boxes) {
+    if (!box) continue
+    union = union
+      ? {
+          minX: Math.min(union.minX, box.minX),
+          minY: Math.min(union.minY, box.minY),
+          maxX: Math.max(union.maxX, box.maxX),
+          maxY: Math.max(union.maxY, box.maxY),
+        }
+      : box
+  }
+  return union
+}
+
+type Nodes = Readonly<Record<NodeId, VectorNode>>
+
+/** The group's visible descendants, depth first; they decide whether its cached box still holds. */
+function visibleDescendants(nodes: Nodes, group: GroupNode, out: VectorNode[] = []): VectorNode[] {
+  for (const id of group.childIds) {
+    const child = nodes[id]
+    if (!child || child.hidden) continue
+    out.push(child)
+    if (child.type === 'group') visibleDescendants(nodes, child, out)
+  }
+  return out
+}
+
+const groupCache = new WeakMap<GroupNode, { parts: VectorNode[]; box: Box | null }>()
+
+/**
+ * A group's box: its visible children boxed through the group's transform, so a turned group gets
+ * the exact box of what it holds, not a box around a box. Cached until a descendant changes.
+ */
+function groupBounds(group: GroupNode, nodes: Nodes): Box | null {
+  const parts = visibleDescendants(nodes, group)
+  const cached = groupCache.get(group)
+  if (
+    cached &&
+    cached.parts.length === parts.length &&
+    cached.parts.every((part, i) => part === parts[i])
+  ) {
+    return cached.box
+  }
+  const box = unionBoxes(
+    group.childIds.map((id) => {
+      const child = nodes[id]
+      if (!child || child.hidden) return null
+      return nodeBounds(
+        { ...child, transform: composeTransform(group.transform, child.transform) },
+        nodes,
+      )
+    }),
+  )
+  groupCache.set(group, { parts, box })
+  return box
+}
+
 const boundsCache = new WeakMap<VectorNode, Box | null>()
 
 /**
- * Canvas-space box around a node's ink, outlines included; null for node types without bounds
- * yet (text and groups get theirs in M12). A path is boxed by its curves' extrema, not by its
- * anchors and handles.
+ * Box around a node's ink, outlines included, in its parent's coordinates: the canvas for a
+ * top-level node. A path is boxed by its curves' extrema, not by its anchors and handles, and a
+ * text by its width and lines. A group needs `nodes` to find its children; without them, or with
+ * nothing visible inside, it has no box.
  */
-export function nodeBounds(node: VectorNode): Box | null {
+export function nodeBounds(node: VectorNode, nodes?: Nodes): Box | null {
+  if (node.type === 'group') return nodes ? groupBounds(node, nodes) : null
   const cached = boundsCache.get(node)
   if (cached !== undefined) return cached
 
@@ -204,14 +280,19 @@ export function nodeBounds(node: VectorNode): Box | null {
     if (node.points.length > 0) {
       box = transformedBox(node.transform, pointsBox(node.points, node.size * MAX_STROKE_REACH))
     }
-  } else if (
-    node.type === 'rect' ||
-    node.type === 'ellipse' ||
-    node.type === 'line' ||
-    node.type === 'path'
-  ) {
+  } else if (node.type === 'text') {
+    box = transformedBox(node.transform, textBox(node))
+  } else {
     box = shapeBounds(node)
   }
   boundsCache.set(node, box)
   return box
+}
+
+/** A node's box on the canvas, through every group it is in. */
+export function canvasBounds(nodes: Nodes, id: NodeId): Box | null {
+  const node = nodes[id]
+  if (!node) return null
+  if (node.parentId === null) return nodeBounds(node, nodes)
+  return nodeBounds({ ...node, transform: absoluteTransform(nodes, id) }, nodes)
 }

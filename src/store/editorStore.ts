@@ -1,6 +1,14 @@
 import { produce, type Draft } from 'immer'
 import { create } from 'zustand'
+import { isIdentity } from '../lib/geometry/bounds'
 import { shapeAnchors } from '../lib/geometry/pathData'
+import { WEB_SAFE_FONTS } from '../lib/geometry/textLayout'
+import {
+  absoluteTransform,
+  composeTransform,
+  deltaInParent,
+  relativeTransform,
+} from '../lib/geometry/transform'
 import {
   CANVAS_HEIGHT,
   CANVAS_WIDTH,
@@ -8,12 +16,14 @@ import {
   emptyDoc,
   type Anchor,
   type Doc,
+  type GroupNode,
   type NodeId,
   type NodeOf,
   type PathNode,
   type Point,
   type StrokeNode,
   type Style,
+  type TextNode,
   type ToolId,
   type VectorNode,
 } from '../types'
@@ -34,6 +44,26 @@ export const DEFAULT_SHAPE_STYLE: Style = {
   stroke: '#000000',
   strokeWidth: 4,
   opacity: 1,
+}
+
+export const MIN_FONT_SIZE = 8
+export const MAX_FONT_SIZE = 200
+
+/** What a new text starts with: its color and font. */
+export interface TextStyle {
+  fill: string
+  fontFamily: string
+  fontSize: number
+  fontStyle: TextNode['fontStyle']
+  align: TextNode['align']
+}
+
+export const DEFAULT_TEXT_STYLE: TextStyle = {
+  fill: '#000000',
+  fontFamily: WEB_SAFE_FONTS[0].family,
+  fontSize: 48,
+  fontStyle: 'normal',
+  align: 'left',
 }
 
 export type ZOrder = 'forward' | 'backward' | 'front' | 'back'
@@ -86,11 +116,16 @@ export interface EditorState {
   clipboard: VectorNode[] // copied nodes with their descendants; not in history or autosave
   penHover: [x: number, y: number] | null // the pen's pointer while it hovers, in canvas units
   activeAnchor: AnchorRef | null // the direct-select tool's anchor, for Delete and the panel
+  textStyle: TextStyle // for new text; not in history or autosave
+  editingText: NodeId | null // the text the textarea overlay is editing
 
   addNodes(nodes: VectorNode[], parentId?: NodeId): void
   updateNodes(patch: Record<NodeId, Partial<VectorNode>>, mergeKey?: string): void
   deleteNodes(ids: NodeId[]): void
   reorder(ids: NodeId[], where: ZOrder): void
+  group(ids: NodeId[]): void
+  ungroup(id: NodeId): void
+  moveNodes(ids: NodeId[], parentId: NodeId | null, index: number): void
   nudge(ids: NodeId[], dx: number, dy: number): void
   duplicate(ids: NodeId[]): void
   copy(ids: NodeId[]): void
@@ -111,6 +146,8 @@ export interface EditorState {
   setMarquee(rect: Rect | null): void
   setPenHover(point: [number, number] | null): void
   setActiveAnchor(anchor: AnchorRef | null): void
+  setTextStyle(style: Partial<TextStyle>): void
+  setEditingText(id: NodeId | null): void
   setViewport(viewport: Viewport): void
   setView(view: View): void
   zoomTo(zoom: number, anchor?: [x: number, y: number]): void
@@ -216,6 +253,128 @@ export function createPathNode(
   }
 }
 
+/** A text box `width` units wide with its top-left corner at (x, y), in the text style. */
+export function createTextNode(
+  x: number,
+  y: number,
+  width: number,
+  style: TextStyle,
+  text = '',
+  id: NodeId = newNodeId(),
+): TextNode {
+  const { fill, fontFamily, fontSize, fontStyle, align } = style
+  return {
+    ...newBase(id, 'Text', { fill, stroke: null, strokeWidth: 0, opacity: 1 }, x, y),
+    type: 'text',
+    text,
+    fontFamily,
+    fontSize,
+    fontStyle,
+    align,
+    width,
+  }
+}
+
+/** A group around `childIds`, with no transform of its own, so its children stay where they are. */
+export function createGroupNode(
+  childIds: NodeId[],
+  parentId: NodeId | null = null,
+  id: NodeId = newNodeId(),
+): GroupNode {
+  return {
+    id,
+    type: 'group',
+    name: 'Group',
+    parentId,
+    transform: IDENTITY_TRANSFORM,
+    style: { fill: null, stroke: null, strokeWidth: 0, opacity: 1 },
+    hidden: false,
+    locked: false,
+    childIds,
+  }
+}
+
+/** Whether the node and every group it is in are visible and unlocked: it can be picked. */
+export function isPickable(doc: Doc, id: NodeId): boolean {
+  let node: VectorNode | undefined = doc.nodes[id]
+  while (node) {
+    if (node.hidden || node.locked) return false
+    if (node.parentId === null) return true
+    node = doc.nodes[node.parentId]
+  }
+  return false
+}
+
+/** Whether `ancestor` is `id` or one of the groups it is in. */
+export function isWithin(doc: Doc, id: NodeId, ancestor: NodeId): boolean {
+  let node: VectorNode | undefined = doc.nodes[id]
+  while (node) {
+    if (node.id === ancestor) return true
+    node = node.parentId === null ? undefined : doc.nodes[node.parentId]
+  }
+  return false
+}
+
+/** Every node's place in a walk of the tree: bottom to top, each group before its children. */
+function treeOrder(doc: Doc): Map<NodeId, number> {
+  const order = new Map<NodeId, number>()
+  const visit = (id: NodeId) => {
+    const node = doc.nodes[id]
+    if (!node || order.has(id)) return
+    order.set(id, order.size)
+    if (node.type === 'group') node.childIds.forEach(visit)
+  }
+  doc.rootIds.forEach(visit)
+  return order
+}
+
+/**
+ * The existing nodes among `ids` without the ones inside another of them, in tree order: what a
+ * move, a group or a duplicate acts on, since a group carries its children along.
+ */
+export function outermost(doc: Doc, ids: NodeId[]): NodeId[] {
+  const picked = new Set(ids.filter((id) => id in doc.nodes))
+  const order = treeOrder(doc)
+  return [...picked]
+    .filter((id) => {
+      for (let p = doc.nodes[id].parentId; p !== null; p = doc.nodes[p]?.parentId ?? null) {
+        if (picked.has(p)) return false
+      }
+      return order.has(id)
+    })
+    .sort((a, b) => order.get(a)! - order.get(b)!)
+}
+
+/** The z-order list a node with this parent sits in: the doc's roots, or a group's children. */
+function siblingsOf(doc: Draft<Doc>, parentId: NodeId | null): NodeId[] {
+  if (parentId === null) return doc.rootIds
+  const parent = doc.nodes[parentId]
+  return parent?.type === 'group' ? parent.childIds : []
+}
+
+/** Takes a node out of its parent's z-order, leaving it in the node map. */
+function detach(doc: Draft<Doc>, id: NodeId): void {
+  const node = doc.nodes[id]
+  if (!node) return
+  const siblings = siblingsOf(doc, node.parentId)
+  const index = siblings.indexOf(id)
+  if (index >= 0) siblings.splice(index, 1)
+}
+
+/** Deletes the groups among `ids` that have nothing left inside, and parents that empty in turn. */
+function dropEmptyGroups(doc: Draft<Doc>, ids: Iterable<NodeId | null>): void {
+  for (let id of ids) {
+    while (id !== null) {
+      const node: Draft<VectorNode> | undefined = doc.nodes[id]
+      if (node?.type !== 'group' || node.childIds.length > 0) break
+      const parentId = node.parentId
+      detach(doc, id)
+      delete doc.nodes[id]
+      id = parentId
+    }
+  }
+}
+
 type ConvertibleNode = NodeOf<'rect' | 'ellipse' | 'line'>
 
 const DEFAULT_NAMES: Record<ConvertibleNode['type'], string> = {
@@ -251,9 +410,12 @@ function pushSnapshot(past: Doc[], doc: Doc): Doc[] {
   return next.length > HISTORY_LIMIT ? next.slice(next.length - HISTORY_LIMIT) : next
 }
 
-/** Selected ids that still exist in `doc`; the same array when nothing was dropped. */
-function existing(selection: NodeId[], doc: Doc): NodeId[] {
-  const kept = selection.filter((id) => id in doc.nodes)
+/**
+ * Selected ids that can still be picked in `doc`: they exist, and neither they nor their groups
+ * are hidden or locked. The same array when nothing was dropped.
+ */
+function pickable(selection: NodeId[], doc: Doc): NodeId[] {
+  const kept = selection.filter((id) => isPickable(doc, id))
   return kept.length === selection.length ? selection : kept
 }
 
@@ -292,23 +454,30 @@ function collectSubtrees(doc: Doc, ids: NodeId[]): VectorNode[] {
 }
 
 /**
- * Copies of the nodes under new ids, with parent and child ids remapped. Nodes whose parent is not
- * among them become top level and are moved by `offset` canvas units on both axes.
+ * Copies of the nodes under new ids, with parent and child ids remapped. A node whose parent is
+ * not among them is a root of the copy: it goes into the same group when that group is in `doc`
+ * (a duplicate), or else to the top level (a paste), and moves by `offset` canvas units on both
+ * axes.
  */
 function withNewIds(
+  doc: Doc,
   nodes: VectorNode[],
   offset: number,
-): { nodes: VectorNode[]; topIds: NodeId[] } {
+): { nodes: VectorNode[]; roots: NodeId[] } {
   const ids = new Map(nodes.map((node) => [node.id, newNodeId()]))
-  const topIds: NodeId[] = []
+  const roots: NodeId[] = []
   const copies = nodes.map((node): VectorNode => {
     const id = ids.get(node.id)!
-    const parentId = node.parentId === null ? null : (ids.get(node.parentId) ?? null)
-    if (parentId === null) topIds.push(id)
-    const transform =
-      parentId === null
-        ? { ...node.transform, x: node.transform.x + offset, y: node.transform.y + offset }
-        : node.transform
+    let parentId = node.parentId === null ? null : (ids.get(node.parentId) ?? null)
+    let transform = node.transform
+    if (parentId === null) {
+      roots.push(id)
+      const parent = node.parentId === null ? undefined : doc.nodes[node.parentId]
+      parentId = parent?.type === 'group' ? parent.id : null
+      const [dx, dy] =
+        parentId === null ? [offset, offset] : deltaInParent(doc.nodes, node.id, offset, offset)
+      transform = { ...transform, x: transform.x + dx, y: transform.y + dy }
+    }
     const copy = { ...node, id, parentId, transform }
     if (copy.type === 'group') {
       copy.childIds = copy.childIds.flatMap((child) => {
@@ -318,7 +487,7 @@ function withNewIds(
     }
     return copy
   })
-  return { nodes: copies, topIds }
+  return { nodes: copies, roots }
 }
 
 /** A sibling list with the picked ids moved one step or all the way up or down, keeping their order. */
@@ -359,22 +528,24 @@ export const useEditorStore = create<EditorState>()((set, get) => {
    * the edit into the latest step instead.
    */
   function commit(recipe: (doc: Draft<Doc>) => void, merge = false): void {
-    const { doc, past, gestureStart } = get()
+    const { doc, past, gestureStart, selection } = get()
     const next = produce(doc, recipe)
     if (next === doc) return
-    if (gestureStart || merge) set({ doc: next })
-    else set({ doc: next, past: pushSnapshot(past, doc), future: [] })
+    // Hiding or locking a node drops it from the selection, as deleting it does.
+    const kept = pickable(selection, next)
+    if (gestureStart || merge) set({ doc: next, selection: kept })
+    else set({ doc: next, past: pushSnapshot(past, doc), future: [], selection: kept })
   }
 
-  /** Adds copies of the nodes on top of the z-order and selects them. */
+  /** Adds copies of the nodes on top of their groups' or the doc's z-order, and selects them. */
   function insertCopies(nodes: VectorNode[], offset: number): void {
-    const copies = withNewIds(nodes, offset)
-    if (copies.topIds.length === 0) return
+    const copies = withNewIds(get().doc, nodes, offset)
+    if (copies.roots.length === 0) return
     commit((doc) => {
       for (const node of copies.nodes) doc.nodes[node.id] = node
-      doc.rootIds.push(...copies.topIds)
+      for (const id of copies.roots) siblingsOf(doc, doc.nodes[id].parentId).push(id)
     })
-    set({ selection: copies.topIds })
+    set({ selection: copies.roots })
   }
 
   // The doc the last mergeable edit produced, its key, and when: an edit with the same key soon
@@ -410,6 +581,8 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     clipboard: [],
     penHover: null,
     activeAnchor: null,
+    textStyle: DEFAULT_TEXT_STYLE,
+    editingText: null,
 
     addNodes(nodes, parentId) {
       commit((doc) => {
@@ -453,16 +626,18 @@ export const useEditorStore = create<EditorState>()((set, get) => {
         if (doomed.size === 0) return
 
         const keep = (id: NodeId) => !doomed.has(id)
+        const parents = new Set<NodeId>()
         if (!doc.rootIds.every(keep)) doc.rootIds = doc.rootIds.filter(keep)
         for (const node of Object.values(doc.nodes)) {
           if (node.type === 'group' && !doomed.has(node.id) && !node.childIds.every(keep)) {
             node.childIds = node.childIds.filter(keep)
+            parents.add(node.id)
           }
         }
         for (const id of doomed) delete doc.nodes[id]
+        // A group never stays empty.
+        dropEmptyGroups(doc, parents)
       })
-      const { selection, doc } = get()
-      set({ selection: existing(selection, doc) })
     },
 
     reorder(ids, where) {
@@ -479,23 +654,135 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       })
     },
 
+    group(ids) {
+      const { doc } = get()
+      const picked = outermost(doc, ids)
+      if (picked.length === 0) return
+      // The group takes the place of the front-most node, in that node's parent.
+      const front = picked[picked.length - 1]
+      const parentId = doc.nodes[front].parentId
+      const frame = parentId === null ? IDENTITY_TRANSFORM : absoluteTransform(doc.nodes, parentId)
+      // Nodes from other groups keep where they are on the canvas.
+      const transforms = picked.map((id) =>
+        doc.nodes[id].parentId === parentId
+          ? doc.nodes[id].transform
+          : relativeTransform(frame, absoluteTransform(doc.nodes, id)),
+      )
+      const formerParents = picked.map((id) => doc.nodes[id].parentId)
+      const group = createGroupNode(picked, parentId)
+      commit((draft) => {
+        const siblings = siblingsOf(draft, parentId)
+        siblings.splice(siblings.indexOf(front) + 1, 0, group.id)
+        picked.forEach((id, i) => {
+          detach(draft, id)
+          const node = draft.nodes[id]
+          node.parentId = group.id
+          node.transform = transforms[i]
+        })
+        draft.nodes[group.id] = group
+        dropEmptyGroups(draft, formerParents)
+      })
+      set({ selection: [group.id], activeAnchor: null })
+    },
+
+    ungroup(id) {
+      const { doc } = get()
+      const group = doc.nodes[id]
+      if (group?.type !== 'group') return
+      const children = group.childIds.filter((child) => child in doc.nodes)
+      const { opacity } = group.style
+      commit((draft) => {
+        const siblings = siblingsOf(draft, group.parentId)
+        siblings.splice(siblings.indexOf(id), 1, ...children)
+        // The group's transform, opacity, visibility and lock pass to its children.
+        for (const child of children) {
+          const node = draft.nodes[child]
+          node.parentId = group.parentId
+          if (!isIdentity(group.transform)) {
+            node.transform = composeTransform(group.transform, node.transform)
+          }
+          if (opacity !== 1) node.style = { ...node.style, opacity: node.style.opacity * opacity }
+          if (group.hidden) node.hidden = true
+          if (group.locked) node.locked = true
+        }
+        delete draft.nodes[id]
+      })
+      // Ungrouping one of several selected groups keeps the others selected.
+      const { selection, doc: next } = get()
+      const rest = selection.filter((s) => s !== id)
+      set({ selection: pickable([...rest, ...children], next) })
+    },
+
+    moveNodes(ids, parentId, index) {
+      const { doc } = get()
+      if (parentId !== null && doc.nodes[parentId]?.type !== 'group') return
+      // A group can't go inside itself.
+      const moving = outermost(doc, ids).filter(
+        (id) => parentId === null || !isWithin(doc, parentId, id),
+      )
+      if (moving.length === 0) return
+      const frame = parentId === null ? IDENTITY_TRANSFORM : absoluteTransform(doc.nodes, parentId)
+      const target = parentId === null ? doc.rootIds : (doc.nodes[parentId] as GroupNode).childIds
+      const rest = target.filter((id) => !moving.includes(id))
+      const at = Math.max(0, Math.min(rest.length, Math.round(index)))
+      const order = [...rest.slice(0, at), ...moving, ...rest.slice(at)]
+      const inPlace = moving.every((id) => doc.nodes[id].parentId === parentId)
+      if (inPlace && sameOrder(order, target)) return
+
+      const moves = moving.map((id) => {
+        const node = doc.nodes[id]
+        const transform =
+          node.parentId === parentId
+            ? node.transform
+            : relativeTransform(frame, absoluteTransform(doc.nodes, id))
+        return { id, from: node.parentId, transform }
+      })
+      commit((draft) => {
+        for (const { id } of moves) detach(draft, id)
+        if (parentId === null) draft.rootIds = order
+        else (draft.nodes[parentId] as Draft<GroupNode>).childIds = order
+        for (const { id, transform } of moves) {
+          const node = draft.nodes[id]
+          node.parentId = parentId
+          node.transform = transform
+        }
+        dropEmptyGroups(
+          draft,
+          moves.map((m) => m.from),
+        )
+      })
+    },
+
     nudge(ids, dx, dy) {
       if (dx === 0 && dy === 0) return
-      commitMerging('nudge', (doc) => {
-        for (const id of ids) {
-          const node = doc.nodes[id]
+      const { doc } = get()
+      // On screen: a node in a turned group moves the way the arrow points.
+      const moves = outermost(doc, ids).map(
+        (id) => [id, deltaInParent(doc.nodes, id, dx, dy)] as const,
+      )
+      commitMerging('nudge', (draft) => {
+        for (const [id, [x, y]] of moves) {
+          const node = draft.nodes[id]
           if (!node || node.locked) continue
-          node.transform = { ...node.transform, x: node.transform.x + dx, y: node.transform.y + dy }
+          node.transform = { ...node.transform, x: node.transform.x + x, y: node.transform.y + y }
         }
       })
     },
 
     duplicate(ids) {
-      insertCopies(collectSubtrees(get().doc, ids), PASTE_OFFSET)
+      const { doc } = get()
+      insertCopies(collectSubtrees(doc, outermost(doc, ids)), PASTE_OFFSET)
     },
 
     copy(ids) {
-      const nodes = collectSubtrees(get().doc, ids)
+      const { doc } = get()
+      const roots = new Set(outermost(doc, ids))
+      // Copied nodes leave their groups, keeping where they are on the canvas.
+      const nodes = collectSubtrees(doc, [...roots]).map((node) =>
+        roots.has(node.id) && node.parentId !== null
+          ? { ...node, parentId: null, transform: absoluteTransform(doc.nodes, node.id) }
+          : node,
+      )
       if (nodes.length === 0) return
       pasteCount = 0
       set({ clipboard: nodes })
@@ -536,7 +823,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     cancelGesture() {
       const { gestureStart, selection } = get()
       if (!gestureStart) return
-      set({ doc: gestureStart, gestureStart: null, selection: existing(selection, gestureStart) })
+      set({ doc: gestureStart, gestureStart: null, selection: pickable(selection, gestureStart) })
     },
 
     undo() {
@@ -547,7 +834,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
         doc: previous,
         past: past.slice(0, -1),
         future: [...future, doc],
-        selection: existing(selection, previous),
+        selection: pickable(selection, previous),
       })
     },
 
@@ -559,7 +846,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
         doc: next,
         past: pushSnapshot(past, doc),
         future: future.slice(0, -1),
-        selection: existing(selection, next),
+        selection: pickable(selection, next),
       })
     },
 
@@ -574,7 +861,8 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 
     select(ids, mode = 'replace') {
       const { doc, selection, activeAnchor } = get()
-      const picked = [...new Set(ids)].filter((id) => id in doc.nodes)
+      // Hidden and locked nodes, and anything in a hidden or locked group, can't be selected.
+      const picked = [...new Set(ids)].filter((id) => isPickable(doc, id))
       let next: NodeId[]
       if (mode === 'replace') next = picked
       else if (mode === 'add') next = [...new Set([...selection, ...picked])]
@@ -630,6 +918,24 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 
     setActiveAnchor(anchor) {
       set({ activeAnchor: anchor })
+    },
+
+    setTextStyle(style) {
+      const current = get().textStyle
+      const fontSize = style.fontSize ?? current.fontSize
+      set({
+        textStyle: {
+          ...current,
+          ...style,
+          fontSize: Number.isFinite(fontSize)
+            ? Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, Math.round(fontSize)))
+            : current.fontSize,
+        },
+      })
+    },
+
+    setEditingText(id) {
+      set({ editingText: id })
     },
 
     setViewport(next) {

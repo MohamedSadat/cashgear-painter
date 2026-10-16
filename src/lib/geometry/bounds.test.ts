@@ -1,15 +1,19 @@
 import { describe, expect, it } from 'vitest'
 import {
+  DEFAULT_TEXT_STYLE,
   createEllipseNode,
+  createGroupNode,
   createLineNode,
   createPathNode,
   createRectNode,
   createStrokeNode,
+  createTextNode,
 } from '../../store/editorStore'
 import type { Style, Transform, VectorNode } from '../../types'
 import {
   applyTransform,
   arrowHeadSize,
+  canvasBounds,
   cubicBox,
   invertTransform,
   nodeBounds,
@@ -28,8 +32,8 @@ const at = (node: VectorNode, transform: Partial<Transform>): VectorNode => ({
 })
 
 /** The box with every value rounded, so float noise from turning doesn't matter. */
-function roundedBounds(node: VectorNode) {
-  const b = nodeBounds(node)
+function roundedBounds(node: VectorNode, nodes?: Record<string, VectorNode>) {
+  const b = nodeBounds(node, nodes)
   return b && Object.fromEntries(Object.entries(b).map(([k, v]) => [k, Math.round(v * 1e6) / 1e6]))
 }
 
@@ -172,9 +176,37 @@ describe('nodeBounds', () => {
     expect(nodeBounds({ ...arch, anchors: [] })).toBeNull()
   })
 
-  it('has no bounds for node types without them yet', () => {
-    const text = { ...createRectNode(box, outlined), type: 'text', text: 'Hi', width: 100 }
+  it('boxes a text by its width and lines, through its transform', () => {
+    // Without a canvas a glyph is 0.6 em: 'Hi there' at size 10 wraps to two lines in 30 units.
+    const text = createTextNode(100, 200, 30, { ...DEFAULT_TEXT_STYLE, fontSize: 10 }, 'Hi there')
 
-    expect(nodeBounds(text as VectorNode)).toBeNull()
+    expect(roundedBounds(text)).toEqual({ minX: 100, minY: 200, maxX: 130, maxY: 224 })
+    expect(roundedBounds(at(text, { rotation: 90 }))).toEqual({
+      minX: 76,
+      minY: 200,
+      maxX: 100,
+      maxY: 230,
+    })
+  })
+
+  it('boxes a group by its visible children, through its transform', () => {
+    const rect = { ...createRectNode({ x: 0, y: 0, width: 100, height: 50 }, filledOnly, 'r') }
+    const hidden = { ...createRectNode(box, filledOnly, 'h'), hidden: true }
+    const group: VectorNode = {
+      ...createGroupNode(['r', 'h'], null, 'g'),
+      transform: { x: 10, y: 20, rotation: 90, scaleX: 1, scaleY: 1 },
+    }
+    const nodes = { g: group, r: { ...rect, parentId: 'g' }, h: { ...hidden, parentId: 'g' } }
+    const turned = { minX: -40, minY: 20, maxX: 10, maxY: 120 }
+
+    expect(roundedBounds(group, nodes)).toEqual(turned)
+    expect(nodeBounds(group)).toBeNull()
+    // A child on the canvas is where its group puts it.
+    const child = canvasBounds(nodes, 'r')!
+    expect(Object.values(child).map((v) => Math.round(v * 1e6) / 1e6)).toEqual(
+      Object.values(turned),
+    )
+    // Its own box is in the group's coordinates.
+    expect(nodeBounds(nodes.r)).toEqual({ minX: 0, minY: 0, maxX: 100, maxY: 50 })
   })
 })

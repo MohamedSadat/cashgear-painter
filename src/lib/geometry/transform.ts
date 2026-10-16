@@ -1,4 +1,14 @@
-import type { Anchor, Transform, VectorNode } from '../../types'
+import {
+  IDENTITY_TRANSFORM,
+  type Anchor,
+  type GroupNode,
+  type NodeId,
+  type Transform,
+  type VectorNode,
+} from '../../types'
+import { applyTransform, invertTransform } from './bounds'
+
+type Nodes = Readonly<Record<NodeId, VectorNode>>
 
 /** Degrees in (-180, 180], so a full turn back reads as no rotation. */
 export function normalizeRotation(degrees: number): number {
@@ -48,12 +58,69 @@ function scaleAnchor(a: Anchor, sx: number, sy: number): Anchor {
   }
 }
 
+const DEG = Math.PI / 180
+
+/**
+ * A scale of (sx, sy) as a node turned by `rotation` degrees sees it along its own axes. Exact when
+ * the scale is uniform or the turn a multiple of 90°; otherwise the closest scale without skew,
+ * which the model can't hold.
+ */
+export function scaleAlong(sx: number, sy: number, rotation: number): [number, number] {
+  if (sx === sy) return [sx, sy]
+  const cos = Math.cos(rotation * DEG)
+  const sin = Math.sin(rotation * DEG)
+  const clean = (n: number) => Math.round(n * 1e9) / 1e9
+  return [clean(Math.hypot(sx * cos, sy * sin)), clean(Math.hypot(sx * sin, sy * cos))]
+}
+
+/** The transform `child` has on the canvas when its parent has the transform `parent`. */
+export function composeTransform(parent: Transform, child: Transform): Transform {
+  const [x, y] = applyTransform(parent, child.x, child.y)
+  const [sx, sy] = scaleAlong(parent.scaleX, parent.scaleY, child.rotation)
+  return {
+    x,
+    y,
+    rotation: normalizeRotation(parent.rotation + child.rotation),
+    scaleX: child.scaleX * sx,
+    scaleY: child.scaleY * sy,
+  }
+}
+
+/** The transform that `composeTransform(parent, ·)` turns into `absolute`: its inverse. */
+export function relativeTransform(parent: Transform, absolute: Transform): Transform {
+  const [x, y] = invertTransform(parent, absolute.x, absolute.y)
+  const rotation = normalizeRotation(absolute.rotation - parent.rotation)
+  const [sx, sy] = scaleAlong(parent.scaleX, parent.scaleY, rotation)
+  return { x, y, rotation, scaleX: absolute.scaleX / sx, scaleY: absolute.scaleY / sy }
+}
+
+/** The transform of the node's parent on the canvas: its groups' transforms combined. */
+export function parentTransform(nodes: Nodes, id: NodeId): Transform {
+  const parentId = nodes[id]?.parentId ?? null
+  return parentId === null ? IDENTITY_TRANSFORM : absoluteTransform(nodes, parentId)
+}
+
+/** The node's transform on the canvas, through every group it is in. */
+export function absoluteTransform(nodes: Nodes, id: NodeId): Transform {
+  const node = nodes[id]
+  if (!node) return IDENTITY_TRANSFORM
+  if (node.parentId === null) return node.transform
+  return composeTransform(parentTransform(nodes, id), node.transform)
+}
+
+/** A canvas-space move of (dx, dy) as the node's parent sees it, for moving a node in a group. */
+export function deltaInParent(nodes: Nodes, id: NodeId, dx: number, dy: number): [number, number] {
+  const parent = parentTransform(nodes, id)
+  return invertTransform(parent, parent.x + dx, parent.y + dy)
+}
+
 /**
  * The changes that give `node` the transform `next`, as a Transformer leaves it. Scale is baked
  * into geometry and reset to 1, so outlines keep their width: sizes for rects and ellipses, points
  * for lines, anchors and handles for paths, and width and font size for text (corner handles
- * scale both, side handles only the width). Freehand strokes and groups keep their scale, since a
- * stroke's outline is a fill and scales correctly. Null when nothing changes.
+ * scale both, side handles only the width). Freehand strokes keep their scale, since a stroke's
+ * outline is a fill and scales correctly. Groups take only the transform here; bakeTransforms
+ * passes their scale on to their children. Null when nothing changes.
  */
 export function bakeTransform(node: VectorNode, next: Transform): Partial<VectorNode> | null {
   const { scaleX: sx, scaleY: sy } = next
@@ -76,4 +143,61 @@ export function bakeTransform(node: VectorNode, next: Transform): Partial<Vector
     case 'text':
       return { transform, width: node.width * Math.abs(sx), fontSize: node.fontSize * Math.abs(sy) }
   }
+}
+
+/**
+ * Scales a group's children by (sx, sy) in the group's own coordinates, so the group can keep a
+ * scale of 1: positions scale, and each child bakes the scale along its own axes as bakeTransform
+ * does. Nested groups pass it on. Exact for a uniform scale, and for children turned by multiples
+ * of 90°; the Transformer keeps the ratio for groups with other turns inside.
+ */
+function scaleChildren(
+  nodes: Nodes,
+  group: GroupNode,
+  sx: number,
+  sy: number,
+  patch: Record<NodeId, Partial<VectorNode>>,
+): void {
+  for (const id of group.childIds) {
+    const child = nodes[id]
+    if (!child) continue
+    const t = child.transform
+    const [lx, ly] = scaleAlong(sx, sy, t.rotation)
+    const moved = { ...t, x: t.x * sx, y: t.y * sy }
+    if (child.type === 'group') {
+      patch[id] = { transform: moved }
+      scaleChildren(nodes, child, lx, ly, patch)
+      continue
+    }
+    const changes = bakeTransform(child, { ...moved, scaleX: t.scaleX * lx, scaleY: t.scaleY * ly })
+    if (changes) patch[id] = changes
+  }
+}
+
+/**
+ * bakeTransform for a node and, when it is a group, its descendants: a group's scale goes into
+ * its children, so their outlines and fonts keep their sizes. Empty when nothing changes.
+ */
+export function bakeTransforms(
+  nodes: Nodes,
+  node: VectorNode,
+  next: Transform,
+): Record<NodeId, Partial<VectorNode>> {
+  const patch: Record<NodeId, Partial<VectorNode>> = {}
+  if (node.type !== 'group' || (next.scaleX === 1 && next.scaleY === 1)) {
+    const changes = bakeTransform(node, next)
+    if (changes) patch[node.id] = changes
+    return patch
+  }
+  patch[node.id] = { transform: { ...next, scaleX: 1, scaleY: 1 } }
+  scaleChildren(nodes, node, next.scaleX, next.scaleY, patch)
+  return patch
+}
+
+/** Whether the node, and everything in it when it is a group, is turned by a multiple of 90°. */
+export function isAxisAligned(nodes: Nodes, id: NodeId): boolean {
+  const node = nodes[id]
+  if (!node) return true
+  if (node.transform.rotation % 90 !== 0) return false
+  return node.type !== 'group' || node.childIds.every((child) => isAxisAligned(nodes, child))
 }

@@ -1,11 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { IDENTITY_TRANSFORM, type Point, type StrokeNode, type VectorNode } from '../types'
+import {
+  IDENTITY_TRANSFORM,
+  type GroupNode,
+  type Point,
+  type StrokeNode,
+  type VectorNode,
+} from '../types'
 import {
   DEFAULT_SHAPE_STYLE,
+  DEFAULT_TEXT_STYLE,
   HISTORY_LIMIT,
+  MAX_FONT_SIZE,
   MAX_SIZE,
   MAX_ZOOM,
   MERGE_MS,
+  MIN_FONT_SIZE,
   MIN_SIZE,
   MIN_ZOOM,
   PASTE_OFFSET,
@@ -14,6 +23,7 @@ import {
   createPathNode,
   createRectNode,
   createStrokeNode,
+  createTextNode,
   reorderIds,
   shapeToPath,
   useEditorStore,
@@ -754,5 +764,224 @@ describe('paths', () => {
     expect(store().activeAnchor).toEqual({ id: path.id, index: 1 })
     store().select([other.id])
     expect(store().activeAnchor).toBeNull()
+  })
+})
+
+describe('groups', () => {
+  /** A 10 × 10 rectangle at (x, 0), its own undo step. */
+  function box(x: number, id: string): VectorNode {
+    const node = createRectNode({ x, y: 0, width: 10, height: 10 }, DEFAULT_SHAPE_STYLE, id)
+    store().addNodes([node])
+    return node
+  }
+  const nodeOf = (id: string) => store().doc.nodes[id]
+  const groupOf = (id: string) => store().doc.nodes[id] as GroupNode
+
+  it('groups nodes in place of the front-most one, as one step, and selects the group', () => {
+    box(0, 'a')
+    box(20, 'b')
+    box(40, 'c')
+    const before = store().doc
+
+    store().group(['c', 'a'])
+
+    const [groupId] = store().selection
+    expect(ids()).toEqual(['b', groupId])
+    expect(groupOf(groupId)).toMatchObject({
+      type: 'group',
+      name: 'Group',
+      parentId: null,
+      transform: IDENTITY_TRANSFORM,
+      childIds: ['a', 'c'],
+    })
+    expect(nodeOf('a')).toMatchObject({ parentId: groupId, transform: { x: 0, y: 0 } })
+    expect(store().past.at(-1)).toBe(before)
+
+    store().undo()
+    expect(store().doc).toBe(before)
+    expect(store().selection).toEqual([])
+  })
+
+  it('ungroups in place, passing the group transform and opacity to the children', () => {
+    box(0, 'a')
+    box(20, 'b')
+    box(40, 'c')
+    store().group(['a', 'b'])
+    const [groupId] = store().selection
+    store().updateNodes({
+      [groupId]: {
+        transform: { x: 100, y: 0, rotation: 90, scaleX: 1, scaleY: 1 },
+        style: { fill: null, stroke: null, strokeWidth: 0, opacity: 0.5 },
+      },
+    })
+    const before = store().doc
+
+    store().ungroup(groupId)
+
+    expect(ids()).toEqual(['a', 'b', 'c'])
+    expect(groupId in store().doc.nodes).toBe(false)
+    expect(store().selection).toEqual(['a', 'b'])
+    // (20, 0) in the group is (100, 20) on the canvas.
+    expect(nodeOf('b').parentId).toBeNull()
+    expect(nodeOf('b').transform.x).toBeCloseTo(100)
+    expect(nodeOf('b').transform).toMatchObject({ y: 20, rotation: 90 })
+    expect(nodeOf('b').style.opacity).toBe(0.5)
+    expect(store().past.at(-1)).toBe(before)
+  })
+
+  it('moves nodes into a group, out of it and along the z-order, keeping them on the canvas', () => {
+    box(0, 'a')
+    box(20, 'b')
+    box(40, 'c')
+    store().group(['b'])
+    const [groupId] = store().selection
+    store().updateNodes({ [groupId]: { transform: { ...IDENTITY_TRANSFORM, x: 5, y: 7 } } })
+    const steps = store().past.length
+
+    store().moveNodes(['a'], groupId, 0)
+    expect(groupOf(groupId).childIds).toEqual(['a', 'b'])
+    expect(nodeOf('a')).toMatchObject({ parentId: groupId, transform: { x: -5, y: -7 } })
+    expect(store().past).toHaveLength(steps + 1)
+
+    // Out to the top of the doc: the group keeps 'b'.
+    store().moveNodes(['a'], null, 2)
+    expect(ids()).toEqual([groupId, 'c', 'a'])
+    expect(nodeOf('a')).toMatchObject({ parentId: null, transform: { x: 0, y: 0 } })
+
+    // Where it already is: no step.
+    store().moveNodes(['a'], null, 2)
+    expect(store().past).toHaveLength(steps + 2)
+
+    // A group can't go inside itself, and a group left empty goes.
+    store().moveNodes([groupId], groupId, 0)
+    expect(store().past).toHaveLength(steps + 2)
+    store().moveNodes(['b'], null, 0)
+    expect(groupId in store().doc.nodes).toBe(false)
+    expect(ids()).toEqual(['b', 'c', 'a'])
+  })
+
+  it('deletes a group once its last child is deleted', () => {
+    box(0, 'a')
+    box(20, 'b')
+    store().group(['a', 'b'])
+    const [groupId] = store().selection
+
+    store().deleteNodes(['a'])
+    expect(groupOf(groupId).childIds).toEqual(['b'])
+    store().deleteNodes(['b'])
+    expect(store().doc.nodes).toEqual({})
+    expect(ids()).toEqual([])
+  })
+
+  it('groups nodes from different groups, keeping them on the canvas', () => {
+    box(0, 'a')
+    box(20, 'b')
+    store().group(['a'])
+    const [inner] = store().selection
+    store().updateNodes({ [inner]: { transform: { ...IDENTITY_TRANSFORM, x: 100 } } })
+
+    store().group(['a', 'b'])
+
+    const [outer] = store().selection
+    expect(ids()).toEqual([outer])
+    expect(groupOf(outer).childIds).toEqual(['a', 'b'])
+    expect(nodeOf('a').transform.x).toBe(100)
+    // The emptied inner group went.
+    expect(inner in store().doc.nodes).toBe(false)
+  })
+
+  it('duplicates a child inside its group, and pastes a copied child at the top level', () => {
+    box(0, 'a')
+    box(20, 'b')
+    store().group(['a', 'b'])
+    const [groupId] = store().selection
+    store().updateNodes({ [groupId]: { transform: { ...IDENTITY_TRANSFORM, x: 100 } } })
+
+    store().duplicate(['a'])
+    const [copy] = store().selection
+    expect(groupOf(groupId).childIds).toEqual(['a', 'b', copy])
+    expect(nodeOf(copy).transform).toMatchObject({ x: PASTE_OFFSET, y: PASTE_OFFSET })
+
+    store().copy(['b'])
+    store().paste()
+    const [pasted] = store().selection
+    expect(ids()).toEqual([groupId, pasted])
+    expect(nodeOf(pasted).transform).toMatchObject({ x: 120 + PASTE_OFFSET, y: PASTE_OFFSET })
+  })
+
+  it('nudges a child of a turned group along the canvas', () => {
+    box(0, 'a')
+    store().group(['a'])
+    const [groupId] = store().selection
+    store().updateNodes({ [groupId]: { transform: { ...IDENTITY_TRANSFORM, rotation: 90 } } })
+
+    store().nudge(['a', groupId], 5, 0)
+
+    // The group carries its child, so only the group moves.
+    expect(nodeOf(groupId).transform).toMatchObject({ x: 5, y: 0 })
+    expect(nodeOf('a').transform).toMatchObject({ x: 0, y: 0 })
+    store().nudge(['a'], 5, 0)
+    expect(nodeOf('a').transform.x).toBeCloseTo(0)
+    expect(nodeOf('a').transform.y).toBeCloseTo(-5)
+  })
+})
+
+describe('hidden and locked nodes', () => {
+  it('can not be selected, nor can anything in a hidden or locked group', () => {
+    draw(0, 'a')
+    draw(10, 'b')
+    draw(20, 'c')
+    store().group(['c'])
+    const [groupId] = store().selection
+    store().updateNodes({ a: { hidden: true }, b: { locked: true }, [groupId]: { locked: true } })
+
+    store().select(['a', 'b', 'c', groupId])
+    expect(store().selection).toEqual([])
+  })
+
+  it('leave the selection when hidden or locked, and stay out after undo', () => {
+    draw(0, 'a')
+    draw(10, 'b')
+    store().select(['a', 'b'])
+
+    store().updateNodes({ a: { hidden: true } })
+    expect(store().selection).toEqual(['b'])
+    store().updateNodes({ b: { locked: true } })
+    expect(store().selection).toEqual([])
+
+    store().undo()
+    store().select(['a', 'b'])
+    expect(store().selection).toEqual(['b'])
+  })
+})
+
+describe('text', () => {
+  it('creates text in the text style, with no outline', () => {
+    const style = { ...DEFAULT_TEXT_STYLE, fill: '#ef4444', fontStyle: 'italic' as const }
+
+    expect(createTextNode(10, 20, 300, style, 'Hi', 't')).toEqual({
+      id: 't',
+      type: 'text',
+      name: 'Text',
+      parentId: null,
+      transform: { ...IDENTITY_TRANSFORM, x: 10, y: 20 },
+      style: { fill: '#ef4444', stroke: null, strokeWidth: 0, opacity: 1 },
+      hidden: false,
+      locked: false,
+      text: 'Hi',
+      fontFamily: DEFAULT_TEXT_STYLE.fontFamily,
+      fontSize: DEFAULT_TEXT_STYLE.fontSize,
+      fontStyle: 'italic',
+      align: 'left',
+      width: 300,
+    })
+  })
+
+  it(`keeps the style for new text outside history, its size ${MIN_FONT_SIZE}–${MAX_FONT_SIZE}`, () => {
+    store().setTextStyle({ fontSize: 1000, align: 'center' })
+    expect(store().textStyle).toMatchObject({ fontSize: MAX_FONT_SIZE, align: 'center' })
+    store().setTextStyle({ fontSize: 2 })
+    expect(store().textStyle.fontSize).toBe(MIN_FONT_SIZE)
+    expect(store().past).toHaveLength(0)
   })
 })

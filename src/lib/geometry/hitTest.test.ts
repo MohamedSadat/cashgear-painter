@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import {
+  DEFAULT_TEXT_STYLE,
   createEllipseNode,
+  createGroupNode,
   createLineNode,
   createPathNode,
   createRectNode,
   createStrokeNode,
+  createTextNode,
 } from '../../store/editorStore'
 import type { Point, Style, VectorNode } from '../../types'
 import { arrowHeadSize, type Vec } from './bounds'
@@ -64,10 +67,14 @@ describe('nodeHitsSegment', () => {
     expect(nodeHitsSegment(turned, [0, 80], [0, 80], 5)).toBe(true)
   })
 
-  it('never hits node types without hit tests yet', () => {
-    const text = { ...stroke(), type: 'text', text: 'Hi', fontSize: 20, width: 100 }
+  it('touches a text anywhere in its box, and never a group itself', () => {
+    // One line at size 20 is 24 units tall.
+    const text = createTextNode(0, 0, 100, { ...DEFAULT_TEXT_STYLE, fontSize: 20 }, 'Hi')
 
-    expect(nodeHitsSegment(text as VectorNode, [5, 5], [5, 5], 50)).toBe(false)
+    expect(nodeHitsSegment(text, [90, 12], [90, 12], 1)).toBe(true)
+    expect(nodeHitsSegment(text, [50, 40], [50, 40], 1)).toBe(false)
+    expect(nodeHitsSegment(text, [50, 40], [50, 40], 20)).toBe(true)
+    expect(nodeHitsSegment(createGroupNode(['a']), [0, 0], [0, 0], 50)).toBe(false)
   })
 })
 
