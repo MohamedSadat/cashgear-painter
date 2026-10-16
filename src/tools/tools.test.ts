@@ -4,6 +4,7 @@ import type { Point, StrokeNode } from '../types'
 import { brushTool } from './brushTool'
 import { eraserTool } from './eraserTool'
 import { handTool } from './handTool'
+import { selectTool } from './selectTool'
 import { toolFor } from './index'
 import type { ToolEvent } from './types'
 
@@ -39,7 +40,8 @@ beforeEach(() => {
 })
 
 describe('toolFor', () => {
-  it('finds the brush, the eraser and the hand', () => {
+  it('finds the select tool, the brush, the eraser and the hand', () => {
+    expect(toolFor('select')).toBe(selectTool)
     expect(toolFor('brush')).toBe(brushTool)
     expect(toolFor('eraser')).toBe(eraserTool)
     expect(toolFor('hand')).toBe(handTool)
@@ -181,5 +183,181 @@ describe('handTool', () => {
     handTool.onMove(at(50, 50))
 
     expect(store().view).toEqual(before)
+  })
+})
+
+describe('selectTool', () => {
+  // At zoom 1, canvas units are screen pixels.
+  beforeEach(() => {
+    selectTool.onCancel?.()
+    store().setViewport({ width: 1000, height: 700, fit: 1 })
+  })
+
+  const on = (x: number, y: number, target: string | null = null, shift = false): ToolEvent => ({
+    ...at(x, y),
+    target,
+    shift,
+  })
+
+  function click(e: ToolEvent) {
+    selectTool.onDown(e)
+    selectTool.onUp(e)
+  }
+
+  function drag(from: ToolEvent, ...to: [number, number][]) {
+    selectTool.onDown(from)
+    for (const [x, y] of to) selectTool.onMove(on(x, y, null, from.shift))
+    selectTool.onUp(on(...to[to.length - 1]))
+  }
+
+  const key = (k: string, mods: Partial<KeyboardEvent> = {}) =>
+    ({
+      key: k,
+      code: '',
+      shiftKey: false,
+      ctrlKey: false,
+      metaKey: false,
+      altKey: false,
+      ...mods,
+    }) as KeyboardEvent
+
+  const transformOf = (id: string) => store().doc.nodes[id].transform
+
+  it('selects on click, adds with Shift, and Shift-click on a selected node removes it', () => {
+    const a = addLine(0)
+    const b = addLine(100)
+
+    click(on(50, 0, a.id))
+    expect(store().selection).toEqual([a.id])
+    click(on(50, 100, b.id, true))
+    expect(store().selection).toEqual([a.id, b.id])
+    click(on(50, 0, a.id, true))
+    expect(store().selection).toEqual([b.id])
+    click(on(50, 0, a.id))
+    expect(store().selection).toEqual([a.id])
+  })
+
+  it('keeps only the clicked node of a bigger selection, and clears on empty canvas', () => {
+    const a = addLine(0)
+    const b = addLine(100)
+    store().select([a.id, b.id])
+
+    click(on(50, 0, a.id))
+    expect(store().selection).toEqual([a.id])
+    click(on(500, 500))
+    expect(store().selection).toEqual([])
+  })
+
+  it('moves the selection as one undo step', () => {
+    const a = addLine(0)
+    const b = addLine(100)
+    store().select([a.id, b.id])
+
+    drag(on(50, 0, a.id), [60, 5], [80, 20])
+
+    expect(transformOf(a.id)).toMatchObject({ x: 30, y: 20 })
+    expect(transformOf(b.id)).toMatchObject({ x: 30, y: 20 })
+    expect(store().past).toHaveLength(3)
+    expect(store().selection).toEqual([a.id, b.id])
+
+    store().undo()
+    expect(transformOf(a.id)).toMatchObject({ x: 0, y: 0 })
+  })
+
+  it('drags the inside of the selection box, between its nodes', () => {
+    const a = addLine(0)
+    const b = addLine(100)
+    store().select([a.id, b.id])
+
+    drag(on(50, 50), [50, 60])
+
+    expect(transformOf(a.id).y).toBe(10)
+    expect(transformOf(b.id).y).toBe(10)
+  })
+
+  it('ignores a press that moves less than the drag slop', () => {
+    const a = addLine(0)
+
+    drag(on(50, 0, a.id), [52, 1])
+
+    expect(transformOf(a.id)).toMatchObject({ x: 0, y: 0 })
+    expect(store().past).toHaveLength(1)
+    expect(store().selection).toEqual([a.id])
+  })
+
+  it('selects what the marquee fully covers, and Shift adds to the selection', () => {
+    const a = addLine(0)
+    const b = addLine(100)
+
+    selectTool.onDown(on(-10, -10))
+    selectTool.onMove(on(110, 20))
+    expect(store().marquee).toEqual({ x: -10, y: -10, width: 120, height: 30 })
+    expect(store().selection).toEqual([a.id])
+    selectTool.onUp(on(110, 20))
+    expect(store().marquee).toBeNull()
+
+    store().select([b.id])
+    drag(on(-10, -10, null, true), [110, 20])
+    expect(store().selection).toEqual([b.id, a.id])
+    expect(store().past).toHaveLength(2)
+  })
+
+  it('Esc puts a moving selection back, then clears the selection', () => {
+    const a = addLine(0)
+
+    selectTool.onDown(on(50, 0, a.id))
+    selectTool.onMove(on(90, 40))
+    expect(selectTool.onKey?.(key('Escape'))).toBe(true)
+    selectTool.onMove(on(120, 40))
+    selectTool.onUp(on(120, 40))
+
+    expect(transformOf(a.id)).toMatchObject({ x: 0, y: 0 })
+    expect(store().gestureStart).toBeNull()
+    expect(store().past).toHaveLength(1)
+
+    expect(selectTool.onKey?.(key('Escape'))).toBe(true)
+    expect(store().selection).toEqual([])
+    expect(selectTool.onKey?.(key('Escape'))).toBe(false)
+  })
+
+  it('nudges, reorders, duplicates and deletes the selection from the keyboard', () => {
+    const a = addLine(0)
+    const b = addLine(100)
+    store().select([a.id])
+
+    selectTool.onKey?.(key('ArrowRight', { shiftKey: true }))
+    selectTool.onKey?.(key('ArrowDown'))
+    expect(transformOf(a.id)).toMatchObject({ x: 10, y: 1 })
+
+    selectTool.onKey?.(key(']', { ctrlKey: true, code: 'BracketRight' }))
+    expect(store().doc.rootIds).toEqual([b.id, a.id])
+    selectTool.onKey?.(key('[', { metaKey: true, code: 'BracketLeft' }))
+    expect(store().doc.rootIds).toEqual([a.id, b.id])
+    selectTool.onKey?.(key('}', { ctrlKey: true, shiftKey: true, code: 'BracketRight' }))
+    expect(store().doc.rootIds).toEqual([b.id, a.id])
+
+    selectTool.onKey?.(key('d', { ctrlKey: true }))
+    expect(store().doc.rootIds).toHaveLength(3)
+    const [copyId] = store().selection
+    expect(copyId).not.toBe(a.id)
+
+    selectTool.onKey?.(key('Delete'))
+    expect(store().doc.rootIds).toEqual([b.id, a.id])
+    expect(store().selection).toEqual([])
+    expect(selectTool.onKey?.(key('Delete'))).toBe(false)
+  })
+
+  it('cuts and copies to the clipboard', () => {
+    const a = addLine(0)
+    store().select([a.id])
+
+    selectTool.onKey?.(key('c', { ctrlKey: true }))
+    expect(store().doc.rootIds).toEqual([a.id])
+    selectTool.onKey?.(key('x', { ctrlKey: true }))
+    expect(store().doc.rootIds).toEqual([])
+
+    store().paste()
+    expect(store().doc.rootIds).toHaveLength(1)
+    expect(store().clipboard.map((n) => n.id)).toEqual([a.id])
   })
 })

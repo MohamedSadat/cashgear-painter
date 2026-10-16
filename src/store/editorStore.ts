@@ -18,6 +18,18 @@ export const MIN_SIZE = 1
 export const MAX_SIZE = 64
 export const MIN_ZOOM = 0.1 // screen pixels per canvas unit
 export const MAX_ZOOM = 32
+export const NUDGE_MERGE_MS = 500 // arrow-key nudges this close together are one undo step
+export const PASTE_OFFSET = 10 // canvas units between a copy and its duplicate or paste
+
+export type ZOrder = 'forward' | 'backward' | 'front' | 'back'
+
+/** An axis-aligned rectangle in canvas units. */
+export interface Rect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
 
 export interface Brush {
   color: string
@@ -48,12 +60,20 @@ export interface EditorState {
   viewport: Viewport // measured canvas area; not in history or autosave
   draft: VectorNode | null // the node being drawn right now; not in history or autosave
   erasing: NodeId[] // nodes the eraser has touched in the current pass
+  marquee: Rect | null // the select tool's drag rectangle
+  clipboard: VectorNode[] // copied nodes with their descendants; not in history or autosave
 
   addNodes(nodes: VectorNode[], parentId?: NodeId): void
   updateNodes(patch: Record<NodeId, Partial<VectorNode>>): void
   deleteNodes(ids: NodeId[]): void
+  reorder(ids: NodeId[], where: ZOrder): void
+  nudge(ids: NodeId[], dx: number, dy: number): void
+  duplicate(ids: NodeId[]): void
+  copy(ids: NodeId[]): void
+  paste(): void
   beginGesture(): void
   endGesture(): void
+  cancelGesture(): void
   undo(): void
   redo(): void
   clear(): void
@@ -62,6 +82,7 @@ export interface EditorState {
   setBrush(brush: Partial<Brush>): void
   setDraft(node: VectorNode | null): void
   setErasing(ids: NodeId[]): void
+  setMarquee(rect: Rect | null): void
   setViewport(viewport: Viewport): void
   setView(view: View): void
   zoomTo(zoom: number, anchor?: [x: number, y: number]): void
@@ -122,6 +143,73 @@ export function zoomOf({ view, viewport }: Pick<EditorState, 'view' | 'viewport'
   return viewport.fit * view.scale
 }
 
+/** The nodes and every descendant, in z-order (bottom to top), parents before their children. */
+function collectSubtrees(doc: Doc, ids: NodeId[]): VectorNode[] {
+  const wanted = new Set(ids)
+  const out: VectorNode[] = []
+  const visit = (id: NodeId, take: boolean) => {
+    const node = doc.nodes[id]
+    if (!node) return
+    const inside = take || wanted.has(id)
+    if (inside) out.push(node)
+    if (node.type === 'group') node.childIds.forEach((child) => visit(child, inside))
+  }
+  doc.rootIds.forEach((id) => visit(id, false))
+  return out
+}
+
+/**
+ * Copies of the nodes under new ids, with parent and child ids remapped. Nodes whose parent is not
+ * among them become top level and are moved by `offset` canvas units on both axes.
+ */
+function withNewIds(
+  nodes: VectorNode[],
+  offset: number,
+): { nodes: VectorNode[]; topIds: NodeId[] } {
+  const ids = new Map(nodes.map((node) => [node.id, newNodeId()]))
+  const topIds: NodeId[] = []
+  const copies = nodes.map((node): VectorNode => {
+    const id = ids.get(node.id)!
+    const parentId = node.parentId === null ? null : (ids.get(node.parentId) ?? null)
+    if (parentId === null) topIds.push(id)
+    const transform =
+      parentId === null
+        ? { ...node.transform, x: node.transform.x + offset, y: node.transform.y + offset }
+        : node.transform
+    const copy = { ...node, id, parentId, transform }
+    if (copy.type === 'group') {
+      copy.childIds = copy.childIds.flatMap((child) => {
+        const mapped = ids.get(child)
+        return mapped === undefined ? [] : [mapped]
+      })
+    }
+    return copy
+  })
+  return { nodes: copies, topIds }
+}
+
+/** A sibling list with the picked ids moved one step or all the way up or down, keeping their order. */
+export function reorderIds(list: NodeId[], picked: ReadonlySet<NodeId>, where: ZOrder): NodeId[] {
+  const isPicked = (id: NodeId) => picked.has(id)
+  if (where === 'front') return [...list.filter((id) => !isPicked(id)), ...list.filter(isPicked)]
+  if (where === 'back') return [...list.filter(isPicked), ...list.filter((id) => !isPicked(id))]
+  const out = [...list]
+  // Walking against the direction of travel moves a run of picked ids together.
+  if (where === 'forward') {
+    for (let i = out.length - 2; i >= 0; i--) {
+      if (isPicked(out[i]) && !isPicked(out[i + 1])) [out[i], out[i + 1]] = [out[i + 1], out[i]]
+    }
+  } else {
+    for (let i = 1; i < out.length; i++) {
+      if (isPicked(out[i]) && !isPicked(out[i - 1])) [out[i], out[i - 1]] = [out[i - 1], out[i]]
+    }
+  }
+  return out
+}
+
+const sameOrder = (a: NodeId[], b: NodeId[]) =>
+  a.length === b.length && a.every((id, i) => id === b[i])
+
 /** The view that centers the whole artboard in the viewport. */
 function fittedView({ width, height, fit }: Viewport): View {
   return {
@@ -134,15 +222,32 @@ function fittedView({ width, height, fit }: Viewport): View {
 export const useEditorStore = create<EditorState>()((set, get) => {
   /**
    * Applies one edit to the doc. Outside a gesture it is one history step; inside one, the step
-   * is recorded once at endGesture. An edit that changes nothing records nothing.
+   * is recorded once at endGesture. An edit that changes nothing records nothing. `merge` folds
+   * the edit into the latest step instead.
    */
-  function commit(recipe: (doc: Draft<Doc>) => void): void {
+  function commit(recipe: (doc: Draft<Doc>) => void, merge = false): void {
     const { doc, past, gestureStart } = get()
     const next = produce(doc, recipe)
     if (next === doc) return
-    if (gestureStart) set({ doc: next })
+    if (gestureStart || merge) set({ doc: next })
     else set({ doc: next, past: pushSnapshot(past, doc), future: [] })
   }
+
+  /** Adds copies of the nodes on top of the z-order and selects them. */
+  function insertCopies(nodes: VectorNode[], offset: number): void {
+    const copies = withNewIds(nodes, offset)
+    if (copies.topIds.length === 0) return
+    commit((doc) => {
+      for (const node of copies.nodes) doc.nodes[node.id] = node
+      doc.rootIds.push(...copies.topIds)
+    })
+    set({ selection: copies.topIds })
+  }
+
+  // The doc the last nudge produced, and when: a nudge soon after, with no edit between, merges.
+  let lastNudge: { at: number; doc: Doc } | null = null
+  // Pastes since the last copy, so repeated pastes step away from the original.
+  let pasteCount = 0
 
   return {
     doc: emptyDoc(),
@@ -156,6 +261,8 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     viewport: { width: 0, height: 0, fit: 0 },
     draft: null,
     erasing: [],
+    marquee: null,
+    clipboard: [],
 
     addNodes(nodes, parentId) {
       commit((doc) => {
@@ -209,6 +316,53 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       set({ selection: existing(selection, doc) })
     },
 
+    reorder(ids, where) {
+      const picked = new Set(ids)
+      if (picked.size === 0) return
+      commit((doc) => {
+        const next = reorderIds(doc.rootIds, picked, where)
+        if (!sameOrder(next, doc.rootIds)) doc.rootIds = next
+        for (const node of Object.values(doc.nodes)) {
+          if (node.type !== 'group') continue
+          const children = reorderIds(node.childIds, picked, where)
+          if (!sameOrder(children, node.childIds)) node.childIds = children
+        }
+      })
+    },
+
+    nudge(ids, dx, dy) {
+      if (dx === 0 && dy === 0) return
+      const now = Date.now()
+      const merge =
+        lastNudge !== null && lastNudge.doc === get().doc && now - lastNudge.at < NUDGE_MERGE_MS
+      commit((doc) => {
+        for (const id of ids) {
+          const node = doc.nodes[id]
+          if (!node || node.locked) continue
+          node.transform = { ...node.transform, x: node.transform.x + dx, y: node.transform.y + dy }
+        }
+      }, merge)
+      lastNudge = { at: now, doc: get().doc }
+    },
+
+    duplicate(ids) {
+      insertCopies(collectSubtrees(get().doc, ids), PASTE_OFFSET)
+    },
+
+    copy(ids) {
+      const nodes = collectSubtrees(get().doc, ids)
+      if (nodes.length === 0) return
+      pasteCount = 0
+      set({ clipboard: nodes })
+    },
+
+    paste() {
+      const { clipboard } = get()
+      if (clipboard.length === 0) return
+      pasteCount += 1
+      insertCopies(clipboard, PASTE_OFFSET * pasteCount)
+    },
+
     beginGesture() {
       const { gestureStart, doc } = get()
       if (gestureStart) return
@@ -220,6 +374,12 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       if (!gestureStart) return
       if (doc === gestureStart) set({ gestureStart: null })
       else set({ gestureStart: null, past: pushSnapshot(past, gestureStart), future: [] })
+    },
+
+    cancelGesture() {
+      const { gestureStart, selection } = get()
+      if (!gestureStart) return
+      set({ doc: gestureStart, gestureStart: null, selection: existing(selection, gestureStart) })
     },
 
     undo() {
@@ -285,6 +445,10 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 
     setErasing(ids) {
       set({ erasing: ids })
+    },
+
+    setMarquee(rect) {
+      set({ marquee: rect })
     },
 
     setViewport(next) {

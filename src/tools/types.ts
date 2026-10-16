@@ -12,6 +12,9 @@ export interface ToolEvent {
 
 export interface ToolController {
   cursor: string
+  // Pointer-downs carry the node under the pointer in `target`. Only these tools pay for Konva's
+  // hit canvas; for the rest the content layer doesn't listen.
+  picksNodes?: boolean
   onDown(e: ToolEvent): void
   onMove(e: ToolEvent): void
   onUp(e: ToolEvent): void

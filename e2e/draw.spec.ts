@@ -86,29 +86,77 @@ function paintedPixels(page: Page) {
   })
 }
 
-/** Number of nodes in the autosaved doc in IndexedDB; -1 when it can't be read. */
-function savedNodeCount(page: Page) {
+type SavedDoc = { rootIds: string[]; nodes: Record<string, { transform: Transform }> }
+type Transform = { x: number; y: number; rotation: number; scaleX: number; scaleY: number }
+
+/** The autosaved doc in IndexedDB: null when nothing is saved, undefined when it can't be read. */
+function savedDoc(page: Page) {
   return page.evaluate(
     () =>
-      new Promise<number>((resolve) => {
+      new Promise<SavedDoc | null | undefined>((resolve) => {
         const open = indexedDB.open('painter')
         // Never create the database here: the app's own first open has to do that.
         open.onupgradeneeded = () => open.transaction?.abort()
-        open.onerror = () => resolve(-1)
+        open.onerror = () => resolve(undefined)
         open.onsuccess = () => {
           const db = open.result
           const request = db.transaction('kv').objectStore('kv').get('painter:v2')
           request.onsuccess = () => {
             db.close()
-            resolve(request.result?.rootIds.length ?? 0)
+            resolve(request.result ?? null)
           }
           request.onerror = () => {
             db.close()
-            resolve(-1)
+            resolve(undefined)
           }
         }
       }),
   )
+}
+
+/** Number of nodes in the autosaved doc in IndexedDB; -1 when it can't be read. */
+async function savedNodeCount(page: Page) {
+  const doc = await savedDoc(page)
+  return doc === undefined ? -1 : (doc?.rootIds.length ?? 0)
+}
+
+/** The transform of every shape on the content layer, bottom to top, as Konva holds it. */
+function shownTransforms(page: Page): Promise<Transform[]> {
+  return page.evaluate(() =>
+    (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+      .getLayers()[1]
+      .getChildren()
+      .map((n) => ({
+        x: n.x(),
+        y: n.y(),
+        rotation: n.rotation(),
+        scaleX: n.scaleX(),
+        scaleY: n.scaleY(),
+      })),
+  )
+}
+
+/** How many nodes the selection Transformer is attached to. */
+function selectedCount(page: Page) {
+  return page.evaluate(
+    () =>
+      (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+        .findOne<Konva.Transformer>('Transformer')!
+        .nodes().length,
+  )
+}
+
+/** The page point at the middle of a Transformer handle, such as 'rotater' or 'middle-right'. */
+function handleAt(page: Page, name: string): Promise<Xy> {
+  return page.evaluate((name) => {
+    const stage = (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+    const rect = stage
+      .findOne<Konva.Transformer>('Transformer')!
+      .findOne(`.${name}`)!
+      .getClientRect()
+    const origin = stage.container().getBoundingClientRect()
+    return [origin.x + rect.x + rect.width / 2, origin.y + rect.y + rect.height / 2] as Xy
+  }, name)
 }
 
 /** Clicks Export PNG and returns the downloaded file with the RGBA values at the given pixels. */
@@ -366,4 +414,134 @@ test('a second finger after the first has moved is ignored, and the stroke goes 
   expect((await artboardBox(page)).width).toBeCloseTo(box.width, 3)
   // The artboard's middle is on the stroke; canvas (800, 500) is doubled in the export.
   expect((await exportPixels(page, [[1600, 1000]])).values).toEqual([BLACK])
+})
+
+/** Where a point in a shape's own coordinates is on the canvas, through the shape's transform. */
+function canvasPointOf(page: Page, index: number, local: Xy): Promise<Xy> {
+  return page.evaluate(
+    ({ index, local: [x, y] }) => {
+      const shape = (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+        .getLayers()[1]
+        .getChildren()[index]
+      const p = shape.getTransform().point({ x, y })
+      return [p.x, p.y] as Xy
+    },
+    { index, local },
+  )
+}
+
+const doubled = ([x, y]: Xy): Xy => [Math.round(x * 2), Math.round(y * 2)]
+
+/** Waits for Konva's next redraw, which also draws the hit canvas a tool switch turned on. */
+const nextFrame = (page: Page) =>
+  page.evaluate(() => new Promise((resolve) => requestAnimationFrame(resolve)))
+
+test('a stroke moves, turns and stretches one undo step at a time, and survives a refresh', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const redo = page.getByRole('button', { name: 'Redo' })
+  // Canvas (480, 500) to (800, 500); its middle is (640, 500) in its own coordinates for good.
+  await drawLine(page, [0.3, 0.5], [0.5, 0.5])
+  await page.keyboard.press('v')
+  await expect(page.getByRole('button', { name: 'Select' })).toHaveAttribute('aria-pressed', 'true')
+  await nextFrame(page)
+  const box = await artboardBox(page)
+  await page.mouse.click(...onArtboard(box, [0.4, 0.5]))
+  await expect.poll(() => selectedCount(page)).toBe(1)
+
+  // Down by 100 canvas units.
+  await drag(page, onArtboard(box, [0.4, 0.5]), onArtboard(box, [0.4, 0.6]))
+  let [t] = await shownTransforms(page)
+  expect(Math.abs(t.x)).toBeLessThan(2)
+  expect(Math.abs(t.y - 100)).toBeLessThan(2)
+
+  // A quarter turn, snapped by Shift: the rotation handle swings from above the middle to its right.
+  const middle = onArtboard(box, [0.4, 0.6])
+  await page.keyboard.down('Shift')
+  await drag(page, await handleAt(page, 'rotater'), [middle[0] + 150, middle[1]])
+  await page.keyboard.up('Shift')
+  ;[t] = await shownTransforms(page)
+  expect(t.rotation).toBe(90)
+
+  // Turned, the stroke's own x axis points down, and so does its middle-right handle.
+  const grip = await handleAt(page, 'middle-right')
+  await drag(page, grip, [grip[0], grip[1] + 100])
+  ;[t] = await shownTransforms(page)
+  expect(t.rotation).toBe(90)
+  expect(t.scaleX).toBeGreaterThan(1.2)
+  expect(t.scaleY).toBe(1)
+
+  // Draw, move, turn and stretch: four undo steps, then nothing.
+  for (let i = 0; i < 4; i++) await undo.click()
+  await expect(undo).toBeDisabled()
+  expect(await shownTransforms(page)).toEqual([])
+  for (let i = 0; i < 4; i++) await redo.click()
+  await expect(redo).toBeDisabled()
+  expect(await shownTransforms(page)).toEqual([t])
+
+  // The middle is still ink; 60 units to the side of the line is not.
+  const onLine = doubled(await canvasPointOf(page, 0, [640, 500]))
+  const offLine = doubled(await canvasPointOf(page, 0, [640, 440]))
+  expect((await exportPixels(page, [onLine, offLine])).values).toEqual([BLACK, WHITE])
+
+  // The transform is saved as is; points are rounded to 0.1 units, so pixels are compared, not files.
+  await expect
+    .poll(async () => {
+      const doc = await savedDoc(page)
+      return doc ? Object.values(doc.nodes)[0]?.transform : null
+    })
+    .toEqual(t)
+  await page.reload()
+  await waitForCanvas(page)
+  expect(await shownTransforms(page)).toEqual([t])
+  expect((await exportPixels(page, [onLine, offLine])).values).toEqual([BLACK, WHITE])
+})
+
+test('marquee, select all, delete, duplicate, nudge and paste from the keyboard', async ({
+  page,
+}) => {
+  const count = async () => (await shownTransforms(page)).length
+  await drawLine(page, [0.2, 0.3], [0.8, 0.3])
+  await drawLine(page, [0.2, 0.7], [0.8, 0.7])
+  await page.keyboard.press('v')
+  await nextFrame(page)
+  const box = await artboardBox(page)
+
+  // Only the top line lies fully inside the marquee.
+  await drag(page, onArtboard(box, [0.1, 0.2]), onArtboard(box, [0.9, 0.45]))
+  expect(await selectedCount(page)).toBe(1)
+  await page.keyboard.press('Delete')
+  expect(await count()).toBe(1)
+  await page.keyboard.press('Control+z')
+  expect(await count()).toBe(2)
+
+  await page.keyboard.press('Control+a')
+  expect(await selectedCount(page)).toBe(2)
+  await page.keyboard.press('Control+d')
+  expect(await count()).toBe(4)
+  expect(await selectedCount(page)).toBe(2)
+  await page.keyboard.press('Control+z')
+  expect(await count()).toBe(2)
+  expect(await selectedCount(page)).toBe(0)
+
+  // Nudges in quick succession are one undo step.
+  await page.mouse.click(...onArtboard(box, [0.5, 0.7]))
+  expect(await selectedCount(page)).toBe(1)
+  for (let i = 0; i < 5; i++) await page.keyboard.press('ArrowRight')
+  await page.keyboard.press('Shift+ArrowDown')
+  expect((await shownTransforms(page))[1]).toMatchObject({ x: 5, y: 10 })
+  await page.keyboard.press('Control+z')
+  expect((await shownTransforms(page))[1]).toMatchObject({ x: 0, y: 0 })
+
+  // A paste lands on top, a little away from the copy, and is selected.
+  await page.keyboard.press('Control+c')
+  await page.keyboard.press('Control+v')
+  expect(await count()).toBe(3)
+  expect((await shownTransforms(page))[2]).toMatchObject({ x: 10, y: 10 })
+  await page.keyboard.press('Control+Shift+BracketLeft')
+  expect((await shownTransforms(page))[0]).toMatchObject({ x: 10, y: 10 })
+
+  await page.keyboard.press('Escape')
+  expect(await selectedCount(page)).toBe(0)
 })

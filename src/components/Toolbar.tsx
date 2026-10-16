@@ -1,4 +1,4 @@
-import { Brush, Download, Eraser, Hand, Redo2, Trash2, Undo2 } from 'lucide-react'
+import { Brush, Download, Eraser, Hand, MousePointer2, Redo2, Trash2, Undo2 } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { MAX_SIZE, MIN_SIZE, useEditorStore, zoomOf } from '../store/editorStore'
 
@@ -66,6 +66,14 @@ export function Toolbar({ onExport }: ToolbarProps) {
   return (
     <header className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-neutral-200 bg-white px-2 py-1.5 sm:gap-x-5 sm:px-4">
       <div role="group" aria-label="Tools" className="flex items-center gap-1">
+        <IconButton
+          label="Select"
+          title="Select (V)"
+          pressed={tool === 'select'}
+          onClick={() => setTool('select')}
+        >
+          <MousePointer2 size={20} />
+        </IconButton>
         <IconButton
           label="Brush"
           title="Brush (B)"

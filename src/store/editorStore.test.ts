@@ -1,12 +1,15 @@
-import { beforeEach, describe, expect, it } from 'vitest'
-import type { Point, StrokeNode } from '../types'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { IDENTITY_TRANSFORM, type Point, type StrokeNode, type VectorNode } from '../types'
 import {
   HISTORY_LIMIT,
   MAX_SIZE,
   MAX_ZOOM,
   MIN_SIZE,
   MIN_ZOOM,
+  NUDGE_MERGE_MS,
+  PASTE_OFFSET,
   createStrokeNode,
+  reorderIds,
   useEditorStore,
   zoomOf,
 } from './editorStore'
@@ -427,5 +430,165 @@ describe('view', () => {
 
     expect(store().doc).toBe(doc)
     expect(store().past).toEqual([])
+  })
+})
+
+describe('cancelGesture', () => {
+  it('puts the doc back as it was when the gesture began, with no step recorded', () => {
+    draw(0, 'a')
+    const before = store().doc
+
+    store().beginGesture()
+    store().updateNodes({ a: { size: 30 } })
+    store().cancelGesture()
+
+    expect(store().doc).toBe(before)
+    expect(store().gestureStart).toBeNull()
+    expect(store().past).toHaveLength(1)
+  })
+})
+
+describe('z-order', () => {
+  it('moves picked ids one step or all the way, keeping runs and their order', () => {
+    const list = ['a', 'b', 'c', 'd', 'e']
+    expect(reorderIds(list, new Set(['b', 'c']), 'forward')).toEqual(['a', 'd', 'b', 'c', 'e'])
+    expect(reorderIds(list, new Set(['b', 'd']), 'forward')).toEqual(['a', 'c', 'b', 'e', 'd'])
+    expect(reorderIds(list, new Set(['e']), 'forward')).toEqual(list)
+    expect(reorderIds(list, new Set(['c', 'd']), 'backward')).toEqual(['a', 'c', 'd', 'b', 'e'])
+    expect(reorderIds(list, new Set(['b', 'd']), 'front')).toEqual(['a', 'c', 'e', 'b', 'd'])
+    expect(reorderIds(list, new Set(['b', 'd']), 'back')).toEqual(['b', 'd', 'a', 'c', 'e'])
+  })
+
+  it('reorders as one step, and records nothing when already at the edge', () => {
+    draw(0, 'a')
+    draw(10, 'b')
+    draw(20, 'c')
+
+    store().reorder(['a'], 'front')
+    expect(ids()).toEqual(['b', 'c', 'a'])
+    expect(store().past).toHaveLength(4)
+
+    store().reorder(['a'], 'forward')
+    expect(store().past).toHaveLength(4)
+
+    store().undo()
+    expect(ids()).toEqual(['a', 'b', 'c'])
+  })
+})
+
+describe('nudge', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it(`moves unlocked nodes, merging nudges less than ${NUDGE_MERGE_MS} ms apart`, () => {
+    vi.useFakeTimers()
+    draw(0, 'a')
+    draw(10, 'b')
+    store().updateNodes({ b: { locked: true } })
+    const steps = store().past.length
+
+    store().nudge(['a', 'b'], 1, 0)
+    vi.advanceTimersByTime(NUDGE_MERGE_MS - 100)
+    store().nudge(['a', 'b'], 0, 10)
+
+    expect(node('a').transform).toMatchObject({ x: 1, y: 10 })
+    expect(node('b').transform).toMatchObject({ x: 0, y: 0 })
+    expect(store().past).toHaveLength(steps + 1)
+
+    vi.advanceTimersByTime(NUDGE_MERGE_MS + 100)
+    store().nudge(['a'], 1, 0)
+    expect(store().past).toHaveLength(steps + 2)
+
+    store().undo()
+    store().undo()
+    expect(node('a').transform).toMatchObject({ x: 0, y: 0 })
+  })
+
+  it('starts a new step after any other edit', () => {
+    vi.useFakeTimers()
+    draw(0, 'a')
+
+    store().nudge(['a'], 1, 0)
+    draw(10, 'b')
+    store().nudge(['a'], 1, 0)
+
+    expect(store().past).toHaveLength(4)
+    expect(node('a').transform.x).toBe(2)
+  })
+})
+
+describe('duplicate, copy and paste', () => {
+  it('duplicates on top, offset and under new ids, selected, as one step', () => {
+    const a = draw(0, 'a')
+    draw(10, 'b')
+
+    store().duplicate(['a'])
+
+    expect(ids()).toHaveLength(3)
+    const copyId = ids()[2]
+    expect(copyId).not.toBe('a')
+    expect(node(copyId)).toMatchObject({
+      points: a.points,
+      transform: { x: PASTE_OFFSET, y: PASTE_OFFSET },
+    })
+    expect(store().selection).toEqual([copyId])
+    expect(store().past).toHaveLength(3)
+  })
+
+  it('keeps the z-order of what it duplicates', () => {
+    const a = draw(0, 'a')
+    draw(10, 'b')
+    const c = draw(20, 'c')
+
+    store().duplicate(['c', 'a'])
+
+    expect(node(ids()[3]).points).toBe(a.points)
+    expect(node(ids()[4]).points).toBe(c.points)
+  })
+
+  it('pastes each copy further from the original, even after it is deleted', () => {
+    draw(0, 'a')
+    store().copy(['a'])
+    expect(store().past).toHaveLength(1)
+
+    store().paste()
+    store().paste()
+    store().deleteNodes(['a'])
+    store().paste()
+
+    expect(ids().map((id) => node(id).transform.x)).toEqual([
+      PASTE_OFFSET,
+      2 * PASTE_OFFSET,
+      3 * PASTE_OFFSET,
+    ])
+    expect(store().selection).toEqual([ids()[2]])
+  })
+
+  it('copies a group with its children under new ids', () => {
+    const group = {
+      id: 'g',
+      type: 'group',
+      name: 'Group',
+      parentId: null,
+      transform: IDENTITY_TRANSFORM,
+      style: { fill: null, stroke: null, strokeWidth: 0, opacity: 1 },
+      hidden: false,
+      locked: false,
+      childIds: [],
+    } satisfies VectorNode
+    store().addNodes([group])
+    store().addNodes([stroke(0, 'child')], 'g')
+
+    store().duplicate(['g'])
+
+    expect(ids()).toHaveLength(2)
+    const copy = store().doc.nodes[ids()[1]]
+    if (copy.type !== 'group') throw new Error('expected a group')
+    expect(copy.childIds).toHaveLength(1)
+    const [childId] = copy.childIds
+    expect(childId).not.toBe('child')
+    expect(store().doc.nodes[childId]).toMatchObject({ parentId: copy.id, transform: { x: 0 } })
+    expect(copy.transform).toMatchObject({ x: PASTE_OFFSET, y: PASTE_OFFSET })
   })
 })

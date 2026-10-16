@@ -7,9 +7,10 @@ import { OVERLAY_LAYER_NAME } from '../lib/exportPng'
 import { useEditorStore } from '../store/editorStore'
 import { toolFor } from '../tools'
 import type { ToolEvent } from '../tools/types'
-import { CANVAS_HEIGHT, CANVAS_WIDTH } from '../types'
+import { CANVAS_HEIGHT, CANVAS_WIDTH, type NodeId } from '../types'
 import { BrushCursor } from './BrushCursor'
 import { NodeView } from './NodeView'
+import { SelectionOverlay } from './SelectionOverlay'
 
 interface CanvasStageProps {
   stageRef: Ref<Konva.Stage>
@@ -21,7 +22,11 @@ const ARTBOARD_EDGE_COLOR = '#d4d4d4'
 const activeTool = () => toolFor(useEditorStore.getState().tool)
 
 /** A pointer event in canvas units, ready for the active tool. */
-function readToolEvent(layer: Konva.Layer | null, evt: PointerEvent): ToolEvent | null {
+function readToolEvent(
+  layer: Konva.Layer | null,
+  evt: PointerEvent,
+  target: NodeId | null = null,
+): ToolEvent | null {
   // Relative to the layer, so the point is in canvas units at any stage scale.
   const pos = layer?.getRelativePointerPosition()
   if (!pos) return null
@@ -33,7 +38,7 @@ function readToolEvent(layer: Konva.Layer | null, evt: PointerEvent): ToolEvent 
     shift: evt.shiftKey,
     alt: evt.altKey,
     mod: evt.ctrlKey || evt.metaKey,
-    target: null,
+    target,
   }
 }
 
@@ -107,12 +112,18 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
     cursorRef.current?.visible(false)
   }
 
-  const handlePointerDown = ({ evt }: KonvaEventObject<PointerEvent>) => {
+  const handlePointerDown = ({ evt, target }: KonvaEventObject<PointerEvent>) => {
     moveCursor(evt)
     // Ignore a second finger while a gesture is in progress, and any mouse button but the main one.
     if (activePointerId.current !== null) return
     if (evt.pointerType === 'mouse' && evt.button !== 0) return
-    const e = readToolEvent(contentLayerRef.current, evt)
+    const content = contentLayerRef.current
+    // A press on the overlay (the Transformer's handles) is the overlay's own drag.
+    const layer = target.getLayer()
+    if (layer && layer !== content) return
+    // Only shapes on a listening content layer are hit; otherwise the target is the Stage.
+    const targetId = layer === content ? target.id() || null : null
+    const e = readToolEvent(content, evt, targetId)
     const active = activeTool()
     if (!e || !active) return
     activePointerId.current = evt.pointerId
@@ -190,14 +201,15 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
               />
             </Layer>
             {/* The draft is the last child, so the stroke being drawn is on top. */}
-            <Layer ref={contentLayerRef} listening={false}>
+            <Layer ref={contentLayerRef} listening={toolFor(tool)?.picksNodes ?? false}>
               {doc.rootIds.map((id) => (
                 <NodeView key={id} node={doc.nodes[id]} dimmed={erasingIds.has(id)} />
               ))}
               {draft && <NodeView key={draft.id} node={draft} isDraft />}
             </Layer>
-            {/* Selection handles and tool previews join the brush cursor here in later milestones. */}
-            <Layer name={OVERLAY_LAYER_NAME} listening={false}>
+            {/* Pen previews and path handles join these in later milestones. */}
+            <Layer name={OVERLAY_LAYER_NAME}>
+              <SelectionOverlay contentLayerRef={contentLayerRef} />
               <BrushCursor ref={cursorRef} tool={tool} size={size} />
             </Layer>
           </Stage>
