@@ -1,17 +1,24 @@
 import type Konva from 'konva'
 import type { Ref } from 'react'
 import { Circle, Group } from 'react-konva'
+import type { ToolId } from '../types'
+
+// The tools that paint or erase with the brush size.
+const BRUSH_TOOLS: ReadonlySet<ToolId> = new Set(['brush', 'eraser'])
 
 interface BrushCursorProps {
   ref?: Ref<Konva.Group>
+  tool: ToolId
   size: number
 }
 
 /**
- * Outline of the brush tip, drawn in canvas units so it scales with the Stage. CanvasStage moves
- * and shows it imperatively, so pointer moves don't re-render React.
+ * Outline of the brush tip on the overlay layer. Its radius is in canvas units, so it matches the
+ * stroke at any zoom, while the outline stays 1 screen pixel wide. CanvasStage moves and shows it
+ * imperatively, so pointer moves don't re-render React. Other tools get no tip outline.
  */
-export function BrushCursor({ ref, size }: BrushCursorProps) {
+export function BrushCursor({ ref, tool, size }: BrushCursorProps) {
+  if (!BRUSH_TOOLS.has(tool)) return null
   const radius = size / 2
   return (
     <Group ref={ref} visible={false} listening={false}>

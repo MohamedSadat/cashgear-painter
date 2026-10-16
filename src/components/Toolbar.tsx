@@ -1,6 +1,6 @@
-import { Brush, Download, Eraser, Redo2, Trash2, Undo2 } from 'lucide-react'
+import { Brush, Download, Eraser, Hand, MousePointer2, Redo2, Trash2, Undo2 } from 'lucide-react'
 import type { ReactNode } from 'react'
-import { MAX_SIZE, MIN_SIZE, usePaintStore } from '../store/paintStore'
+import { MAX_SIZE, MIN_SIZE, useEditorStore, zoomOf } from '../store/editorStore'
 
 const SWATCHES = [
   '#000000',
@@ -47,17 +47,18 @@ interface ToolbarProps {
 }
 
 export function Toolbar({ onExport }: ToolbarProps) {
-  const tool = usePaintStore((s) => s.tool)
-  const color = usePaintStore((s) => s.color)
-  const size = usePaintStore((s) => s.size)
-  const canUndo = usePaintStore((s) => s.past.length > 0)
-  const canRedo = usePaintStore((s) => s.future.length > 0)
-  const canClear = usePaintStore((s) => s.strokes.length > 0)
-  const { setTool, setColor, setSize, undo, redo, clear } = usePaintStore.getState()
+  const tool = useEditorStore((s) => s.tool)
+  const color = useEditorStore((s) => s.brush.color)
+  const size = useEditorStore((s) => s.brush.size)
+  const canUndo = useEditorStore((s) => s.past.length > 0)
+  const canRedo = useEditorStore((s) => s.future.length > 0)
+  const canClear = useEditorStore((s) => s.doc.rootIds.length > 0)
+  const zoomPercent = useEditorStore((s) => Math.round(zoomOf(s) * 100))
+  const { setTool, setBrush, undo, redo, clear, fitView } = useEditorStore.getState()
 
   // Picking a color means you want to paint with it.
   const pickColor = (c: string) => {
-    setColor(c)
+    setBrush({ color: c })
     setTool('brush')
   }
   const isCustomColor = !SWATCHES.includes(color)
@@ -65,6 +66,14 @@ export function Toolbar({ onExport }: ToolbarProps) {
   return (
     <header className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-neutral-200 bg-white px-2 py-1.5 sm:gap-x-5 sm:px-4">
       <div role="group" aria-label="Tools" className="flex items-center gap-1">
+        <IconButton
+          label="Select"
+          title="Select (V)"
+          pressed={tool === 'select'}
+          onClick={() => setTool('select')}
+        >
+          <MousePointer2 size={20} />
+        </IconButton>
         <IconButton
           label="Brush"
           title="Brush (B)"
@@ -80,6 +89,14 @@ export function Toolbar({ onExport }: ToolbarProps) {
           onClick={() => setTool('eraser')}
         >
           <Eraser size={20} />
+        </IconButton>
+        <IconButton
+          label="Hand"
+          title="Hand (H, or hold Space)"
+          pressed={tool === 'hand'}
+          onClick={() => setTool('hand')}
+        >
+          <Hand size={20} />
         </IconButton>
       </div>
 
@@ -123,7 +140,7 @@ export function Toolbar({ onExport }: ToolbarProps) {
           min={MIN_SIZE}
           max={MAX_SIZE}
           value={size}
-          onChange={(e) => setSize(Number(e.target.value))}
+          onChange={(e) => setBrush({ size: Number(e.target.value) })}
           className="w-24 accent-sky-600 sm:w-32"
         />
         <span className="w-5 text-right tabular-nums">{size}</span>
@@ -141,6 +158,16 @@ export function Toolbar({ onExport }: ToolbarProps) {
             <Trash2 size={20} />
           </IconButton>
         </div>
+        {/* Shows the zoom and fits the artboard, so touch screens have a way back too. */}
+        <button
+          type="button"
+          aria-label="Fit artboard"
+          title="Fit artboard (Ctrl+0)"
+          onClick={fitView}
+          className="h-9 min-w-12 rounded-md px-1.5 text-sm text-neutral-600 tabular-nums hover:bg-neutral-100"
+        >
+          {zoomPercent}%
+        </button>
         <IconButton label="Export PNG" onClick={onExport}>
           <Download size={20} />
         </IconButton>

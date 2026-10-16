@@ -1,24 +1,43 @@
-import type { Point, Stroke } from '../types'
+import { createStore, get, set } from 'idb-keyval'
+import { emptyDoc, type Doc, type NodeId, type Point, type VectorNode } from '../types'
 
-export const STORAGE_KEY = 'painter:v1'
+export const STORAGE_KEY = 'painter:v2'
 export const SAVE_DELAY_MS = 500
+const DB_NAME = 'painter'
+const DB_STORE_NAME = 'kv'
 
-interface StrokeState {
-  strokes: Stroke[]
+/** The slice of IndexedDB that autosave needs; tests pass an in-memory one. */
+export interface KeyValueStore {
+  get(key: string): Promise<unknown>
+  set(key: string, value: unknown): Promise<void>
 }
 
-interface StrokeStore {
-  getState(): StrokeState
-  subscribe(listener: (state: StrokeState, previous: StrokeState) => void): () => void
+interface DocState {
+  doc: Doc
 }
 
-function defaultStorage(): Storage | null {
-  // Reading localStorage itself throws when site data is blocked.
+interface DocStore {
+  getState(): DocState
+  subscribe(listener: (state: DocState, previous: DocState) => void): () => void
+}
+
+let idbStore: KeyValueStore | null | undefined
+
+/** idb-keyval on database `painter`; null when IndexedDB is missing or blocked. */
+export function defaultKeyValueStore(): KeyValueStore | null {
+  if (idbStore !== undefined) return idbStore
   try {
-    return globalThis.localStorage ?? null
+    // Reading indexedDB itself throws in some locked-down contexts.
+    if (typeof indexedDB === 'undefined') {
+      idbStore = null
+    } else {
+      const store = createStore(DB_NAME, DB_STORE_NAME)
+      idbStore = { get: (key) => get(key, store), set: (key, value) => set(key, value, store) }
+    }
   } catch {
-    return null
+    idbStore = null
   }
+  return idbStore
 }
 
 const round = (n: number, digits: number) => {
@@ -26,11 +45,12 @@ const round = (n: number, digits: number) => {
   return Math.round(n * factor) / factor
 }
 
-// Rounding keeps a busy drawing well under the ~5 MB localStorage quota.
-function compact(stroke: Stroke): Stroke {
+// Rounding keeps a busy drawing small, in IndexedDB and in saved files.
+function compactNode(node: VectorNode): VectorNode {
+  if (node.type !== 'stroke') return node
   return {
-    ...stroke,
-    points: stroke.points.map(([x, y, pressure]): Point => [
+    ...node,
+    points: node.points.map(([x, y, pressure]): Point => [
       round(x, 1),
       round(y, 1),
       round(pressure, 2),
@@ -38,50 +58,116 @@ function compact(stroke: Stroke): Stroke {
   }
 }
 
+function compactDoc(doc: Doc): Doc {
+  const nodes: Record<NodeId, VectorNode> = {}
+  for (const [id, node] of Object.entries(doc.nodes)) nodes[id] = compactNode(node)
+  return { ...doc, nodes }
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
 function isPoint(value: unknown): value is Point {
+  return Array.isArray(value) && value.length === 3 && value.every(isFiniteNumber)
+}
+
+function isTransform(value: unknown): boolean {
   return (
-    Array.isArray(value) &&
-    value.length === 3 &&
-    value.every((n) => typeof n === 'number' && Number.isFinite(n))
+    isObject(value) &&
+    isFiniteNumber(value.x) &&
+    isFiniteNumber(value.y) &&
+    isFiniteNumber(value.rotation) &&
+    isFiniteNumber(value.scaleX) &&
+    isFiniteNumber(value.scaleY)
   )
 }
 
-function isStroke(value: unknown): value is Stroke {
-  if (typeof value !== 'object' || value === null) return false
-  const s = value as Record<string, unknown>
+const isColor = (value: unknown) => value === null || typeof value === 'string'
+
+function isStyle(value: unknown): boolean {
   return (
-    typeof s.id === 'string' &&
-    (s.tool === 'brush' || s.tool === 'eraser') &&
-    typeof s.color === 'string' &&
-    typeof s.size === 'number' &&
-    Number.isFinite(s.size) &&
-    typeof s.usesPressure === 'boolean' &&
-    Array.isArray(s.points) &&
-    s.points.length > 0 &&
-    s.points.every(isPoint)
+    isObject(value) &&
+    isColor(value.fill) &&
+    isColor(value.stroke) &&
+    isFiniteNumber(value.strokeWidth) &&
+    isFiniteNumber(value.opacity)
   )
 }
 
-/** Strokes saved by a previous visit; anything missing or malformed loads as an empty canvas. */
-export function loadStrokes(storage: Storage | null = defaultStorage()): Stroke[] {
+// Other node types get their checks in their own milestones; until then they are dropped.
+const TYPE_CHECKS: Record<string, (node: Record<string, unknown>) => boolean> = {
+  stroke: (node) =>
+    Array.isArray(node.points) &&
+    node.points.length > 0 &&
+    node.points.every(isPoint) &&
+    isFiniteNumber(node.size) &&
+    typeof node.usesPressure === 'boolean',
+}
+
+function isNode(id: string, value: unknown): value is VectorNode {
+  if (!isObject(value) || typeof value.type !== 'string') return false
+  const typeCheck = Object.hasOwn(TYPE_CHECKS, value.type) ? TYPE_CHECKS[value.type] : undefined
+  return (
+    value.id === id &&
+    typeof value.name === 'string' &&
+    (value.parentId === null || typeof value.parentId === 'string') &&
+    isTransform(value.transform) &&
+    isStyle(value.style) &&
+    typeof value.hidden === 'boolean' &&
+    typeof value.locked === 'boolean' &&
+    typeCheck !== undefined &&
+    typeCheck(value)
+  )
+}
+
+/**
+ * A doc that is safe to render: unreadable data becomes an empty doc, and malformed nodes are
+ * dropped. Only top-level nodes are kept for now; groups arrive in M12.
+ */
+export function sanitizeDoc(value: unknown): Doc {
+  const doc = emptyDoc()
+  if (!isObject(value) || value.version !== 2 || !isObject(value.nodes)) return doc
+  if (!Array.isArray(value.rootIds)) return doc
+  if (typeof value.background === 'string') doc.background = value.background
+
+  const nodes = value.nodes
+  for (const id of new Set(value.rootIds)) {
+    if (typeof id !== 'string' || !Object.hasOwn(nodes, id)) continue
+    const node = nodes[id]
+    if (!isNode(id, node) || node.parentId !== null) continue
+    doc.nodes[id] = node
+    doc.rootIds.push(id)
+  }
+  return doc
+}
+
+/** The saved doc; undefined when nothing is saved yet or storage can't be read. */
+export async function loadDoc(
+  kv: KeyValueStore | null = defaultKeyValueStore(),
+): Promise<Doc | undefined> {
+  if (!kv) return undefined
   try {
-    const raw = storage?.getItem(STORAGE_KEY)
-    if (!raw) return []
-    const data: unknown = JSON.parse(raw)
-    return Array.isArray(data) ? data.filter(isStroke) : []
-  } catch {
-    return []
+    const value = await kv.get(STORAGE_KEY)
+    return value === undefined ? undefined : sanitizeDoc(value)
+  } catch (error) {
+    console.warn('Loading the saved drawing failed', error)
+    return undefined
   }
 }
 
-/** Returns false when the write failed, for example because the quota is full. */
-export function saveStrokes(
-  strokes: Stroke[],
-  storage: Storage | null = defaultStorage(),
-): boolean {
-  if (!storage) return false
+/** Returns false when the write failed, for example because storage is full or blocked. */
+export async function saveDoc(
+  doc: Doc,
+  kv: KeyValueStore | null = defaultKeyValueStore(),
+): Promise<boolean> {
+  if (!kv) return false
   try {
-    storage.setItem(STORAGE_KEY, JSON.stringify(strokes.map(compact)))
+    await kv.set(STORAGE_KEY, compactDoc(doc))
     return true
   } catch (error) {
     console.warn('Autosave failed', error)
@@ -90,12 +176,12 @@ export function saveStrokes(
 }
 
 /**
- * Saves the strokes 500 ms after they stop changing, and right away when the page is hidden
+ * Saves the doc 500 ms after it stops changing, and right away when the page is hidden
  * (a refresh, tab switch or app switch). Returns a function that stops autosaving.
  */
 export function startAutosave(
-  store: StrokeStore,
-  storage: Storage | null = defaultStorage(),
+  store: DocStore,
+  kv: KeyValueStore | null = defaultKeyValueStore(),
 ): () => void {
   let timer: ReturnType<typeof setTimeout> | undefined
 
@@ -103,11 +189,11 @@ export function startAutosave(
     if (timer === undefined) return
     clearTimeout(timer)
     timer = undefined
-    saveStrokes(store.getState().strokes, storage)
+    void saveDoc(store.getState().doc, kv)
   }
 
   const unsubscribe = store.subscribe((state, previous) => {
-    if (state.strokes === previous.strokes) return
+    if (state.doc === previous.doc) return
     clearTimeout(timer)
     timer = setTimeout(flush, SAVE_DELAY_MS)
   })

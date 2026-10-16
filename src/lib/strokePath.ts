@@ -1,5 +1,5 @@
 import { getStroke } from 'perfect-freehand'
-import type { Stroke } from '../types'
+import type { StrokeNode } from '../types'
 
 const average = (a: number, b: number) => (a + b) / 2
 
@@ -24,7 +24,7 @@ export function getSvgPathFromStroke(outline: number[][]): string {
 
 /** SVG path data for a stroke's filled outline. `last` is false while the stroke is still being drawn. */
 export function strokeToPath(
-  stroke: Pick<Stroke, 'points' | 'size' | 'usesPressure'>,
+  stroke: Pick<StrokeNode, 'points' | 'size' | 'usesPressure'>,
   last = true,
 ): string {
   if (stroke.points.length === 0) return ''
