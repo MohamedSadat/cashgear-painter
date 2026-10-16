@@ -42,6 +42,7 @@ function readToolEvent(
     alt: evt.altKey,
     mod: evt.ctrlKey || evt.metaKey,
     target,
+    timeStamp: evt.timeStamp,
   }
 }
 

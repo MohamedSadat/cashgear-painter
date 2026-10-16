@@ -32,6 +32,13 @@ import type { ToolEvent } from './types'
 const initialState = useEditorStore.getState()
 const store = () => useEditorStore.getState()
 
+// The time pointer events carry, in ms. It stands still unless a test waits, so presses in a test
+// are at the same moment; each test starts a second after the last.
+let clock = 0
+const wait = (ms: number) => {
+  clock += ms
+}
+
 const at = (x: number, y: number, pointerType = 'mouse', pressure = 0.5): ToolEvent => ({
   point: [x, y],
   pressure,
@@ -40,6 +47,7 @@ const at = (x: number, y: number, pointerType = 'mouse', pressure = 0.5): ToolEv
   alt: false,
   mod: false,
   target: null,
+  timeStamp: clock,
 })
 
 /** A size-8 horizontal stroke along y from x = 0 to 100, added as its own history step. */
@@ -58,6 +66,7 @@ function addLine(y: number, overrides: Partial<StrokeNode> = {}): StrokeNode {
 
 beforeEach(() => {
   useEditorStore.setState(initialState, true)
+  wait(1000)
 })
 
 describe('toolFor', () => {
@@ -770,16 +779,10 @@ describe('penTool', () => {
 })
 
 describe('directTool', () => {
-  // At zoom 1, canvas units are screen pixels. Presses are a second apart unless a test wants a
-  // double-click.
+  // At zoom 1, canvas units are screen pixels.
   beforeEach(() => {
-    vi.useFakeTimers()
-    vi.advanceTimersByTime(1000)
     store().setViewport({ width: 1000, height: 700, fit: 1 })
     store().setTool('direct')
-  })
-  afterEach(() => {
-    vi.useRealTimers()
   })
 
   const on = (x: number, y: number, target: string | null = null, shift = false): ToolEvent => ({
@@ -810,10 +813,10 @@ describe('directTool', () => {
 
     press(on(50, 0, square.id))
     expect(store().selection).toEqual([square.id])
-    vi.advanceTimersByTime(1000)
+    wait(1000)
     press(on(50, 300, line.id, true))
     expect(store().selection).toEqual([square.id, line.id])
-    vi.advanceTimersByTime(1000)
+    wait(1000)
     press(on(500, 500))
     expect(store().selection).toEqual([])
   })
@@ -839,9 +842,9 @@ describe('directTool', () => {
 
     press(on(50, 50, square.id))
     press(on(50, 50, square.id))
-    vi.advanceTimersByTime(1000)
+    wait(1000)
     press(on(50, 1, square.id))
-    vi.advanceTimersByTime(1000)
+    wait(1000)
     press(on(50, 1, square.id))
 
     expect(pathOf(square.id).anchors).toHaveLength(4)
@@ -953,8 +956,6 @@ describe('directTool', () => {
 
 describe('selectTool double-click', () => {
   beforeEach(() => {
-    vi.useFakeTimers()
-    vi.advanceTimersByTime(1000)
     store().setViewport({ width: 1000, height: 700, fit: 1 })
     store().setTool('select')
   })
@@ -977,7 +978,7 @@ describe('selectTool double-click', () => {
 
     const path = createPathNode([corner(0, 0), corner(100, 0)], false, DEFAULT_SHAPE_STYLE)
     store().addNodes([path])
-    vi.advanceTimersByTime(1000)
+    wait(1000)
     click(50, 0, path.id)
     click(51, 1, path.id)
     expect(store().tool).toBe('direct')
@@ -991,16 +992,15 @@ describe('selectTool double-click', () => {
     store().group([a.id, b.id])
     const [groupId] = store().selection
     store().select([])
-    vi.advanceTimersByTime(1000)
 
     click(50, 0, a.id)
     expect(store().selection).toEqual([groupId])
     click(50, 0, a.id)
     expect(store().selection).toEqual([a.id])
-    vi.advanceTimersByTime(1000)
+    wait(1000)
     click(50, 100, b.id)
     expect(store().selection).toEqual([b.id])
-    vi.advanceTimersByTime(1000)
+    wait(1000)
     click(50, 300, c.id)
     expect(store().selection).toEqual([c.id])
 
@@ -1021,6 +1021,27 @@ describe('selectTool double-click', () => {
     selectTool.onUp(e)
     expect(store().editingText).toBe(text.id)
     cancelTextEdit()
+  })
+
+  it('times presses by their events, not by when a busy main thread handles them', () => {
+    vi.useFakeTimers()
+    const text = createTextNode(0, 0, 200, DEFAULT_TEXT_STYLE, 'Hi')
+    store().addNodes([text])
+
+    // Presses 200 ms apart, the second handled a second after the first: a double-click.
+    click(10, 10, text.id)
+    vi.advanceTimersByTime(1000)
+    wait(200)
+    click(10, 10, text.id)
+    expect(store().editingText).toBe(text.id)
+    cancelTextEdit()
+
+    // Presses 500 ms apart, handled straight away: two clicks.
+    wait(1000)
+    click(10, 10, text.id)
+    wait(500)
+    click(10, 10, text.id)
+    expect(store().editingText).toBeNull()
   })
 })
 

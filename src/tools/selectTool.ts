@@ -14,16 +14,20 @@ const DOUBLE_MS = 400
 const DOUBLE_SLOP = 6
 const TOUCH_DOUBLE_SLOP = 24
 
-/** A detector that tells whether each press is the second of a double-click or double-tap. */
+/**
+ * A detector that tells whether each press is the second of a double-click or double-tap. Presses
+ * are timed by their events, so a quick double-click still counts when a busy main thread handles
+ * the second press late.
+ */
 export function doublePressDetector(): (e: ToolEvent) => boolean {
   let last: { at: number; point: [number, number] } | null = null
   return (e) => {
-    const now = Date.now()
     const slop = e.pointerType === 'touch' ? TOUCH_DOUBLE_SLOP : DOUBLE_SLOP
     const travel = last ? Math.hypot(e.point[0] - last.point[0], e.point[1] - last.point[1]) : 0
-    const double = last !== null && now - last.at < DOUBLE_MS && travel * zoomOf(store()) <= slop
+    const double =
+      last !== null && e.timeStamp - last.at < DOUBLE_MS && travel * zoomOf(store()) <= slop
     // A third press starts over, so a triple-click is not two doubles.
-    last = double ? null : { at: now, point: e.point }
+    last = double ? null : { at: e.timeStamp, point: e.point }
     return double
   }
 }

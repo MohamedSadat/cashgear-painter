@@ -120,6 +120,17 @@ async function savedNodeCount(page: Page) {
   return doc === undefined ? -1 : (doc?.rootIds.length ?? 0)
 }
 
+/**
+ * The top-level nodes of the autosaved doc, bottom to top; empty when nothing is saved or it
+ * can't be read. Autosave lags edits by 500 ms, and a reload doesn't save (Chromium drops
+ * IndexedDB writes begun in pagehide), so a test polls this for the doc it expects before it
+ * reloads, rather than a node count an earlier save may already have.
+ */
+async function savedNodes(page: Page) {
+  const doc = await savedDoc(page)
+  return doc ? doc.rootIds.map((id) => doc.nodes[id]) : []
+}
+
 /** The transform of every shape on the content layer, bottom to top, as Konva holds it. */
 function shownTransforms(page: Page): Promise<Transform[]> {
   return page.evaluate(() =>
@@ -707,8 +718,13 @@ test('the properties panel shows mixed values and restyles a whole selection as 
   await page.keyboard.press('Control+z')
   expect((await exportPixels(page, inside)).values).toEqual([RED, BLUE])
 
-  // Shapes are saved and come back after a reload.
-  await expect.poll(() => savedNodeCount(page)).toBe(2)
+  // Shapes are saved and come back after a reload; the undone fill and width were saved too.
+  await expect
+    .poll(() => savedNodes(page))
+    .toMatchObject([
+      { type: 'rect', style: { fill: '#ef4444', strokeWidth: 4 } },
+      { type: 'ellipse', style: { fill: '#3b82f6', strokeWidth: 4 } },
+    ])
   await page.reload()
   await waitForCanvas(page)
   expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
@@ -1068,6 +1084,8 @@ test('a text is placed, typed and edited, one undo step per edit', async ({ page
   await page.keyboard.press('Escape')
   await expect(editor).toHaveCount(0)
   expect(await shownTexts(page)).toEqual(['Hello, world'])
+  // The text was hidden while edited; Konva draws its hit area again on its next frame.
+  await nextFrame(page)
 
   // A click on the canvas ends an edit; emptying a text deletes it, one step.
   await page.mouse.dblclick(...onText)
@@ -1086,8 +1104,8 @@ test('a text is placed, typed and edited, one undo step per edit', async ({ page
   await undo.click()
   expect(await shownTexts(page)).toEqual(['Hello, world'])
 
-  // Text is saved and comes back after a reload.
-  await expect.poll(() => savedNodeCount(page)).toBe(1)
+  // Text is saved and comes back after a reload, as the undos left it.
+  await expect.poll(() => savedNodes(page)).toMatchObject([{ type: 'text', text: 'Hello, world' }])
   await page.reload()
   await waitForCanvas(page)
   expect(await shownTexts(page)).toEqual(['Hello, world'])
@@ -1431,6 +1449,8 @@ test('save and open a .painter.json drawing; Open is one undo step and refuses u
 
   await page.getByRole('button', { name: 'Clear' }).click()
   expect(await shownShapes(page)).toEqual([])
+  // Saved empty first, so the check at the end can't pass on the drawing saved before Clear.
+  await expect.poll(() => savedNodeCount(page)).toBe(0)
 
   // Ctrl+O opens the file picker, as File → Open does.
   const chooser = page.waitForEvent('filechooser')

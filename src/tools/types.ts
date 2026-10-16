@@ -8,6 +8,9 @@ export interface ToolEvent {
   alt: boolean
   mod: boolean // Ctrl or Cmd
   target: NodeId | null
+  // The pointer event's own time in ms (its `timeStamp`), not when it was handled, which a busy
+  // main thread can delay.
+  timeStamp: number
 }
 
 export interface ToolController {

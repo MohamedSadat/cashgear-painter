@@ -207,7 +207,9 @@ export function LayersPanel({ className = '' }: { className?: string }) {
       suppressClick.current = false
       return
     }
-    const now = Date.now()
+    // Timed by the clicks' own events, not when they are handled: the first click's re-render can
+    // hold the second one back.
+    const now = e.timeStamp
     const previous = lastClick.current
     lastClick.current = { id: node.id, at: now }
     if (previous?.id === node.id && now - previous.at < DOUBLE_MS) {
