@@ -437,6 +437,353 @@ Fix every error, then list what changed and anything you skipped.
 - Between sessions: run `npm run dev -- --host`, try it on your phone, then commit.
 - If the agent drifts (new libraries, a different data model), point it back to the relevant section here.
 
+# Simple Painter — v3 Pro Features Plan
+
+## Goal and scope
+
+v3 adds the six features that close most of the visible gap to Canva's editor: pages, snapping and alignment, gradients, boolean operations, images and PDF export. It runs in 7 agent sessions (M15 to M21) on the same React, TypeScript, Konva and zustand stack.
+
+This plan builds on the vector extension plan above and assumes M7 to M14 are done.
+
+**In scope (v3)**
+
+- Multiple pages, each with its own size; presets for print, social and slides
+- Snapping to page edges, page center and other objects, with smart guides
+- Align and distribute, plus numeric X, Y, W, H and rotation fields
+- Linear and radial gradient fills, edited on the canvas
+- Boolean operations: union, subtract, intersect, exclude
+- Image import by file picker, drag-and-drop and paste, with crop
+- Vector PDF export of all pages or a range
+- A `.painter` file that carries images
+
+**Out of scope (v3)**
+
+- Live (non-destructive) boolean groups and clipping masks
+- Gradient strokes, mesh gradients, blend modes, shadows and blur
+- Several artboards side by side on one canvas; Canva-style scrolling through all pages
+- CMYK, spot colors, bleed and PDF/X
+- Image editing beyond crop (filters, background removal)
+- Templates and stock content libraries
+
+## Model changes
+
+v3 changes four things in the model: a document holds pages, paths hold several contours, fills become paints, and images are a new node type. Everything else from v2 stays as it is.
+
+Each page lists its own top-level node ids, while the nodes of every page live in one map. Image nodes point into the asset store by hash.
+
+```ts
+type AssetId = string // SHA-256 hex of the image bytes
+
+interface Stop {
+  offset: number // 0..1
+  color: string
+  opacity: number
+}
+
+type Paint =
+  | { kind: 'solid'; color: string }
+  | { kind: 'linear'; stops: Stop[]; start: [number, number]; end: [number, number] } // box units 0..1
+  | { kind: 'radial'; stops: Stop[]; center: [number, number]; radius: number } // radius in units of the longer box side
+
+interface Style {
+  fill: Paint | null // was string | null
+  stroke: string | null // stays solid in v3
+  strokeWidth: number
+  opacity: number
+}
+
+interface Contour {
+  anchors: Anchor[]
+  closed: boolean
+}
+
+// changed and new node types
+type PathNode = BaseNode & { type: 'path'; contours: Contour[]; fillRule: 'nonzero' | 'evenodd' }
+type ImageNode = BaseNode & {
+  type: 'image'
+  assetId: AssetId
+  width: number
+  height: number
+  crop: { x: number; y: number; width: number; height: number } | null
+}
+
+interface Page {
+  id: string
+  name: string
+  width: number
+  height: number // px at 96 dpi
+  background: Paint
+  rootIds: NodeId[] // z-order, bottom to top
+}
+
+interface AssetMeta {
+  id: AssetId
+  mime: 'image/png' | 'image/jpeg' | 'image/webp'
+  width: number
+  height: number
+  bytes: number
+}
+
+interface Doc {
+  version: 3
+  pages: Page[]
+  nodes: Record<NodeId, VectorNode> // every node of every page
+  assets: Record<AssetId, AssetMeta> // blobs live in IndexedDB, not here
+}
+```
+
+**Store additions:** `currentPageId`, a per-page `views` map for zoom and pan, and the actions `addPage`, `duplicatePage`, `deletePage`, `movePage`, `resizePage`, `moveToPage`, `align`, `distribute`, `setFill`, `booleanOp` and `importImages`. Keep a derived `pageOf` map (node id to page id), rebuilt on load and on structural changes.
+
+**Migration v2 → v3** (`store/migrate.ts`)
+
+- The v2 artboard becomes "Page 1" with the same size, a solid background and the v2 `rootIds`.
+- Every `fill` string becomes `{ kind: 'solid', color }`.
+- Every path's `anchors` and `closed` become one contour, with `fillRule: 'nonzero'`.
+- `assets` starts empty. Autosave moves to `painter:v3`; `painter:v2` stays as a backup, and v2 `.painter.json` files migrate on open.
+
+## Pages and page sizes
+
+A page replaces v2's single artboard: each page has its own size, background and object list, and the canvas shows one page at a time.
+
+**Units:** the document unit stays the CSS pixel at 96 dpi. Print sizes are shown in mm in the UI and converted on input (1 mm = 3.7795 px).
+
+| Preset       | Size (px)           | Note                            |
+| ------------ | ------------------- | ------------------------------- |
+| A4 portrait  | 794 × 1123          | 210 × 297 mm                    |
+| US Letter    | 816 × 1056          | 8.5 × 11 in                     |
+| Square post  | 1080 × 1080         | Instagram, Facebook             |
+| Story        | 1080 × 1920         | Instagram, TikTok               |
+| Presentation | 1920 × 1080         | 16:9 slide                      |
+| Painter v2   | 1600 × 1000         | Migrated documents              |
+| Custom       | 16 to 8000 per side | Width, height, orientation swap |
+
+**Pages panel**
+
+- A vertical strip of thumbnails with add, duplicate, delete, rename and drag-to-reorder. Each change is one undo step.
+- Thumbnails come from an offscreen Konva render at 0.1 scale, refreshed when a page is left and 1 s after its last edit.
+- PageUp and PageDown switch pages. Each page remembers its own zoom and pan.
+- Right-click an object → "Move to page" or "Copy to page".
+
+**Resizing a page** keeps objects where they are, anchored to the top-left. A "Scale content" checkbox scales everything proportionally instead.
+
+**Export per page:** PNG and SVG export the current page at its own size (PNG at 2×). PDF exports all pages or a range (PDF export).
+
+## Snapping, align and distribute
+
+A pure snap engine in `lib/snap/` decides every snapped position; tools call it, and the overlay draws its guides. Keeping it pure makes it fully unit-testable.
+
+```ts
+interface Box {
+  left: number
+  centerX: number
+  right: number
+  top: number
+  centerY: number
+  bottom: number
+}
+
+interface SnapResult {
+  dx: number
+  dy: number // correction to apply to the moving box
+  guides: { axis: 'x' | 'y'; at: number; from: number; to: number }[]
+}
+
+function snapMove(moving: Box, targets: SnapTargets, threshold: number): SnapResult
+function snapResize(
+  moving: Box,
+  edges: ('left' | 'right' | 'top' | 'bottom')[],
+  targets: SnapTargets,
+  threshold: number,
+): SnapResult
+```
+
+**How snapping works**
+
+- At drag start, collect target lines: left, center and right x, and top, center and bottom y, of every visible, unselected object on the page, plus the page edges and center. Cache them for the whole drag.
+- On each move, find the nearest target per axis within 6 screen px (6 / `view.scale`). Snap each axis independently.
+- Guides span from the moving box to the farthest object sharing that line, drawn as thin magenta lines in the overlay.
+- Rotated objects snap by their axis-aligned bounding box.
+- Moves snap in the select tool's drag handler; resizes snap through the Konva `Transformer`'s `boundBoxFunc`. New shapes snap their drag corner too.
+- Hold Ctrl (Cmd on Mac) to drag without snapping; Alt keeps its v2 meanings. A View menu toggle turns snapping off, and an optional 8 px grid adds grid lines as targets.
+
+**Align and distribute**
+
+| Command                   | Shortcut        | Works on                                              |
+| ------------------------- | --------------- | ----------------------------------------------------- |
+| Align left, center, right | Alt + A, H, D   | 2+ objects to the selection box; 1 object to the page |
+| Align top, middle, bottom | Alt + W, V, S   | Same                                                  |
+| Distribute horizontally   | Alt + Shift + H | 3+ objects: equal gaps between them                   |
+| Distribute vertically     | Alt + Shift + V | 3+ objects: equal gaps between them                   |
+
+Each command is one undo step. Locked objects stay put and act as the reference when selected.
+
+**Numeric transform:** X, Y, W, H and rotation fields at the top of the properties panel. Values update live while dragging, Enter applies, and a lock icon keeps the aspect ratio. Typing math like `200/3` is evaluated.
+
+## Gradients
+
+Fills become a `Paint` instead of a color string. Gradient points are stored in bounding-box units (0 to 1), so a gradient follows its object through moves and resizes.
+
+**Konva rendering** (`lib/paint/toKonva.ts`)
+
+- Convert box units to local pixels using the node's local bounding box, then set the Konva attributes:
+  - Solid: `fill`, `fillPriority: 'color'`
+  - Linear: `fillLinearGradientStartPoint`, `fillLinearGradientEndPoint`, `fillLinearGradientColorStops`, `fillPriority: 'linear-gradient'`
+  - Radial: `fillRadialGradientStartPoint` and `EndPoint` both at the center, `StartRadius: 0`, `EndRadius`, the stops, `fillPriority: 'radial-gradient'`
+- Konva color stops are a flat `[offset, color, …]` array; stop opacity goes into the color as `rgba()`.
+- Gradients work on every filled node: rect, ellipse, path, freehand stroke, text and page background.
+
+**Editing**
+
+- Properties panel: a Fill type switch (None, Solid, Linear, Radial), a stop bar to add, drag and delete stops, and color plus opacity per stop. A reverse button flips the stops.
+- On the canvas, a gradient overlay appears when the fill is a gradient and one object is selected. Linear: two draggable end points on a line. Radial: a center point and a radius handle. Shift snaps the linear angle to 45°.
+- A gradient drag is one gesture, so one undo step.
+
+**SVG export**
+
+- Each gradient fill becomes a `<linearGradient>` or `<radialGradient>` in `<defs>` with a unique id, referenced by `fill="url(#id)"`. Stops use `stop-color` and `stop-opacity`.
+- Export with `gradientUnits="userSpaceOnUse"` and the same local-pixel coordinates used for Konva. `objectBoundingBox` would stretch radial gradients into ellipses on non-square shapes and no longer match the canvas.
+- SVG import reads simple linear and radial gradients back into `Paint`; anything with `gradientTransform` beyond translate and scale falls back to the first stop's color.
+
+## Boolean operations
+
+Booleans run through Paper.js (`paper`), loaded with a dynamic `import()` on first use so it never weighs on startup. Results are ordinary `path` nodes, so they stay node-editable.
+
+| Operation | Shortcut           | Result                                           |
+| --------- | ------------------ | ------------------------------------------------ |
+| Union     | Ctrl/Cmd + Alt + U | One shape covering all selected shapes           |
+| Subtract  | Ctrl/Cmd + Alt + S | The bottom-most shape minus every shape above it |
+| Intersect | Ctrl/Cmd + Alt + I | Only the area all shapes share                   |
+| Exclude   | Ctrl/Cmd + Alt + X | Areas covered an odd number of times             |
+
+**Pipeline** (`lib/boolean/booleanOp.ts`)
+
+1. Set up Paper once, headless: `paper.setup(new paper.Size(1, 1))`.
+2. Convert each selected node to a Paper `Path` or `CompoundPath` in page coordinates, with its transform applied. Rect, ellipse and line go through "convert to path" first; a freehand stroke uses its perfect-freehand outline.
+3. Clean the inputs with `resolveCrossings()` and `reorient()`, so self-intersecting freehand outlines don't break the operation.
+4. Fold the operation across the shapes in z-order: `unite`, `subtract`, `intersect` or `exclude`.
+5. Convert the result back: each child path of the result becomes a contour, and each segment's `point`, `handleIn` and `handleOut` map directly to an `Anchor`.
+6. Replace the inputs with one `path` node at the bottom-most input's z-position, with its style. The whole operation is one undo step.
+
+**Rules**
+
+- Enabled only for 2+ selected rect, ellipse, line, path or stroke nodes. Text and images disable the commands until "text to outlines" exists.
+- Results from freehand strokes can carry hundreds of anchors. Offer "Simplify" (Paper's `simplify(2.5)`) in the context menu, not automatically.
+- Results can have holes, which is why v3 paths hold several contours with a fill rule (Model changes).
+
+## Image import and assets
+
+Image bytes never live in the `Doc`. They are stored once as blobs in IndexedDB, keyed by their SHA-256 hash, and image nodes point to them by that id.
+
+**Import**
+
+- Three ways in: the file picker, drag-and-drop onto the canvas, and paste (Ctrl/Cmd + V) from the clipboard. PNG, JPEG and WebP become image nodes; SVG files go through the v2 SVG importer instead.
+- Decode with `createImageBitmap`. If the longer side exceeds 4096 px, downscale in a Web Worker with `OffscreenCanvas` and re-encode (JPEG at 0.9 for photos, PNG when the image has transparency).
+- Hash the final bytes with `crypto.subtle.digest('SHA-256', …)`. A known hash reuses the existing asset, so pasting the same image twice stores it once.
+- New images land centered on the page, scaled down to fit inside 80% of it.
+
+**Rendering**
+
+- An `assetUrls` cache maps asset ids to object URLs and decoded `HTMLImageElement`s. Konva `Image` nodes draw from it.
+- While an asset loads, draw a gray placeholder of the right size.
+- Revoke an object URL when no node in the document or the undo history uses its asset.
+
+**Crop**
+
+- Double-click an image (or press Enter) to enter crop mode: the full image shows dimmed, with a crop box on top. Drag the box handles to crop, drag the image to reposition it inside the box. Enter applies, Esc cancels.
+- The crop is stored in source-image pixels and maps straight to Konva `Image`'s `crop` attribute.
+- "Reset crop" restores the full image.
+
+**Storage and files**
+
+- Autosave writes the doc to `painter:v3` and each asset to `asset:<sha256>` with `idb-keyval`. Call `navigator.storage.persist()` once so the browser doesn't evict images under storage pressure.
+- On start, delete stored assets that the loaded doc no longer references.
+- Save writes a `.painter` file: a zip built with `fflate` holding `doc.json` and `assets/<sha256>.<ext>`. Open accepts `.painter` and v2's `.painter.json`.
+- SVG export embeds images as base64 `data:` URLs inside `<image>`; a cropped image is wrapped in a nested `<svg>` whose `viewBox` is the crop rectangle.
+
+## PDF export
+
+PDF reuses the SVG exporter: each page becomes an SVG, and `svg2pdf.js` draws it into a `jsPDF` page as real vectors. Both libraries load on first export.
+
+**Pipeline** (`lib/pdf/exportPdf.ts`)
+
+1. Build each page's SVG with `exportSvg(page, { embedImages: true })` and parse it into an element with `DOMParser`.
+2. Create the document with the first page's size in points: `new jsPDF({ unit: 'pt', format: [w * 0.75, h * 0.75] })`. CSS px to pt is × 0.75.
+3. For each page, `addPage` at that page's size (except the first), then `await pdf.svg(svgEl, { x: 0, y: 0, width: w * 0.75, height: h * 0.75 })`.
+4. Save as `<document name>.pdf`.
+
+**Export dialog:** all pages or a range ("1-3, 5"), and Vector (default) or Image mode. A progress bar runs during export.
+
+**Fonts**
+
+- jsPDF only knows its built-in fonts. Map Arial and Helvetica to Helvetica, Times New Roman to Times, Courier New to Courier.
+- Any other font needs its TTF shipped in `public/fonts/` and registered with `addFileToVFS` and `addFont` before export. Text stays selectable and searchable.
+- Arabic and other right-to-left text need an embedded TTF that covers the script, plus a real test; check jsPDF's output early and use Image mode for those pages if shaping is wrong.
+
+**Image mode (fallback):** render each page with an offscreen Konva stage at 300 dpi (pixelRatio 3.125) and place it with `addImage` as JPEG. It looks exactly like the screen, but text is no longer selectable and files are larger.
+
+Gradients, opacity, images and compound paths with holes all go through `svg2pdf.js`. Confirm each in the M21 test document.
+
+## Milestones
+
+Seven milestones, one per agent session, continuing from M14. The model change comes first because every later feature depends on it; PDF comes last because it exercises all the others. Each ends only when its check passes and `lint`, `test` and `build` are green.
+
+1. **M15 · Model v3 and pages.** v3 types, v2 → v3 migration, `currentPageId`, pages panel with thumbnails, size presets and custom sizes, move/copy to page, per-page PNG and SVG export. Paths render from `contours` with `fillRule`.
+   - Done when: a v2 document opens as one 1600 × 1000 page that looks unchanged, and add, duplicate, delete, reorder and resize page are each one undo step.
+2. **M16 · Snapping.** `lib/snap/` engine with unit tests, smart guides in the overlay, move and resize snapping, Ctrl/Cmd to bypass, View toggle, optional grid.
+   - Done when: objects snap to page edges, page center and each other within 6 screen px at 25%, 100% and 400% zoom.
+3. **M17 · Align, distribute and numeric transform.** Six align and two distribute commands with shortcuts and toolbar buttons; X, Y, W, H and rotation fields.
+   - Done when: commands give correct results on rotated objects in unit tests, and each is one undo step.
+4. **M18 · Gradients.** `Paint` rendering in Konva, fill type switch and stop bar, on-canvas handles, page background gradients, SVG export and import.
+   - Done when: linear and radial gradients on a rect, a circle, a path and text look the same on the canvas, in the PNG and in the SVG opened in Chrome and Inkscape.
+5. **M19 · Boolean operations.** Lazy-loaded Paper.js pipeline, four operations with shortcuts and menu items, Simplify.
+   - Done when: subtracting a circle from a rect gives a node-editable path with a hole, a union with a freehand stroke works, and `paper` is absent from the initial bundle.
+6. **M20 · Images.** Import by picker, drop and paste; worker downscaling; asset store with dedupe and cleanup; crop mode; `.painter` zip save and open.
+   - Done when: a 20 MB phone photo imports without freezing the UI, survives a refresh and a `.painter` round trip, and crops correctly in PNG and SVG.
+7. **M21 · PDF and release.** Export dialog, vector and image modes, font mapping and one embedded TTF, Playwright suite covering pages, snapping, gradient, boolean, image import and PDF download.
+   - Done when: a 3-page A4 test document with gradients, a cropped image, a boolean shape and text opens in Chrome and Acrobat, matches the screen, and its text is selectable.
+
+**Driving the agent:** append this plan to `CLAUDE.md` / `AGENTS.md` below the v2 plan, and reuse the same session prompt with the new milestone number.
+
+### Definition of done
+
+- [ ] v2 documents open unchanged as a single page
+- [ ] Pages can be added, sized, reordered and exported one by one or as a PDF
+- [ ] Snapping, align and distribute behave the same at every zoom level
+- [ ] Gradients match across canvas, PNG, SVG and PDF
+- [ ] Boolean results are editable paths, holes included
+- [ ] Images survive refresh, `.painter` save/open and every export format
+- [ ] `lint`, unit tests and the Playwright suite pass from a clean clone
+
+## Gotchas and open decisions
+
+Most v3 bugs will come from coordinate spaces (box units, page units, PDF points) and from memory held by images; give these to the agent up front.
+
+**Gotchas**
+
+- **Booleans need holes in the model first.** A single `anchors` list can't hold a donut. `contours` + `fillRule` must land in M15, not M19.
+- **Radial gradients stretch in SVG.** `objectBoundingBox` turns circles into ellipses on non-square shapes. Export with `userSpaceOnUse` and pixel coordinates.
+- **Gradient points drift on resize.** Store them in box units and convert at render time; never store Konva's pixel points.
+- **jsPDF flips landscape pages.** With a `[w, h]` format it defaults to portrait and swaps the sides. Pass `orientation: w > h ? 'landscape' : 'portrait'` for every page.
+- **Text falls back to Helvetica in PDF.** Unregistered fonts are silently replaced. Warn in the export dialog when a page uses an unmapped font.
+- **Huge photos crash mobile Safari.** iOS caps canvas and image memory. The 4096 px downscale is required, not optional.
+- **Undo brings back a deleted image.** Asset cleanup must keep any asset referenced by the undo history in the current session.
+- **Object URLs leak.** Revoke them when an asset's last reference goes, or memory grows with every paste.
+- **Snapping lags with many objects.** Collect targets once per drag, only for objects in the viewport. Past about 1,000 objects, put them in an `rbush` spatial index.
+- **Paper.js chokes on messy outlines.** Run `resolveCrossings()` and `reorient()` before every operation, and catch errors so a failed operation changes nothing.
+- **Hashing and storage APIs need a secure context.** `crypto.subtle` (the SHA-256 asset ids) and `navigator.storage.persist()` are missing on plain-http LAN URLs such as `npm run dev -- --host`, as `crypto.randomUUID()` is. Feature-detect them, with a JS hash fallback for asset ids.
+
+**Open decisions**
+
+| Decision        | Plan's pick                                | Alternative                                             |
+| --------------- | ------------------------------------------ | ------------------------------------------------------- |
+| Page view       | One page at a time                         | Canva-style vertical scroll through all pages           |
+| Booleans        | Destructive: inputs replaced by the result | Live boolean groups that stay editable (much more work) |
+| Images in files | `.painter` zip with separate asset files   | Base64 inside JSON: simpler, about 33% larger           |
+| PDF mode        | Vector by default, image mode as fallback  | Image only: exact match, no selectable text             |
+| PDF library     | jsPDF + svg2pdf.js                         | pdf-lib with a hand-written SVG-to-PDF drawer           |
+
+**New libraries** (latest stable, pinned): `paper` and `jspdf` + `svg2pdf.js` (all lazy-loaded), `fflate` for the zip, and `rbush` only if snapping needs it.
+
 ## Repo notes
 
 - The folder tree above is relative to this repo root.
