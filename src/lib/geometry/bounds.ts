@@ -215,6 +215,48 @@ export function textBox(node: TextNode): Box {
   return { minX: 0, minY: 0, maxX: node.width, maxY: textHeight(node) }
 }
 
+const pathFillCache = new WeakMap<PathNode['contours'], Box | null>()
+
+/** A path's curves boxed in its own coordinates; cached by its contours array. */
+function localPathBox(node: PathNode): Box | null {
+  const cached = pathFillCache.get(node.contours)
+  if (cached !== undefined) return cached
+  const boxes: Box[] = []
+  for (const c of node.contours) {
+    const segments = pathSegments(c.anchors, c.closed)
+    if (segments.length > 0) boxes.push(...segments.map(cubicBox))
+    else if (c.anchors.length > 0) boxes.push(pointsBox(c.anchors.map((a) => [a.x, a.y])))
+  }
+  const box = unionBoxes(boxes)
+  pathFillCache.set(node.contours, box)
+  return box
+}
+
+/**
+ * The box a node's fill is laid out in, in the node's own coordinates: its geometry without the
+ * outline. Gradient points are stored in units of this box, so they follow the node through
+ * moves and resizes. A rectangle's is its size, an ellipse's its radii about its center, a
+ * path's its curves' extrema, a freehand stroke's its drawn outline and a text's its width by its
+ * lines. Lines and groups have no fill.
+ */
+export function fillBox(node: VectorNode): Box | null {
+  switch (node.type) {
+    case 'rect':
+      return { minX: 0, minY: 0, maxX: node.width, maxY: node.height }
+    case 'ellipse':
+      return { minX: -node.rx, minY: -node.ry, maxX: node.rx, maxY: node.ry }
+    case 'path':
+      return localPathBox(node)
+    case 'stroke':
+      return strokeOutlineBox(node)
+    case 'text':
+      return textBox(node)
+    case 'line':
+    case 'group':
+      return null
+  }
+}
+
 export function unionBoxes(boxes: Iterable<Box | null>): Box | null {
   let union: Box | null = null
   for (const box of boxes) {

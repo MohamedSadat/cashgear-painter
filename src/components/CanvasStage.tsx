@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type Ref } from 'rea
 import { Layer, Rect, Stage } from 'react-konva'
 import { useViewport } from '../hooks/useViewport'
 import { OVERLAY_LAYER_NAME } from '../lib/exportPng'
-import { paintColor } from '../lib/paint/paint'
+import { pageKonvaFill } from '../lib/paint/toKonva'
 import { currentPageOf, useEditorStore } from '../store/editorStore'
 import { toolFor } from '../tools'
 import { pickTarget } from '../tools/selectTool'
@@ -12,6 +12,7 @@ import { finishTextEdit } from '../tools/textTool'
 import type { ToolEvent } from '../tools/types'
 import type { NodeId } from '../types'
 import { BrushCursor } from './BrushCursor'
+import { GradientOverlay } from './GradientOverlay'
 import { MoveToPageMenu } from './MoveToPageMenu'
 import { NodeView } from './NodeView'
 import { PathEditOverlay } from './PathEditOverlay'
@@ -242,7 +243,7 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
                 name="artboard"
                 width={page.width}
                 height={page.height}
-                fill={paintColor(page.background)}
+                {...pageKonvaFill(page)}
               />
             </Layer>
             {/* The draft is the last child, so the stroke being drawn is on top. */}
@@ -254,6 +255,8 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
             </Layer>
             <Layer name={OVERLAY_LAYER_NAME}>
               <SnapOverlay />
+              {/* Under the Transformer, whose handles win where the two overlap. */}
+              <GradientOverlay />
               <SelectionOverlay contentLayerRef={contentLayerRef} />
               <PathEditOverlay />
               <BrushCursor ref={cursorRef} tool={tool} size={size} />

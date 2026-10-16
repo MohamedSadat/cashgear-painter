@@ -3,7 +3,7 @@ import { Arrow, Ellipse, Group, Path, Rect, Text } from 'react-konva'
 import { arrowHeadSize } from '../lib/geometry/bounds'
 import { cachedPathData } from '../lib/geometry/pathData'
 import { TEXT_LINE_HEIGHT } from '../lib/geometry/textLayout'
-import { fillColor } from '../lib/paint/paint'
+import { nodeKonvaFill } from '../lib/paint/toKonva'
 import { cachedStrokePath, strokeToPath } from '../lib/strokePath'
 import { useEditorStore, zoomOf } from '../store/editorStore'
 import type { GroupNode, NodeId, ShapeNode, TextNode, VectorNode } from '../types'
@@ -40,8 +40,8 @@ function ShapeView({ node, common }: { node: ShapeNode; common: CommonProps }) {
     hitStrokeWidth: Math.max(outline, zoom > 0 ? HIT_STROKE_PX / zoom : HIT_STROKE_PX),
   }
   // Konva's hit canvas fills every fill-enabled shape, so an unfilled one turns filling off to be
-  // picked on its outline only.
-  const fill = { fill: fillColor(style.fill), fillEnabled: style.fill !== null }
+  // picked on its outline only. A gradient is laid out in the node's own coordinates.
+  const fill = { ...nodeKonvaFill(node), fillEnabled: style.fill !== null }
 
   switch (node.type) {
     case 'path':
@@ -111,7 +111,7 @@ function TextView({ node, common }: { node: TextNode; common: CommonProps }) {
       width={node.width}
       wrap="word"
       lineHeight={TEXT_LINE_HEIGHT}
-      fill={fillColor(node.style.fill)}
+      {...nodeKonvaFill(node)}
     />
   )
 }
@@ -169,7 +169,7 @@ export const NodeView = memo(function NodeView({
         <Path
           {...common}
           data={isDraft ? strokeToPath(node, false) : cachedStrokePath(node)}
-          fill={fillColor(style.fill)}
+          {...nodeKonvaFill(node)}
           perfectDrawEnabled={false}
           // The outline is a fill, so the hit stroke has no visible twin; unscaled, it stays
           // HIT_STROKE_PX on screen at any zoom and any stroke scale.

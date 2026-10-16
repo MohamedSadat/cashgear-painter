@@ -11,10 +11,16 @@ import {
   createTextNode,
   shapeToPath,
 } from '../../store/editorStore'
-import { applyTransform, canvasSegments, nodeBounds } from '../geometry/bounds'
+import {
+  applyTransform,
+  canvasSegments,
+  fillBox,
+  invertTransform,
+  nodeBounds,
+} from '../geometry/bounds'
 import { corner, type Cubic, type Xy } from '../geometry/pathData'
 import { absoluteTransform } from '../geometry/transform'
-import { solid } from '../paint/paint'
+import { isGradient, placeGradient, solid } from '../paint/paint'
 import { strokeToPath } from '../strokePath'
 import {
   IDENTITY_TRANSFORM,
@@ -22,7 +28,10 @@ import {
   type Anchor,
   type Doc,
   type GroupNode,
+  type Paint,
   type PathNode,
+  type Stop,
+  type Transform,
   type StrokeNode,
   type VectorNode,
 } from '../../types'
@@ -331,6 +340,255 @@ describe('importSvg round trip', () => {
   })
 })
 
+const GRADIENT_STOPS: Stop[] = [
+  { offset: 0, color: '#ef4444', opacity: 1 },
+  { offset: 0.4, color: '#22c55e', opacity: 0.5 },
+  { offset: 1, color: '#3b82f6', opacity: 1 },
+]
+const LINEAR: Paint = { kind: 'linear', stops: GRADIENT_STOPS, start: [0.1, 0.2], end: [0.9, 0.7] }
+const RADIAL: Paint = { kind: 'radial', stops: GRADIENT_STOPS, center: [0.4, 0.6], radius: 0.7 }
+
+/** A node's gradient laid out in pixels, and the transform from there to the canvas. */
+function placed(node: VectorNode, t: Transform = node.transform) {
+  const paint = node.style.fill
+  if (!isGradient(paint)) throw new Error(`${node.id} has no gradient`)
+  return { gradient: placeGradient(paint, fillBox(node)!)!, t }
+}
+
+/** Where a canvas point is along a linear gradient: 0 at its start, 1 at its end. */
+function along(node: VectorNode, t: Transform, point: Xy): number {
+  const { gradient } = placed(node, t)
+  if (gradient.kind !== 'linear') throw new Error('not linear')
+  const [x, y] = invertTransform(t, point[0], point[1])
+  const [sx, sy] = gradient.start
+  const [vx, vy] = [gradient.end[0] - sx, gradient.end[1] - sy]
+  return ((x - sx) * vx + (y - sy) * vy) / (vx * vx + vy * vy)
+}
+
+/** A radial gradient's center on the canvas, and its radius there for an unstretched transform. */
+function radialOnCanvas(node: VectorNode, t: Transform = node.transform) {
+  const { gradient } = placed(node, t)
+  if (gradient.kind !== 'radial') throw new Error('not radial')
+  return {
+    center: applyTransform(t, ...gradient.center),
+    radius: gradient.radius * Math.sqrt(Math.abs(t.scaleX * t.scaleY)),
+  }
+}
+
+describe('importSvg gradients', () => {
+  // A turned rectangle and a stretched, turned freehand stroke with linear gradients; a circle
+  // and a turned path with radial ones; and a page background.
+  const filled = { ...DEFAULT_SHAPE_STYLE, stroke: null }
+  const rect = createRectNode(
+    { x: 100, y: 100, width: 300, height: 120 },
+    { ...filled, fill: LINEAR },
+    'rect',
+  )
+  rect.transform = { ...rect.transform, rotation: 30 }
+  const stroke: StrokeNode = {
+    ...createStrokeNode(
+      [
+        [100, 600, 0.5],
+        [160, 650, 0.6],
+        [240, 640, 0.4],
+        [300, 700, 0.5],
+      ],
+      { color: '#000000', size: 16, usesPressure: true },
+      'stroke',
+    ),
+    transform: { x: 50, y: 0, rotation: 10, scaleX: 1.5, scaleY: 1.2 },
+  }
+  stroke.style = { ...stroke.style, fill: LINEAR }
+  const circle = createEllipseNode(
+    { x: 500, y: 100, width: 200, height: 200 },
+    { ...filled, fill: RADIAL },
+    'circle',
+  )
+  const heart = createPathNode(HEART, true, { ...filled, fill: RADIAL }, 'heart')
+  heart.transform = { ...heart.transform, x: 600, y: 400, rotation: 15 }
+  const doc = docOf(rect, stroke, circle, heart)
+  doc.pages[0].background = LINEAR
+  const result = imported(exportSvg(doc))
+  const [rectPath, strokePath, circlePath, heartPath] = result.children.map(asPath)
+
+  it('brings gradient fills back with their stops, skipping nothing', () => {
+    expect(result.skipped).toBe(0)
+    expect(result.children).toHaveLength(4)
+    for (const path of [rectPath, strokePath]) {
+      expect(path.style.fill).toMatchObject({ kind: 'linear', stops: GRADIENT_STOPS })
+    }
+    for (const path of [circlePath, heartPath]) {
+      expect(path.style.fill).toMatchObject({ kind: 'radial', stops: GRADIENT_STOPS })
+    }
+  })
+
+  it('keeps a linear gradient’s colors where they were on the canvas, on turned and stretched shapes', () => {
+    for (const [original, copy] of [
+      [rect, rectPath],
+      [stroke, strokePath],
+    ] as const) {
+      for (const point of [
+        [150, 150],
+        [400, 300],
+        [200, 650],
+        [-100, 900],
+      ] as Xy[]) {
+        expect(along(copy, copy.transform, point)).toBeCloseTo(
+          along(original, original.transform, point),
+          4,
+        )
+      }
+    }
+    // An unturned box keeps its box units: the rectangle's corners stay its box's corners.
+    const flat = { ...rect, transform: { ...rect.transform, rotation: 0 } }
+    const again = asPath(imported(exportSvg(docOf(flat))).children[0])
+    const paint = again.style.fill as Extract<Paint, { kind: 'linear' }>
+    expect(paint.start[0]).toBeCloseTo(0.1, 5)
+    expect(paint.start[1]).toBeCloseTo(0.2, 5)
+    expect(paint.end[0]).toBeCloseTo(0.9, 5)
+    expect(paint.end[1]).toBeCloseTo(0.7, 5)
+  })
+
+  it('keeps a radial gradient’s center and radius on the canvas', () => {
+    for (const [original, copy] of [
+      [circle, circlePath],
+      [heart, heartPath],
+    ] as const) {
+      const before = radialOnCanvas(original)
+      const after = radialOnCanvas(copy)
+      expect(after.center[0]).toBeCloseTo(before.center[0], 2)
+      expect(after.center[1]).toBeCloseTo(before.center[1], 2)
+      expect(after.radius).toBeCloseTo(before.radius, 2)
+    }
+    // The circle's box is the same, so its box units are too.
+    expect(circlePath.style.fill).toMatchObject({ center: [0.4, 0.6], radius: 0.7 })
+  })
+})
+
+/** Imports one shape, its <defs> before it, and returns its fill. */
+function fillOf(defs: string, shape: string): Paint | null | undefined {
+  const result = imported(`${SVG_OPEN}<defs>${defs}</defs>${shape}</svg>`)
+  return result.children[0]?.style.fill
+}
+
+describe('importSvg gradient subset', () => {
+  const STOPS = '<stop offset="0" stop-color="#ff0000"/><stop offset="100%" stop-color="#0000ff"/>'
+  const RED_BLUE = [
+    { offset: 0, color: '#ff0000', opacity: 1 },
+    { offset: 1, color: '#0000ff', opacity: 1 },
+  ]
+
+  it('reads bounding-box units by default, from left to right across the top', () => {
+    expect(
+      fillOf(
+        `<linearGradient id="g">${STOPS}</linearGradient>`,
+        '<rect x="10" y="20" width="200" height="100" fill="url(#g)"/>',
+      ),
+    ).toEqual({ kind: 'linear', stops: RED_BLUE, start: [0, 0], end: [1, 0] })
+    expect(
+      fillOf(
+        `<radialGradient id="g" cx="0.25" cy="75%" r="0.5">${STOPS}</radialGradient>`,
+        '<rect width="100" height="100" fill="url(#g)"/>',
+      ),
+    ).toEqual({ kind: 'radial', stops: RED_BLUE, center: [0.25, 0.75], radius: 0.5 })
+  })
+
+  it('maps user-space gradients through the shape’s transform into its box', () => {
+    expect(
+      fillOf(
+        `<linearGradient id="g" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="50">${STOPS}</linearGradient>`,
+        '<rect width="100" height="100" transform="translate(300 200) scale(2)" fill="url(#g)"/>',
+      ),
+    ).toEqual({ kind: 'linear', stops: RED_BLUE, start: [0, 0], end: [0, 0.5] })
+  })
+
+  it('follows href for stops and attributes, as Inkscape writes gradients', () => {
+    const fill = fillOf(
+      `<linearGradient id="stops">${STOPS}</linearGradient>` +
+        '<linearGradient id="g" xlink:href="#stops" gradientUnits="userSpaceOnUse" x1="0" y1="50" x2="100" y2="50" gradientTransform="rotate(90 50 50)"/>',
+      '<rect width="100" height="100" fill="url(#g)"/>',
+    )
+    // Turned a quarter, the gradient runs from top to bottom: any transform works for a linear one.
+    expect(fill?.kind).toBe('linear')
+    const { start, end } = fill as Extract<Paint, { kind: 'linear' }>
+    expect([start, end].flat().map((n) => Math.round(n * 1e6) / 1e6)).toEqual([0.5, 0, 0.5, 1])
+    expect((fill as Extract<Paint, { kind: 'linear' }>).stops).toEqual(RED_BLUE)
+  })
+
+  it('takes a stop color’s alpha and stop-opacity, styles included, into its opacity', () => {
+    const fill = fillOf(
+      '<linearGradient id="g">' +
+        '<stop offset="0" style="stop-color: rgba(255, 0, 0, 0.5); stop-opacity: 0.5"/>' +
+        '<stop offset="0.6" stop-color="lime"/>' +
+        '<stop offset="0.3" stop-color="#00f" stop-opacity="20%"/>' +
+        '</linearGradient>',
+      '<rect width="10" height="10" fill="url(#g)"/>',
+    )
+    // Node has no canvas to read named colors; lime reads as black here. An offset below an
+    // earlier one is raised to it, as SVG does.
+    expect((fill as Extract<Paint, { kind: 'linear' }>).stops).toEqual([
+      { offset: 0, color: '#ff0000', opacity: 0.25 },
+      { offset: 0.6, color: '#000000', opacity: 1 },
+      { offset: 0.6, color: '#0000ff', opacity: 0.2 },
+    ])
+  })
+
+  it('falls back to a solid color where a gradient can’t be kept', () => {
+    // A radial gradient turned or skewed by its own transform paints its first stop.
+    expect(
+      fillOf(
+        `<radialGradient id="g" gradientTransform="skewX(20)">${STOPS}</radialGradient>`,
+        '<rect width="10" height="10" fill="url(#g)"/>',
+      ),
+    ).toEqual(solid('#ff0000'))
+    // But a scale is fine.
+    expect(
+      fillOf(
+        `<radialGradient id="g" gradientTransform="scale(0.5)">${STOPS}</radialGradient>`,
+        '<rect width="10" height="10" fill="url(#g)"/>',
+      ),
+    ).toMatchObject({ kind: 'radial', center: [0.25, 0.25], radius: 0.25 })
+    // One stop is a solid fill; none is no fill, so a shape without an outline goes.
+    expect(
+      fillOf(
+        '<linearGradient id="g"><stop stop-color="#123456"/></linearGradient>',
+        '<rect width="10" height="10" fill="url(#g)"/>',
+      ),
+    ).toEqual(solid('#123456'))
+    expect(
+      fillOf(
+        '<linearGradient id="g"/>',
+        '<rect width="10" height="10" fill="url(#g)" stroke="#000000"/>',
+      ),
+    ).toBeNull()
+    expect(
+      imported(
+        `${SVG_OPEN}<defs><linearGradient id="g"/></defs><rect width="10" height="10" fill="url(#g)"/></svg>`,
+      ).children,
+    ).toHaveLength(0)
+    // An unknown gradient is its fallback color, or no fill.
+    expect(fillOf('', '<rect width="10" height="10" fill="url(#nope) #00ff00"/>')).toEqual(
+      solid('#00ff00'),
+    )
+  })
+
+  it('passes a gradient down from a group, laid out on each shape’s own box', () => {
+    const result = imported(
+      `${SVG_OPEN}<defs><linearGradient id="g">${STOPS}</linearGradient></defs>` +
+        '<g fill="url(#g)"><rect width="10" height="10"/><rect x="100" width="50" height="20"/></g></svg>',
+    )
+    const group = result.children[0] as GroupNode
+    for (const id of group.childIds) {
+      expect(result.nodes.get(id)!.style.fill).toEqual({
+        kind: 'linear',
+        stops: RED_BLUE,
+        start: [0, 0],
+        end: [1, 0],
+      })
+    }
+  })
+})
+
 describe('importSvg', () => {
   it('reads basic shapes, polylines and polygons as paths', () => {
     // All on the artboard, so the import stays where it is.
@@ -390,8 +648,9 @@ describe('importSvg', () => {
     </svg>`)
     expect(result.groupId).toBeNull()
     expect(result.nodes.size).toBe(0)
-    // Two in <defs>, the style, the text, the image and the use.
-    expect(result.skipped).toBe(6)
+    // The clip path in <defs> (not the gradient, which fills read), the style, the text, the
+    // image and the use.
+    expect(result.skipped).toBe(5)
   })
 
   it('inherits paint from groups, with inline styles over attributes', () => {

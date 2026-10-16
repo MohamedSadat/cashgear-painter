@@ -588,6 +588,32 @@ describe('merged updates', () => {
   })
 })
 
+describe('setFill', () => {
+  it('gives nodes their fills as one step, leaving out ones that already have them', () => {
+    draw(0, 'a')
+    draw(10, 'b')
+    const steps = store().past.length
+    const linear = {
+      kind: 'linear' as const,
+      stops: [
+        { offset: 0, color: '#ef4444', opacity: 1 },
+        { offset: 1, color: '#ffffff', opacity: 1 },
+      ],
+      start: [0, 0.5] as [number, number],
+      end: [1, 0.5] as [number, number],
+    }
+    store().setFill({ a: linear, b: solid('#000000') })
+    expect(node('a').style.fill).toEqual(linear)
+    // b's fill was already black: a fresh paint of the same color is no change.
+    expect(node('b').style.fill).toEqual(solid('#000000'))
+    expect(store().past).toHaveLength(steps + 1)
+    store().setFill({ a: structuredClone(linear), b: solid('#000000') })
+    expect(store().past).toHaveLength(steps + 1)
+    store().undo()
+    expect(node('a').style.fill).toEqual(solid('#000000'))
+  })
+})
+
 describe('shape style and new shapes', () => {
   it('keeps the style for new shapes outside history, with clamped width and opacity', () => {
     store().setShapeStyle({ fill: solid('#ef4444'), strokeWidth: 500, opacity: 2 })

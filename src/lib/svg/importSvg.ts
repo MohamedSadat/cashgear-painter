@@ -1,7 +1,7 @@
 import svgpath from 'svgpath'
-import { nodeBounds } from '../geometry/bounds'
+import { cubicBox, fillBox, nodeBounds, pointsBox, unionBoxes } from '../geometry/bounds'
 import { KAPPA, corner, pathSegments, type Cubic, type Xy } from '../geometry/pathData'
-import { solid } from '../paint/paint'
+import { radiusUnit, solid, toBoxUnits } from '../paint/paint'
 import {
   DEFAULT_SHAPE_STYLE,
   createGroupNode,
@@ -14,7 +14,9 @@ import {
   type Contour as PathContour,
   type FillRule,
   type NodeId,
+  type Paint,
   type PathNode,
+  type Stop,
   type VectorNode,
 } from '../../types'
 import { SVG_NS } from './exportSvg'
@@ -42,7 +44,7 @@ export interface SvgImport {
   nodes: VectorNode[]
   /** The group holding the import; null when nothing could be imported. */
   groupId: NodeId | null
-  /** Elements left out: text, images, gradients, styles, masks and anything else unsupported. */
+  /** Elements left out: text, images, styles, masks, markers and anything else unsupported. */
   skipped: number
 }
 
@@ -57,6 +59,8 @@ const SHAPES: ReadonlySet<string> = new Set([
 ])
 // Elements that describe a drawing rather than draw anything; leaving them out skips nothing.
 const DESCRIPTIVE: ReadonlySet<string> = new Set(['title', 'desc', 'metadata'])
+// Gradients are read where a fill uses them, and draw nothing themselves.
+const GRADIENTS: ReadonlySet<string> = new Set(['linearGradient', 'radialGradient'])
 
 // CSS absolute units in pixels; percentages and font-relative units aren't supported.
 const UNITS: Record<string, number> = {
@@ -158,6 +162,28 @@ function parsePaint(value: string | undefined, color: string): string | null | u
   return parsed.alpha === 0 ? null : parsed.hex
 }
 
+/** A gradient a fill refers to by id, and the color to use when it can't be read. */
+interface GradientRef {
+  gradient: string
+  fallback: string | null
+}
+
+/** A fill as the context passes it on: a color, none, or a gradient each shape lays out itself. */
+type Fill = string | null | GradientRef
+
+/** A fill value, as parsePaint reads it, except that url(#id) of a known gradient refers to it. */
+function parseFill(
+  value: string | undefined,
+  color: string,
+  gradients: ReadonlyMap<string, SvgElementLike>,
+): Fill | undefined {
+  const url = /^url\(\s*['"]?#([^'")\s]+)['"]?\s*\)\s*(.*)$/i.exec(value?.trim() ?? '')
+  if (url && gradients.has(url[1])) {
+    return { gradient: url[1], fallback: parsePaint(url[2], color) ?? null }
+  }
+  return parsePaint(value, color)
+}
+
 function parseOpacity(value: string | undefined): number {
   if (value === undefined) return 1
   const n = value.trim().endsWith('%') ? parseFloat(value) / 100 : parseFloat(value)
@@ -184,7 +210,7 @@ function propertiesOf(el: SvgElementLike): Properties {
 
 /** What an element passes on to its children: inherited paint, and the transforms above it. */
 interface Context {
-  fill: string | null
+  fill: Fill
   fillRule: FillRule
   stroke: string | null
   strokeWidth: number
@@ -209,6 +235,7 @@ function contextOf(
   el: SvgElementLike,
   parent: Context,
   prop: Properties,
+  gradients: ReadonlyMap<string, SvgElementLike>,
   ownTransform = true,
 ): Context {
   const colorValue = prop('color')
@@ -217,7 +244,7 @@ function contextOf(
       ? null
       : parseColor(colorValue)
   const color = parsedColor?.hex ?? parent.color
-  const fill = parsePaint(prop('fill'), color)
+  const fill = parseFill(prop('fill'), color, gradients)
   const stroke = parsePaint(prop('stroke'), color)
   const strokeWidth = parseLength(prop('stroke-width'))
   const fillRule = prop('fill-rule')
@@ -303,22 +330,100 @@ function viewportTransform(root: SvgElementLike): string | null {
   return `matrix(${sx} 0 0 ${sy} ${tx - minX * sx} ${ty - minY * sy})`
 }
 
-/** How much the transforms scale areas, as a factor for lengths such as outline widths. */
-function lengthScale(transforms: readonly string[]): number {
-  if (transforms.length === 0) return 1
+/** An affine map as SVG's matrix(a b c d e f): x' = a x + c y + e, y' = b x + d y + f. */
+type Matrix = [a: number, b: number, c: number, d: number, e: number, f: number]
+
+const IDENTITY_MATRIX: Matrix = [1, 0, 0, 1, 0, 0]
+
+/** The transforms (svgpath transform strings, applied in order) as one matrix. */
+function matrixOf(transforms: readonly string[]): Matrix {
+  if (transforms.length === 0) return IDENTITY_MATRIX
   let frame = svgpath('M 0 0 L 1 0 M 0 0 L 0 1')
   for (const t of transforms) frame = frame.transform(t)
   const points: Xy[] = []
   frame.iterate((segment) => {
     if (segment[0] === 'M' || segment[0] === 'L') points.push([segment[1], segment[2]])
   })
-  if (points.length < 4) return 1
+  if (points.length < 4) return IDENTITY_MATRIX
   const [origin, x, , y] = points
-  const det = (x[0] - origin[0]) * (y[1] - origin[1]) - (x[1] - origin[1]) * (y[0] - origin[0])
-  return Math.sqrt(Math.abs(det))
+  return [x[0] - origin[0], x[1] - origin[1], y[0] - origin[0], y[1] - origin[1], ...origin]
+}
+
+const mapPoint = ([a, b, c, d, e, f]: Matrix, [x, y]: Xy): Xy => [
+  a * x + c * y + e,
+  b * x + d * y + f,
+]
+const determinant = ([a, b, c, d]: Matrix) => a * d - b * c
+
+/** How much the transforms scale areas, as a factor for lengths such as outline widths. */
+function lengthScale(transforms: readonly string[]): number {
+  return transforms.length === 0 ? 1 : Math.sqrt(Math.abs(determinant(matrixOf(transforms))))
 }
 
 const length = (el: SvgElementLike, name: string) => parseLength(el.getAttribute(name))
+
+const isSvg = (el: SvgElementLike) => el.namespaceURI === SVG_NS
+
+/** Every gradient in the tree by its id, wherever it is: in <defs> or not. */
+function gradientsIn(root: SvgElementLike): Map<string, SvgElementLike> {
+  const found = new Map<string, SvgElementLike>()
+  const walk = (el: SvgElementLike) => {
+    for (const child of Array.from(el.children)) {
+      if (!isSvg(child)) continue
+      const id = child.getAttribute('id')?.trim()
+      if (GRADIENTS.has(child.localName) && id && !found.has(id)) found.set(id, child)
+      walk(child)
+    }
+  }
+  walk(root)
+  return found
+}
+
+/** A number or a percentage as a fraction: "50%" and "0.5" are both 0.5. */
+function fraction(value: string | null | undefined): number | null {
+  if (value == null) return null
+  const v = value.trim()
+  const n = v.endsWith('%') ? parseFloat(v) / 100 : parseFloat(v)
+  return Number.isFinite(n) ? n : null
+}
+
+/**
+ * A gradient's stops, their offsets within 0..1 and never below an earlier stop's, as SVG reads
+ * them. A stop color's alpha goes into its opacity; a color that can't be read is black.
+ */
+function stopsOf(gradient: SvgElementLike): Stop[] {
+  let last = 0
+  const stops: Stop[] = []
+  for (const child of Array.from(gradient.children)) {
+    if (!isSvg(child) || child.localName !== 'stop') continue
+    const prop = propertiesOf(child)
+    const offset = Math.max(
+      last,
+      Math.min(1, Math.max(0, fraction(child.getAttribute('offset')) ?? 0)),
+    )
+    last = offset
+    const value = prop('stop-color') ?? '#000000'
+    const parsed = parseColor(/^currentcolor$/i.test(value) ? (prop('color') ?? '#000000') : value)
+    stops.push({
+      offset,
+      color: parsed?.hex ?? '#000000',
+      opacity: parseOpacity(prop('stop-opacity')) * (parsed?.alpha ?? 1),
+    })
+  }
+  return stops
+}
+
+/** A gradient and the ones it takes attributes and stops from through href, nearest first. */
+function chainOf(id: string, gradients: ReadonlyMap<string, SvgElementLike>): SvgElementLike[] {
+  const chain: SvgElementLike[] = []
+  let next = gradients.get(id)
+  while (next && !chain.includes(next) && chain.length < 16) {
+    chain.push(next)
+    const href = (next.getAttribute('href') ?? next.getAttribute('xlink:href'))?.trim()
+    next = href?.startsWith('#') ? gradients.get(href.slice(1)) : undefined
+  }
+  return chain
+}
 
 /** A rectangle's outline from its top-left corner, clockwise, with quarter-ellipse corners. */
 function rectData(x: number, y: number, w: number, h: number, rx: number, ry: number): string {
@@ -538,6 +643,7 @@ export function contourAnchors({ start, segments, closed }: Contour): Anchor[] |
 }
 
 const round3 = (n: number) => Math.round(n * 1000) / 1000 || 0
+const round6 = (n: number) => Math.round(n * 1e6) / 1e6 || 0
 
 /**
  * Places the import on the page: when it is larger, scaled down to fit and centered; when it lies
@@ -603,9 +709,13 @@ export function importSvgElement(
   const nodes = new Map<NodeId, VectorNode>()
   let skipped = 0
 
+  const gradients = gradientsIn(root)
+
   const skipAll = (el: SvgElementLike) => {
     for (const child of Array.from(el.children)) {
-      if (child.namespaceURI === SVG_NS && !DESCRIPTIVE.has(child.localName)) skipped += 1
+      if (isSvg(child) && !DESCRIPTIVE.has(child.localName) && !GRADIENTS.has(child.localName)) {
+        skipped += 1
+      }
     }
   }
 
@@ -616,6 +726,107 @@ export function importSvgElement(
     for (const child of children) child.parentId = group.id
     nodes.set(group.id, group)
     return group
+  }
+
+  // What percentages in userSpaceOnUse gradients are of: the viewBox, or else the svg's size.
+  const viewBox = viewBoxOf(root)
+  const viewWidth = viewBox?.[2] ?? parseLength(root.getAttribute('width')) ?? area.width
+  const viewHeight = viewBox?.[3] ?? parseLength(root.getAttribute('height')) ?? area.height
+
+  /**
+   * A gradient fill laid out on a new path node, in units of the node's fill box. The gradient's
+   * coordinates go through its gradientTransform, the shape's own box for objectBoundingBox and
+   * the transforms the path's anchors were baked with. A linear gradient maps exactly under any
+   * of them: its start is mapped, and its direction goes through the inverse transpose, so its
+   * color bands keep their angle. A radial gradient's radius scales by √|det|, and one whose
+   * gradientTransform turns or skews it is painted with its first stop instead. No stops is no
+   * fill and one stop a solid fill; the focal point and spreadMethod aren't read.
+   */
+  const gradientFill = (
+    ref: GradientRef,
+    own: string,
+    ctx: Context,
+    node: PathNode,
+  ): Paint | null => {
+    const chain = chainOf(ref.gradient, gradients)
+    if (chain.length === 0) return ref.fallback === null ? null : solid(ref.fallback)
+    const stops = chain.map(stopsOf).find((list) => list.length > 0) ?? []
+    if (stops.length === 0) return null
+    const firstStop = solid(stops[0].color)
+    const lastStop = solid(stops[stops.length - 1].color)
+    if (stops.length === 1) return firstStop
+    const linear = chain[0].localName === 'linearGradient'
+    const tag = chain[0].localName
+    // An attribute from the nearest gradient that has it; geometry only from gradients of a kind.
+    const attr = (name: string, only?: string) =>
+      chain
+        .filter((g) => only === undefined || g.localName === only)
+        .map((g) => g.getAttribute(name))
+        .find((v) => v !== null)
+        ?.trim() ?? null
+    const userSpace = attr('gradientUnits') === 'userSpaceOnUse'
+    const gradientTransform = attr('gradientTransform')
+    const transforms: string[] = gradientTransform ? [gradientTransform] : []
+    if (!userSpace) {
+      const shape = unionBoxes(
+        contoursOf(own).map(({ start, segments }) =>
+          unionBoxes([pointsBox([start]), ...segments.map(cubicBox)]),
+        ),
+      )
+      const w = shape ? shape.maxX - shape.minX : 0
+      const h = shape ? shape.maxY - shape.minY : 0
+      // SVG leaves out a bounding-box gradient on a shape without width or height.
+      if (!shape || w <= 0 || h <= 0) return firstStop
+      transforms.push(`matrix(${w} 0 0 ${h} ${shape.minX} ${shape.minY})`)
+    }
+    const m = matrixOf([...transforms, ...ctx.transforms])
+    const det = determinant(m)
+    const box = fillBox(node)
+    if (!(Math.abs(det) > 1e-12) || !box) return firstStop
+
+    const coord = (name: string, fallback: string, size: number) => {
+      const raw = attr(name, tag) ?? fallback
+      if (raw.endsWith('%')) return (parseFloat(raw) / 100) * (userSpace ? size : 1)
+      return (userSpace ? parseLength(raw) : fraction(raw)) ?? 0
+    }
+    // From the shape's coordinates, which the anchors were made in, to the node's box units.
+    const inBox = ([x, y]: Xy): Xy => {
+      const [u, v] = toBoxUnits(box, [x - node.transform.x, y - node.transform.y])
+      return [round6(u), round6(v)]
+    }
+
+    if (linear) {
+      const start: Xy = [coord('x1', '0%', viewWidth), coord('y1', '0%', viewHeight)]
+      const end: Xy = [coord('x2', '100%', viewWidth), coord('y2', '0%', viewHeight)]
+      const v: Xy = [end[0] - start[0], end[1] - start[1]]
+      const length2 = v[0] * v[0] + v[1] * v[1]
+      // A gradient without length is painted with its last stop.
+      if (!(length2 > 0)) return lastStop
+      const [a, b, c, d] = m
+      // The direction the colors change along, mapped by the inverse transpose.
+      const u: Xy = [(d * v[0] - b * v[1]) / det, (a * v[1] - c * v[0]) / det]
+      const k = length2 / (u[0] * u[0] + u[1] * u[1])
+      const [sx, sy] = mapPoint(m, start)
+      return {
+        kind: 'linear',
+        stops,
+        start: inBox([sx, sy]),
+        end: inBox([sx + u[0] * k, sy + u[1] * k]),
+      }
+    }
+    if (gradientTransform) {
+      const [, b, c] = matrixOf([gradientTransform])
+      if (Math.abs(b) > 1e-9 || Math.abs(c) > 1e-9) return firstStop
+    }
+    const center: Xy = [coord('cx', '50%', viewWidth), coord('cy', '50%', viewHeight)]
+    const r = coord('r', '50%', Math.hypot(viewWidth, viewHeight) / Math.SQRT2)
+    if (!(r > 0)) return lastStop
+    return {
+      kind: 'radial',
+      stops,
+      center: inBox(mapPoint(m, center)),
+      radius: round6((r * Math.sqrt(Math.abs(det))) / radiusUnit(box)),
+    }
   }
 
   /** The shape as a path node of its subpaths, in canvas units; none when it draws nothing. */
@@ -634,8 +845,19 @@ export function importSvgElement(
       return anchors ? [{ anchors, closed: contour.closed }] : []
     })
     if (contours.length === 0) return []
-    const style = { fill: fill === null ? null : solid(fill), stroke, strokeWidth, opacity: 1 }
-    return [createPathFromContours(contours, style, ctx.fillRule)]
+    const node = createPathFromContours(
+      contours,
+      { fill: null, stroke, strokeWidth, opacity: 1 },
+      ctx.fillRule,
+    )
+    node.style.fill =
+      fill === null
+        ? null
+        : typeof fill === 'string'
+          ? solid(fill)
+          : gradientFill(fill, d, ctx, node)
+    if (node.style.fill === null && stroke === null) return []
+    return [node]
   }
 
   /** The nodes an element makes, for its parent to adopt. */
@@ -646,6 +868,7 @@ export function importSvgElement(
       skipAll(el)
       return []
     }
+    if (GRADIENTS.has(el.localName)) return []
     const isGroup = el.localName === 'g'
     if (!isGroup && !SHAPES.has(el.localName)) {
       skipped += 1
@@ -653,7 +876,7 @@ export function importSvgElement(
     }
     const prop = propertiesOf(el)
     if (prop('display') === 'none') return []
-    const ctx = contextOf(el, parent, prop)
+    const ctx = contextOf(el, parent, prop, gradients)
     const opacity = parseOpacity(prop('opacity'))
     const made: VectorNode[] = isGroup
       ? Array.from(el.children).flatMap((child) => visit(child, ctx))
@@ -674,7 +897,7 @@ export function importSvgElement(
   const rootProps = propertiesOf(root)
   const viewport = viewportTransform(root)
   const base: Context = { ...INITIAL_CONTEXT, transforms: viewport ? [viewport] : [] }
-  const ctx = contextOf(root, base, rootProps, false)
+  const ctx = contextOf(root, base, rootProps, gradients, false)
   const children = Array.from(root.children)
   // A background can only be the first thing drawn.
   const first = children.find(

@@ -13,10 +13,10 @@ import {
 } from '../../store/editorStore'
 import { arrowHeadSize } from '../geometry/bounds'
 import { corner } from '../geometry/pathData'
-import { firstBaseline } from '../geometry/textLayout'
+import { firstBaseline, textHeight } from '../geometry/textLayout'
 import { solid } from '../paint/paint'
 import { strokeToPath } from '../strokePath'
-import { emptyDoc, newPage, type Doc, type VectorNode } from '../../types'
+import { emptyDoc, newPage, type Doc, type Paint, type VectorNode } from '../../types'
 import { exportSvg, transformAttr } from './exportSvg'
 
 /** A doc holding the nodes; nodes with a parent go into that group's childIds by the caller. */
@@ -76,6 +76,53 @@ describe('exportSvg', () => {
     expect(elements(svg, 'path')[0].trim()).toBe(
       '<path d="M 0 0 C 0 0 80 30 100 0 C 100 0 0 0 0 0 Z" fill="none" stroke="#22c55e" stroke-width="6" stroke-linejoin="miter" stroke-linecap="round" stroke-miterlimit="10"/>',
     )
+  })
+
+  it('writes gradient fills into <defs>, in the pixels of each element’s own coordinates', () => {
+    const stops = [
+      { offset: 1, color: '#3b82f6', opacity: 0.5 },
+      { offset: 0, color: '#ef4444', opacity: 1 },
+    ]
+    const linear: Paint = { kind: 'linear', stops, start: [0, 0.5], end: [1, 0.5] }
+    const radial: Paint = { kind: 'radial', stops, center: [0.5, 0.5], radius: 0.5 }
+    const filled = { ...DEFAULT_SHAPE_STYLE, stroke: null }
+    const rect = createRectNode(box, { ...filled, fill: linear }, 'r')
+    const twin = createRectNode({ ...box, x: 400 }, { ...filled, fill: linear }, 'twin')
+    const ellipse = createEllipseNode(box, { ...filled, fill: radial }, 'e')
+    const flat = createRectNode(box, { ...filled, fill: { ...linear, end: [0, 0.5] } }, 'flat')
+    const text = {
+      ...createTextNode(0, 0, 300, DEFAULT_TEXT_STYLE, 'Hi', 't'),
+      style: { ...filled, fill: radial },
+    }
+    const doc = docOf(rect, twin, ellipse, flat, text)
+    doc.pages[0].background = radial
+    const svg = exportSvg(doc)
+
+    const stopsSvg =
+      '<stop offset="0" stop-color="#ef4444"/><stop offset="1" stop-color="#3b82f6" stop-opacity="0.5"/>'
+    const defs = svg.slice(svg.indexOf('<defs>'), svg.indexOf('</defs>'))
+    // userSpaceOnUse, as Konva lays them out: objectBoundingBox would stretch a radial one.
+    expect(
+      defs
+        .split('\n')
+        .slice(1, -1)
+        .map((line) => line.trim()),
+    ).toEqual([
+      `<radialGradient id="gradient-1" gradientUnits="userSpaceOnUse" cx="800" cy="500" r="800">${stopsSvg}</radialGradient>`,
+      `<linearGradient id="gradient-2" gradientUnits="userSpaceOnUse" x1="0" y1="40" x2="200" y2="40">${stopsSvg}</linearGradient>`,
+      `<radialGradient id="gradient-3" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="100">${stopsSvg}</radialGradient>`,
+      `<radialGradient id="gradient-4" gradientUnits="userSpaceOnUse" cx="150" cy="${Math.round(textHeight(text) * 500) / 1000}" r="150">${stopsSvg}</radialGradient>`,
+    ])
+    expect(elements(svg, 'rect').map((line) => line.trim())).toEqual([
+      '<rect width="1600" height="1000" fill="url(#gradient-1)"/>',
+      '<rect transform="translate(100 50)" width="200" height="80" fill="url(#gradient-2)"/>',
+      // The same gradient on the same box is written once.
+      '<rect transform="translate(400 50)" width="200" height="80" fill="url(#gradient-2)"/>',
+      // Without extent, the last stop, as on the canvas.
+      '<rect transform="translate(100 50)" width="200" height="80" fill="#3b82f6" fill-opacity="0.5"/>',
+    ])
+    expect(elements(svg, 'ellipse')[0]).toContain('fill="url(#gradient-3)"')
+    expect(elements(svg, 'text')[0]).toContain('fill="url(#gradient-4)"')
   })
 
   it('writes the page asked for, at its own size and background', () => {

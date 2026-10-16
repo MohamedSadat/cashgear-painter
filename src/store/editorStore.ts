@@ -184,6 +184,7 @@ export interface EditorState {
   addNodes(nodes: VectorNode[], parentId?: NodeId): void
   replaceDoc(doc: Doc): void
   updateNodes(patch: Record<NodeId, Partial<VectorNode>>, mergeKey?: string): void
+  setFill(fills: Record<NodeId, Paint | null>, mergeKey?: string): void
   deleteNodes(ids: NodeId[]): void
   splitStrokes(cuts: Record<NodeId, Point[][]>): void
   reorder(ids: NodeId[], where: ZOrder): void
@@ -893,6 +894,18 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       }
       if (mergeKey === undefined) commit(recipe)
       else commitMerging(mergeKey, recipe)
+    },
+
+    // Fills compare by value, so a paint equal to the one a node has records nothing.
+    setFill(fills, mergeKey) {
+      const { nodes } = get().doc
+      const patch: Record<NodeId, Partial<VectorNode>> = {}
+      for (const [id, fill] of Object.entries(fills)) {
+        const node = nodes[id]
+        if (node && !samePaint(node.style.fill, fill))
+          patch[id] = { style: { ...node.style, fill } }
+      }
+      if (Object.keys(patch).length > 0) get().updateNodes(patch, mergeKey)
     },
 
     deleteNodes(ids) {

@@ -713,7 +713,7 @@ test('the properties panel shows mixed values and restyles a whole selection as 
 
   await page.keyboard.press('Control+a')
   await expect(page.getByRole('heading', { name: '2 objects' })).toBeVisible()
-  const fill = page.getByRole('group', { name: 'Fill' })
+  const fill = page.getByRole('group', { name: 'Fill', exact: true })
   await expect(fill).toContainText('Mixed')
   await page.getByRole('button', { name: 'Fill #22c55e' }).click()
   await expect(fill).not.toContainText('Mixed')
@@ -831,7 +831,7 @@ test.describe('on a 375 px phone', () => {
       { tool: 'Line', from: [0.1, 0.8], to: [0.6, 0.8], color: 'Stroke #22c55e' },
     ] satisfies { tool: string; from: Xy; to: Xy; color: string }[]
     for (const { tool, from, to, color } of shapes) {
-      await page.getByRole('button', { name: tool }).tap()
+      await page.getByRole('button', { name: tool, exact: true }).tap()
       const box = await artboardBox(page)
       await touchDrag(page, onArtboard(box, from), onArtboard(box, to))
       await expect(page.getByRole('button', { name: 'Select', exact: true })).toHaveAttribute(
@@ -2377,4 +2377,241 @@ test('the X, Y, W, H and rotation fields follow drags live and apply typed math,
   await expect.poll(shown).toEqual(resized)
   for (let i = 0; i < 2; i++) await undo.click()
   await expect.poll(shown).toEqual(start)
+})
+
+type ShownFill = {
+  priority: string
+  color?: string
+  start?: Xy
+  end?: Xy
+  center?: Xy
+  radius?: number
+  stops?: (string | number)[]
+}
+
+/** How Konva fills a shape on the content layer: its color, or its gradient in local pixels. */
+function shownFill(page: Page, index = 0): Promise<ShownFill> {
+  return page.evaluate((index) => {
+    const shape = (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+      .getLayers()[1]
+      .getChildren()[index] as Konva.Shape
+    const xy = ({ x, y }: { x: number; y: number }): Xy => [x, y]
+    const priority = shape.fillPriority()
+    if (priority === 'linear-gradient') {
+      return {
+        priority,
+        start: xy(shape.fillLinearGradientStartPoint()),
+        end: xy(shape.fillLinearGradientEndPoint()),
+        stops: shape.fillLinearGradientColorStops(),
+      }
+    }
+    if (priority === 'radial-gradient') {
+      return {
+        priority,
+        center: xy(shape.fillRadialGradientEndPoint()),
+        radius: shape.fillRadialGradientEndRadius(),
+        stops: shape.fillRadialGradientColorStops(),
+      }
+    }
+    return { priority, color: String(shape.fill()) }
+  }, index)
+}
+
+/** Drags the mouse between two page points in small steps; Shift is held when asked. */
+async function dragWith(page: Page, from: Xy, to: Xy, shift = false) {
+  if (shift) await page.keyboard.down('Shift')
+  await drag(page, from, to, 10)
+  if (shift) await page.keyboard.up('Shift')
+}
+
+test('a gradient set from the panel drags by its handles and stops, one undo step each', async ({
+  page,
+}) => {
+  await drawRectOnCanvas(page, [200, 200], [600, 400])
+  const [rect] = await shownRects(page)
+  const { width: w, height: h } = rect
+  const fillType = page.getByRole('group', { name: 'Fill type' })
+  const steps: ShownFill[] = [await shownFill(page)]
+  const step = async (check: (fill: ShownFill) => void) => {
+    await expect.poll(() => shownFill(page)).not.toEqual(steps.at(-1))
+    const fill = await shownFill(page)
+    check(fill)
+    steps.push(fill)
+  }
+
+  // Linear, from the outline's black to white, left to right across the middle.
+  await fillType.getByRole('button', { name: 'Linear', exact: true }).click()
+  await expect(fillType.getByRole('button', { name: 'Linear', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  await step((fill) => {
+    expect(fill).toMatchObject({ priority: 'linear-gradient', stops: [0, '#000000', 1, '#ffffff'] })
+    expect(fill.start![0]).toBeCloseTo(0, 6)
+    expect(fill.start![1]).toBeCloseTo(h / 2, 6)
+    expect(fill.end![0]).toBeCloseTo(w, 6)
+  })
+
+  // The end handle drags to the bottom-right corner.
+  await dragWith(
+    page,
+    await overlayPointOf(page, 'gradient-end'),
+    await screenOf(page, [rect.x + w, rect.y + h]),
+  )
+  // The mouse moves in whole screen pixels.
+  const zoom = await zoomOf(page)
+  await step((fill) => {
+    expect(Math.abs(fill.end![0] - w)).toBeLessThan(1 / zoom)
+    expect(Math.abs(fill.end![1] - h)).toBeLessThan(1 / zoom)
+  })
+
+  // With Shift, the start turns about the end in 45° steps: nearly level snaps level.
+  await dragWith(
+    page,
+    await overlayPointOf(page, 'gradient-start'),
+    await screenOf(page, [rect.x + w * 0.25, rect.y + h * 0.95]),
+    true,
+  )
+  await step((fill) => {
+    expect(fill.start![1]).toBeCloseTo(fill.end![1], 6)
+    expect(fill.start![0]).toBeLessThan(w / 2)
+  })
+
+  // A click on the stop bar adds a stop there in the color the gradient has; it takes a swatch.
+  await page.getByTitle('Click to add a stop').click()
+  await expect(page.getByRole('slider', { name: 'Stop 3' })).toHaveAttribute('aria-valuenow', '50')
+  await step((fill) => expect(fill.stops).toEqual([0, '#000000', 0.5, '#808080', 1, '#ffffff']))
+  await page.getByRole('button', { name: 'Stop #22c55e' }).click()
+  await step((fill) => expect(fill.stops).toEqual([0, '#000000', 0.5, '#22c55e', 1, '#ffffff']))
+
+  // Dragging its marker moves it along the gradient, as one step.
+  const marker = page.getByRole('slider', { name: 'Stop 3' })
+  const box = (await marker.boundingBox())!
+  const markerAt: Xy = [box.x + box.width / 2, box.y + box.height / 2]
+  await dragWith(page, markerAt, [markerAt[0] - 40, markerAt[1]])
+  await step((fill) => {
+    expect(fill.stops![2]).toBeLessThan(0.5)
+    expect(fill.stops![3]).toBe('#22c55e')
+  })
+
+  // Radial, from the middle to half the longer side; its radius handle drags outward.
+  await fillType.getByRole('button', { name: 'Radial', exact: true }).click()
+  await step((fill) => {
+    expect(fill.priority).toBe('radial-gradient')
+    expect(fill.center![0]).toBeCloseTo(w / 2, 6)
+    expect(fill.radius).toBeCloseTo(Math.max(w, h) / 2, 6)
+  })
+  const radiusAt = await overlayPointOf(page, 'gradient-radius')
+  await dragWith(page, radiusAt, [radiusAt[0] + 60, radiusAt[1]])
+  await step((fill) => {
+    expect(Math.abs(fill.radius! - (Math.max(w, h) / 2 + 60 / zoom))).toBeLessThan(1 / zoom)
+  })
+
+  // Saved with the drawing, in box units.
+  await expect
+    .poll(async () => (await savedNodes(page))[0] as unknown)
+    .toMatchObject({ style: { fill: { kind: 'radial', center: [0.5, 0.5] } } })
+
+  // Each was one undo step.
+  const undo = page.getByRole('button', { name: 'Undo' })
+  for (let i = steps.length - 2; i >= 0; i--) {
+    await undo.click()
+    await expect.poll(() => shownFill(page)).toEqual(steps[i])
+  }
+})
+
+test('gradients on a rectangle, a circle, a path and text match on the canvas, in the PNG and in the SVG', async ({
+  page,
+}) => {
+  const fillType = page.getByRole('group', { name: 'Fill type' })
+  const pick = async (kind: 'Linear' | 'Radial') => {
+    await fillType.getByRole('button', { name: kind, exact: true }).click()
+    await expect(fillType.getByRole('button', { name: kind, exact: true })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+  }
+
+  // A rectangle from red to white, left to right.
+  await drawRectOnCanvas(page, [100, 100], [500, 300])
+  await pick('Linear')
+  await page.getByRole('button', { name: 'Stop #ef4444' }).click()
+  // A circle from black in the middle to blue.
+  await page.keyboard.press('o')
+  await page.keyboard.down('Shift')
+  await drag(page, await screenOf(page, [700, 100]), await screenOf(page, [950, 350]))
+  await page.keyboard.up('Shift')
+  await pick('Radial')
+  await page.getByRole('slider', { name: 'Stop 2' }).click()
+  await page.getByRole('button', { name: 'Stop #3b82f6' }).click()
+  // A pen triangle, linear, turned by its end handle.
+  await page.keyboard.press('p')
+  await page.mouse.click(...(await screenOf(page, [1100, 350])))
+  await page.mouse.click(...(await screenOf(page, [1450, 120])))
+  await page.mouse.click(...(await screenOf(page, [1500, 420])))
+  await page.mouse.click(...(await screenOf(page, [1100, 350])))
+  await pick('Linear')
+  await dragWith(
+    page,
+    await overlayPointOf(page, 'gradient-end'),
+    await screenOf(page, [1450, 400]),
+  )
+  // A big text, radial.
+  await page.keyboard.press('t')
+  await page.mouse.click(...(await screenOf(page, [300, 600])))
+  await page.keyboard.type('Gradient')
+  await page.keyboard.press('Control+Enter')
+  await page.getByRole('slider', { name: 'Font size' }).focus()
+  await page.keyboard.press('End')
+  await page
+    .getByRole('group', { name: 'Color type' })
+    .getByRole('button', { name: 'Radial', exact: true })
+    .click()
+  await expect.poll(() => shownFill(page, 3)).toMatchObject({ priority: 'radial-gradient' })
+  // And the page's background, linear, from nothing selected.
+  await page.keyboard.press('Escape')
+  await page.keyboard.press('Escape')
+  await page
+    .getByRole('group', { name: 'Background type' })
+    .getByRole('button', { name: 'Linear', exact: true })
+    .click()
+  expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse', 'Path', 'Text'])
+
+  // The PNG has the canvas's gradient: red fading to white across the rectangle.
+  const { png, values } = await exportPixels(page, [
+    [2 * 140, 2 * 200],
+    [2 * 460, 2 * 200],
+  ])
+  for (const [pixel, f] of [
+    [values[0], 0.1],
+    [values[1], 0.9],
+  ] as const) {
+    const expected = [239 + 16 * f, 68 + 187 * f, 68 + 187 * f]
+    pixel.slice(0, 3).forEach((c, i) => expect(Math.abs(c - expected[i])).toBeLessThan(8))
+  }
+
+  // Drawn by Chrome's SVG renderer, the export looks like the canvas.
+  const { text: svg } = await downloadFromFileMenu(page, 'Export SVG')
+  expect(svg.match(/<linearGradient /g)).toHaveLength(3)
+  expect(svg.match(/<radialGradient /g)).toHaveLength(2)
+  expect(svg).toContain('gradientUnits="userSpaceOnUse"')
+  const { some, far } = await svgAgainstPng(page, svg, png)
+  expect(far).toBeLessThan(200)
+  expect(some).toBeLessThan(3200 * 2000 * 0.002)
+
+  // Imported back, the shapes keep their gradients (the text is skipped) and lie over the drawing.
+  await chooseFromFileMenu(page, 'Import SVG', 'drawing.svg', svg)
+  await expect(page.getByRole('status')).toContainText('Skipped 1 unsupported element')
+  const kinds = await page.evaluate(() =>
+    (
+      (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+        .getLayers()[1]
+        .getChildren()[4] as Konva.Group
+    )
+      .getChildren()
+      .map((n) => (n as Konva.Shape).fillPriority()),
+  )
+  expect(kinds).toEqual(['linear-gradient', 'radial-gradient', 'linear-gradient'])
+  const again = await exportPixels(page, [])
+  expect((await svgAgainstPng(page, svg, again.png)).far).toBeLessThan(200)
 })

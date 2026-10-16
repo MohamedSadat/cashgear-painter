@@ -34,7 +34,7 @@ import type { AlignEdge, Axis } from '../lib/align/align'
 import type { AnchorKind } from '../lib/geometry/pathData'
 import { WEB_SAFE_FONTS } from '../lib/geometry/textLayout'
 import { PAGE_PRESETS, mmToPx, presetOf, pxToMm } from '../lib/pages'
-import { paintColor, samePaint, solid } from '../lib/paint/paint'
+import { samePaint } from '../lib/paint/paint'
 import {
   MAX_FONT_SIZE,
   MAX_SIZE,
@@ -53,32 +53,12 @@ import { ungroupSelection } from '../tools/selectTool'
 import { lineStyleOf } from '../tools/shapeTools'
 import { startTextEdit } from '../tools/textTool'
 import type { NodeId, NodeOf, Page, Paint, Style, TextNode, VectorNode } from '../types'
+import { FillRow, type FillTarget } from './FillEditor'
 import { MoveToPageMenu } from './MoveToPageMenu'
+import { ColorRow, Choices, Row, SliderRow, type Choice } from './PanelRows'
+import { MIXED, shared, type Value } from './panelValues'
 import { IconButton } from './ToolRail'
 import { TransformFields } from './TransformFields'
-
-const SWATCHES = [
-  '#000000',
-  '#6b7280',
-  '#ef4444',
-  '#f97316',
-  '#eab308',
-  '#22c55e',
-  '#3b82f6',
-  '#a855f7',
-]
-
-const SELECTED_RING = 'ring-2 ring-sky-500 ring-offset-1'
-const SWATCH = 'h-6 w-6 shrink-0 rounded-full border border-black/15 sm:h-5 sm:w-5'
-
-/** Selected objects disagree on a value. */
-const MIXED = Symbol('mixed')
-type Value<T> = T | typeof MIXED
-
-/** The value every item has, or MIXED. */
-function shared<T>(values: T[]): Value<T> {
-  return values.every((v) => v === values[0]) ? values[0] : MIXED
-}
 
 const store = () => useEditorStore.getState()
 
@@ -107,135 +87,24 @@ function restyle(nodes: VectorNode[], changes: Partial<Style>, mergeKey?: string
   if (Object.keys(patch).length > 0) store().updateNodes(patch, mergeKey)
 }
 
+/** A node's fill as the fill row edits it; a new fill starts from its outline's color. */
+const fillTargetOf = (node: VectorNode): FillTarget => ({
+  fill: node.style.fill,
+  canClear: canClearColor(node),
+  fallback: node.style.stroke ?? '#000000',
+})
+
+/** Gives each node its fill, in order, as one undo step; nodes whose fill is the same are left out. */
+function refill(nodes: VectorNode[], fills: (Paint | null)[], mergeKey?: string) {
+  store().setFill(Object.fromEntries(nodes.map((node, i) => [node.id, fills[i]])), mergeKey)
+}
+
 function Header({ title, children }: { title: string; children?: ReactNode }) {
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
       <h2 className="mr-auto truncate text-sm font-semibold text-neutral-800">{title}</h2>
       {children}
     </div>
-  )
-}
-
-/** A labelled control: the label beside it on phones, above it from 640 px up. */
-function Row({ label, mixed, children }: { label: string; mixed?: boolean; children: ReactNode }) {
-  return (
-    <div
-      role="group"
-      aria-label={label}
-      className="grid grid-cols-[3.5rem_1fr] items-center gap-x-2 sm:grid-cols-1 sm:gap-y-1"
-    >
-      <div className="flex flex-col text-xs text-neutral-500 sm:flex-row sm:gap-1.5">
-        <span>{label}</span>
-        {mixed && <span className="text-amber-700">Mixed</span>}
-      </div>
-      <div className="flex min-w-0 items-center gap-1">{children}</div>
-    </div>
-  )
-}
-
-/** A fill as the color rows show it; gradients show their first stop until M18. */
-const colorOf = (fill: Paint | null) => (fill === null ? null : paintColor(fill))
-const paintOf = (color: string | null) => (color === null ? null : solid(color))
-
-const asHex = (value: Value<string | null>) =>
-  typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value : '#000000'
-
-interface ColorRowProps {
-  label: string
-  value: Value<string | null>
-  allowNone: boolean
-  // The custom picker reports every color it passes through, under one merge key.
-  onPick(color: string | null, mergeKey?: string): void
-}
-
-function ColorRow({ label, value, allowNone, onPick }: ColorRowProps) {
-  const name = label.toLowerCase()
-  const isCustom = typeof value === 'string' && !SWATCHES.includes(value)
-  return (
-    <Row label={label} mixed={value === MIXED}>
-      <div className="flex flex-wrap items-center gap-1">
-        {allowNone && (
-          <button
-            type="button"
-            aria-label={`No ${name}`}
-            aria-pressed={value === null}
-            title={`No ${name}`}
-            onClick={() => onPick(null)}
-            className={`${SWATCH} bg-white bg-[linear-gradient(to_top_right,transparent_44%,#ef4444_44%,#ef4444_56%,transparent_56%)] ${value === null ? SELECTED_RING : ''}`}
-          />
-        )}
-        {SWATCHES.map((swatch) => (
-          <button
-            key={swatch}
-            type="button"
-            aria-label={`${label} ${swatch}`}
-            aria-pressed={value === swatch}
-            title={swatch}
-            onClick={() => onPick(swatch)}
-            className={`${SWATCH} ${value === swatch ? SELECTED_RING : ''}`}
-            style={{ backgroundColor: swatch }}
-          />
-        ))}
-        <label
-          title={`Custom ${name}`}
-          className={`relative cursor-pointer ${SWATCH} ${isCustom ? SELECTED_RING : ''}`}
-          style={{
-            background: isCustom
-              ? value
-              : 'conic-gradient(#ef4444, #eab308, #22c55e, #06b6d4, #3b82f6, #a855f7, #ef4444)',
-          }}
-        >
-          <input
-            type="color"
-            aria-label={`Custom ${name}`}
-            value={asHex(value)}
-            onChange={(e) => onPick(e.target.value, name)}
-            className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
-          />
-        </label>
-      </div>
-    </Row>
-  )
-}
-
-interface SliderRowProps {
-  label: string
-  ariaLabel: string
-  min: number
-  max: number
-  value: Value<number>
-  format?(n: number): string
-  disabled?: boolean
-  onChange(n: number): void
-}
-
-function SliderRow({
-  label,
-  ariaLabel,
-  min,
-  max,
-  value,
-  format = String,
-  disabled,
-  onChange,
-}: SliderRowProps) {
-  const position = value === MIXED ? min : Math.min(max, Math.max(min, value))
-  return (
-    <Row label={label}>
-      <input
-        type="range"
-        aria-label={ariaLabel}
-        min={min}
-        max={max}
-        value={position}
-        disabled={disabled}
-        onChange={(e) => onChange(Number(e.target.value))}
-        className="min-w-0 flex-1 accent-sky-600 disabled:opacity-35"
-      />
-      <span className="w-11 shrink-0 text-right text-xs text-neutral-600 tabular-nums">
-        {value === MIXED ? 'Mixed' : format(value)}
-      </span>
-    </Row>
   )
 }
 
@@ -330,43 +199,6 @@ function AlignRows({ count }: { count: number }) {
         ))}
       </Row>
     </>
-  )
-}
-
-interface Choice<T extends string> {
-  value: T
-  label: string
-  title: string
-}
-
-interface ChoicesProps<T extends string> {
-  label: string
-  options: Choice<T>[]
-  value: T
-  onPick(value: T): void
-}
-
-/** Buttons for one of a few options, the current one pressed, such as an anchor's kind. */
-function Choices<T extends string>({ label, options, value, onPick }: ChoicesProps<T>) {
-  return (
-    <div role="group" aria-label={label} className="flex items-center gap-0.5">
-      {options.map((option) => (
-        <button
-          key={option.value}
-          type="button"
-          aria-pressed={value === option.value}
-          title={option.title}
-          onClick={() => onPick(option.value)}
-          className={`h-8 rounded-md px-2 text-xs transition-colors ${
-            value === option.value
-              ? 'bg-sky-100 text-sky-700'
-              : 'text-neutral-700 hover:bg-neutral-100'
-          }`}
-        >
-          {option.label}
-        </button>
-      ))}
-    </div>
   )
 }
 
@@ -639,13 +471,11 @@ function PageRows({ page }: { page: Page }) {
         />
         Scale content with the page
       </label>
-      <ColorRow
+      <FillRow
         label="Background"
-        value={paintColor(page.background)}
-        allowNone={false}
-        onPick={(color, mergeKey) => {
-          if (color === null) return
-          store().updatePage(page.id, { background: solid(color) }, mergeKey && 'page-background')
+        targets={[{ fill: page.background, canClear: false, fallback: '#ffffff' }]}
+        onApply={([background], mergeKey) => {
+          if (background) store().updatePage(page.id, { background }, mergeKey)
         }}
       />
     </>
@@ -784,17 +614,10 @@ function SelectionProperties() {
       <AlignRows count={outermost(doc, selection).length} />
       {direct && <AnchorRow />}
       {filled.length > 0 && (
-        <ColorRow
+        <FillRow
           label={colorOnly ? 'Color' : 'Fill'}
-          value={shared(filled.map((n) => colorOf(n.style.fill)))}
-          allowNone={filled.some(canClearColor)}
-          onPick={(fill, mergeKey) =>
-            restyle(
-              fill === null ? filled.filter(canClearColor) : filled,
-              { fill: paintOf(fill) },
-              mergeKey,
-            )
-          }
+          targets={filled.map(fillTargetOf)}
+          onApply={(fills, mergeKey) => refill(filled, fills, mergeKey)}
         />
       )}
       {outlined.length > 0 && (
@@ -987,11 +810,10 @@ function ShapeDefaults({ tool }: { tool: keyof typeof SHAPE_TITLES }) {
         )}
       </Header>
       {!isLine && (
-        <ColorRow
+        <FillRow
           label="Fill"
-          value={colorOf(style.fill)}
-          allowNone
-          onPick={(fill) => setShapeStyle({ fill: paintOf(fill) })}
+          targets={[{ fill: style.fill, canClear: true, fallback: style.stroke ?? '#000000' }]}
+          onApply={([fill]) => setShapeStyle({ fill })}
         />
       )}
       <ColorRow

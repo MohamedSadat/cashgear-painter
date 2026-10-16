@@ -1,10 +1,11 @@
-import { arrowHeadSize } from '../geometry/bounds'
+import { arrowHeadSize, fillBox } from '../geometry/bounds'
 import { cachedPathData } from '../geometry/pathData'
 import { TEXT_LINE_HEIGHT, firstBaseline, quoteFamilies, textLines } from '../geometry/textLayout'
 import { pageById } from '../pages'
-import { paintColor } from '../paint/paint'
+import { lastStop, placeGradient, type PaintBox } from '../paint/paint'
+import { pageBox } from '../paint/toKonva'
 import { cachedStrokePath } from '../strokePath'
-import type { Doc, NodeOf, Paint, Style, TextNode, Transform, VectorNode } from '../../types'
+import type { Doc, NodeOf, Paint, Stop, TextNode, Transform, VectorNode } from '../../types'
 
 export const SVG_FILE_NAME = 'drawing.svg'
 export const SVG_NS = 'http://www.w3.org/2000/svg'
@@ -87,13 +88,65 @@ class Markers {
   }
 }
 
-/** A fill as an SVG paint; gradients are written as their first stop until M18. */
-const fillAttr = (fill: Paint | null) => (fill === null ? 'none' : paintColor(fill))
+/**
+ * Gradient fills, written into <defs> as <linearGradient> and <radialGradient>, one per distinct
+ * gradient as placed. They use userSpaceOnUse in the pixels of the element's own coordinates,
+ * which is where Konva lays them out too: objectBoundingBox would stretch a radial gradient into
+ * an ellipse on a box that isn't square.
+ */
+class Gradients {
+  private ids = new Map<string, string>()
+  readonly defs: string[] = []
+
+  /** The fill attributes for a paint laid out in `box`, the element's fill box. */
+  fill(paint: Paint | null, box: () => PaintBox | null): Attrs {
+    if (paint === null) return { fill: 'none' }
+    if (paint.kind === 'solid') return { fill: paint.color }
+    const area = box()
+    const placed = area && placeGradient(paint, area)
+    // Without extent or a box, the one color Konva paints: see toKonvaFill.
+    if (!placed) return solidStop(area ? lastStop(paint) : paint.stops[0])
+    const stops = placed.stops.map(
+      (stop) =>
+        `<stop${attrs({ offset: stop.offset, 'stop-color': stop.color, 'stop-opacity': stop.opacity < 1 ? stop.opacity : undefined })}/>`,
+    )
+    const geometry: Attrs =
+      placed.kind === 'linear'
+        ? { x1: placed.start[0], y1: placed.start[1], x2: placed.end[0], y2: placed.end[1] }
+        : { cx: placed.center[0], cy: placed.center[1], r: placed.radius }
+    const tag = placed.kind === 'linear' ? 'linearGradient' : 'radialGradient'
+    const body = `${attrs({ gradientUnits: 'userSpaceOnUse', ...geometry })}>${stops.join('')}</${tag}>`
+    let id = this.ids.get(tag + body)
+    if (id === undefined) {
+      id = `gradient-${this.ids.size + 1}`
+      this.ids.set(tag + body, id)
+      this.defs.push(`<${tag}${attrs({ id })}${body}`)
+    }
+    return { fill: `url(#${id})` }
+  }
+}
+
+/** One stop as a plain fill, its opacity as fill-opacity. */
+const solidStop = (stop: Stop): Attrs => ({
+  fill: stop.color,
+  'fill-opacity': stop.opacity < 1 ? Math.max(0, stop.opacity) : undefined,
+})
+
+/** What nodeSvg passes down: the defs it fills as it goes. */
+interface Defs {
+  markers: Markers
+  gradients: Gradients
+}
+
+/** A node's fill, laid out in its fill box. */
+const nodeFill = (node: VectorNode, defs: Defs) =>
+  defs.gradients.fill(node.style.fill, () => fillBox(node))
 
 /** Fill and outline as Konva paints them: no fill is fill="none", no outline no stroke at all. */
-function paint(style: Style): Attrs {
+function paint(node: VectorNode, defs: Defs): Attrs {
+  const { style } = node
   return {
-    fill: fillAttr(style.fill),
+    ...nodeFill(node, defs),
     stroke: style.stroke ?? undefined,
     'stroke-width': style.stroke === null ? undefined : style.strokeWidth,
   }
@@ -119,7 +172,7 @@ const ANCHORS: Record<TextNode['align'], string | undefined> = {
  * written on one line: with xml:space="preserve", whitespace between the tspans would count as
  * trailing spaces and push centered and right-aligned lines to the left.
  */
-function textSvg(node: TextNode, common: Attrs, indent: string): string {
+function textSvg(node: TextNode, common: Attrs, defs: Defs, indent: string): string {
   const x = node.align === 'center' ? node.width / 2 : node.align === 'right' ? node.width : 0
   const baseline = firstBaseline(node)
   const step = node.fontSize * TEXT_LINE_HEIGHT
@@ -129,7 +182,7 @@ function textSvg(node: TextNode, common: Attrs, indent: string): string {
   if (spans.length === 0) return ''
   const open = `<text${attrs({
     ...common,
-    fill: fillAttr(node.style.fill),
+    ...nodeFill(node, defs),
     'font-family': quoteFamilies(node.fontFamily).replaceAll('"', "'"),
     'font-size': node.fontSize,
     'font-weight': FONT_WEIGHTS[node.fontStyle],
@@ -164,13 +217,7 @@ function lineSvg(node: NodeOf<'line'>, common: Attrs, markers: Markers): string 
  * a see-through group child by child rather than as a whole, so a group's opacity is multiplied
  * into each child's instead of going on its <g>: the export looks like the screen.
  */
-function nodeSvg(
-  doc: Doc,
-  node: VectorNode,
-  fade: number,
-  markers: Markers,
-  indent: string,
-): string {
+function nodeSvg(doc: Doc, node: VectorNode, fade: number, defs: Defs, indent: string): string {
   if (node.hidden) return ''
   const opacity = node.style.opacity * fade
   const common: Attrs = { transform: transformAttr(node.transform) }
@@ -179,7 +226,7 @@ function nodeSvg(
     const children = node.childIds
       .map((id) => doc.nodes[id])
       .filter((child) => child !== undefined)
-      .map((child) => nodeSvg(doc, child, opacity, markers, `${indent}  `))
+      .map((child) => nodeSvg(doc, child, opacity, defs, `${indent}  `))
       .filter((svg) => svg !== '')
     if (children.length === 0) return ''
     return `${indent}<g${attrs(common)}>\n${children.join('\n')}\n${indent}</g>`
@@ -189,7 +236,7 @@ function nodeSvg(
   switch (node.type) {
     case 'stroke':
       // The outline is a fill, as on the canvas.
-      return `${indent}<path${attrs({ ...common, d: cachedStrokePath(node), fill: fillAttr(node.style.fill) })}/>`
+      return `${indent}<path${attrs({ ...common, d: cachedStrokePath(node), ...nodeFill(node, defs) })}/>`
     case 'rect': {
       // Konva keeps a corner radius within half the shorter side; SVG would clamp rx and ry apart.
       const r = Math.max(0, Math.min(node.cornerRadius, node.width / 2, node.height / 2))
@@ -199,20 +246,20 @@ function nodeSvg(
         height: node.height,
         rx: r > 0 ? r : undefined,
         ry: r > 0 ? r : undefined,
-        ...paint(node.style),
+        ...paint(node, defs),
       })}/>`
     }
     case 'ellipse':
-      return `${indent}<ellipse${attrs({ ...common, rx: node.rx, ry: node.ry, ...paint(node.style) })}/>`
+      return `${indent}<ellipse${attrs({ ...common, rx: node.rx, ry: node.ry, ...paint(node, defs) })}/>`
     case 'line':
-      return indent + lineSvg(node, common, markers)
+      return indent + lineSvg(node, common, defs.markers)
     case 'path': {
       // Konva draws paths with miter joins, round caps and canvas's miter limit of 10 (SVG's is 4).
       const outlined = node.style.stroke !== null
       return `${indent}<path${attrs({
         ...common,
         d: cachedPathData(node),
-        ...paint(node.style),
+        ...paint(node, defs),
         // Nonzero is SVG's default, as it is canvas's.
         'fill-rule': node.fillRule === 'evenodd' ? 'evenodd' : undefined,
         'stroke-linejoin': outlined ? 'miter' : undefined,
@@ -221,7 +268,7 @@ function nodeSvg(
       })}/>`
     }
     case 'text':
-      return textSvg(node, common, indent)
+      return textSvg(node, common, defs, indent)
   }
 }
 
@@ -233,11 +280,12 @@ function nodeSvg(
 export function exportSvg(doc: Doc, pageId = doc.pages[0].id): string {
   const page = pageById(doc, pageId) ?? doc.pages[0]
   const { width, height } = page
-  const markers = new Markers()
+  const defs: Defs = { markers: new Markers(), gradients: new Gradients() }
+  const background = defs.gradients.fill(page.background, () => pageBox(page))
   const body = page.rootIds
     .map((id) => doc.nodes[id])
     .filter((node) => node !== undefined)
-    .map((node) => nodeSvg(doc, node, 1, markers, '  '))
+    .map((node) => nodeSvg(doc, node, 1, defs, '  '))
     .filter((svg) => svg !== '')
   const lines = [
     '<?xml version="1.0" encoding="UTF-8"?>',
@@ -248,10 +296,11 @@ export function exportSvg(doc: Doc, pageId = doc.pages[0].id): string {
       height,
     })}>`,
   ]
-  if (markers.defs.length > 0) {
-    lines.push('  <defs>', ...markers.defs.map((def) => `    ${def}`), '  </defs>')
+  const written = [...defs.gradients.defs, ...defs.markers.defs]
+  if (written.length > 0) {
+    lines.push('  <defs>', ...written.map((def) => `    ${def}`), '  </defs>')
   }
-  lines.push(`  <rect${attrs({ width, height, fill: paintColor(page.background) })}/>`)
+  lines.push(`  <rect${attrs({ width, height, ...background })}/>`)
   lines.push(...body, '</svg>', '')
   return lines.join('\n')
 }
