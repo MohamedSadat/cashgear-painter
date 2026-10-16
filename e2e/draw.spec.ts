@@ -494,8 +494,11 @@ test('a stroke moves, turns and stretches one undo step at a time, and survives 
   await page.mouse.click(...onArtboard(box, [0.4, 0.5]))
   await expect.poll(() => selectedCount(page)).toBe(1)
 
-  // Down by 100 canvas units.
+  // Down by 100 canvas units, with Ctrl, which drags without snapping: the ink's right end would
+  // snap to the page's center line, 3 px away.
+  await page.keyboard.down('Control')
   await drag(page, onArtboard(box, [0.4, 0.5]), onArtboard(box, [0.4, 0.6]))
+  await page.keyboard.up('Control')
   let [t] = await shownTransforms(page)
   expect(Math.abs(t.x)).toBeLessThan(2)
   expect(Math.abs(t.y - 100)).toBeLessThan(2)
@@ -2074,4 +2077,129 @@ test.describe('pages on a 375 px phone', () => {
     expect(await pageNames(page)).toEqual(['Page 1*', 'Page 2', 'Page 3'])
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(375)
   })
+})
+
+/** The page point over a canvas point, at the current zoom and pan. */
+function screenOf(page: Page, at: Xy): Promise<Xy> {
+  return page.evaluate(([x, y]) => {
+    const stage = (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+    const origin = stage.container().getBoundingClientRect()
+    return [origin.x + stage.x() + x * stage.scaleX(), origin.y + stage.y() + y * stage.scaleY()]
+  }, at) as Promise<Xy>
+}
+
+/** Screen pixels per canvas unit. */
+const zoomOf = (page: Page) =>
+  page.evaluate(() => (window as unknown as { Konva: typeof Konva }).Konva.stages[0].scaleX())
+
+/** The smart guides on the overlay, as their Konva points: [x1, y1, x2, y2] in canvas units. */
+function shownGuides(page: Page): Promise<number[][]> {
+  return page.evaluate(() =>
+    (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+      .find<Konva.Line>('.snap-guide')
+      .map((line) => line.points()),
+  )
+}
+
+/**
+ * Drags the mouse from one canvas point by (dx, dy) screen pixels and returns the guides shown
+ * just before the release. `mod` holds Ctrl for the whole drag.
+ */
+async function dragOnCanvas(page: Page, from: Xy, [dx, dy]: Xy, mod = false) {
+  const start = await screenOf(page, from)
+  await page.mouse.move(...start)
+  if (mod) await page.keyboard.down('Control')
+  await page.mouse.down()
+  const steps = 10
+  for (let i = 1; i <= steps; i++) {
+    await page.mouse.move(start[0] + (dx * i) / steps, start[1] + (dy * i) / steps)
+  }
+  const guides = await shownGuides(page)
+  await page.mouse.up()
+  if (mod) await page.keyboard.up('Control')
+  return guides
+}
+
+test('objects snap to the page edge and to each other within 6 screen px, with guides', async ({
+  page,
+}) => {
+  const shown = async (index: number) => (await shownTransforms(page))[index]
+  const view = page.getByRole('button', { name: 'View', exact: true })
+  const toggle = async (name: string) => {
+    await view.click()
+    await page.getByRole('menuitemcheckbox', { name }).click()
+  }
+
+  // Two rectangles with the default 4-unit outline, so each one's ink reaches 2 past its box.
+  const drawRect = async (from: Xy, to: Xy) => {
+    await page.keyboard.press('r')
+    await drag(page, await screenOf(page, from), await screenOf(page, to))
+  }
+  await drawRect([480, 300], [640, 400])
+  await drawRect([960, 600], [1120, 700])
+  expect(await shownShapes(page)).toEqual(['Rect', 'Rect'])
+  const zoom = await zoomOf(page)
+
+  // The second one, selected, dragged from its middle to 3 px right of the page's left edge:
+  // its ink lands on the edge, under a guide as tall as the page.
+  let guides = await dragOnCanvas(page, [1040, 650], [-958 * zoom + 3, 0])
+  expect((await shown(1)).x).toBeCloseTo(2, 6)
+  expect(guides).toEqual([[0, 0, 0, 1000]])
+  await expect.poll(() => shownGuides(page)).toEqual([])
+
+  // Then 4 px right of the first one's ink: its left meets that right edge, under a guide from
+  // one to the other.
+  guides = await dragOnCanvas(page, [82, 650], [642 * zoom + 4, 0])
+  expect((await shown(1)).x).toBeCloseTo(644, 6)
+  expect(guides).toHaveLength(1)
+  expect(guides[0][0]).toBeCloseTo(642, 6)
+  expect(guides[0][1]).toBeCloseTo(298, 6)
+  expect(guides[0][3]).toBeCloseTo(702, 6)
+
+  // Ctrl drags without snapping: 4 px left, it stays there.
+  guides = await dragOnCanvas(page, [724, 650], [-4, 0], true)
+  expect(guides).toEqual([])
+  expect((await shown(1)).x).toBeLessThan(644 - 2 / zoom)
+
+  // The View menu turns snapping off: dropped 3 px past that edge, it stays there too.
+  await view.click()
+  const snapping = page.getByRole('menuitemcheckbox', { name: 'Snapping' })
+  await expect(snapping).toHaveAttribute('aria-checked', 'true')
+  await snapping.click()
+  guides = await dragOnCanvas(page, [722, 650], [7, 0])
+  expect(guides).toEqual([])
+  expect((await shown(1)).x).toBeGreaterThan(644 + 1 / zoom)
+  await toggle('Snapping')
+
+  // With the grid on, it shows, and the top or bottom of a box dragged clear of other objects
+  // lands on one of its 8-unit lines.
+  await toggle('Grid')
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { Konva: typeof Konva }).Konva.stages[0].find('.snap-grid').length,
+      ),
+    )
+    .toBe(1)
+  await dragOnCanvas(page, [730, 650], [0, 37])
+  const { y } = await shown(1)
+  const onGrid = (v: number) => Math.abs(v / 8 - Math.round(v / 8)) < 1e-6
+  expect(onGrid(y - 2) || onGrid(y + 102)).toBe(true)
+  await toggle('Grid')
+
+  // A resize snaps too: the right handle let go 3 px short of the page's right edge takes the
+  // ink there; the outline stays 2 units past the box.
+  const { x } = await shown(1)
+  const width = (await shownAttr(page, 'width'))[1] as number
+  const handle = await handleAt(page, 'middle-right')
+  await drag(page, handle, [handle[0] + (1598 - x - width) * zoom - 3, handle[1]])
+  expect((await shown(1)).x).toBeCloseTo(x, 6)
+  expect(((await shownAttr(page, 'width'))[1] as number) + x).toBeCloseTo(1598, 4)
+
+  // Each of the five moves and the resize was one undo step.
+  const undo = page.getByRole('button', { name: 'Undo' })
+  for (let i = 0; i < 6; i++) await undo.click()
+  expect((await shown(1)).x).toBeCloseTo(960, 6)
+  expect((await shownAttr(page, 'width'))[1]).toBe(160)
 })

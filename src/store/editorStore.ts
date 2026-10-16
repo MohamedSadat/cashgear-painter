@@ -19,6 +19,7 @@ import {
   touchedPages,
 } from '../lib/pages'
 import { samePaint, solid } from '../lib/paint/paint'
+import { sameGuides, type Guide } from '../lib/snap/snap'
 import {
   FIRST_PAGE_ID,
   IDENTITY_TRANSFORM,
@@ -160,6 +161,9 @@ export interface EditorState {
   draft: VectorNode | null // the node being drawn right now; not in history or autosave
   erasing: NodeId[] // nodes the eraser has touched in the current pass
   marquee: Rect | null // the select tool's drag rectangle
+  snapping: boolean // drags snap to objects, the page and the grid; not in history or autosave
+  grid: boolean // the 8-unit grid shows, and drags snap to it; not in history or autosave
+  guides: Guide[] // the smart guides of the snap being dragged
   clipboard: VectorNode[] // copied nodes with their descendants; not in history or autosave
   penHover: [x: number, y: number] | null // the pen's pointer while it hovers, in canvas units
   activeAnchor: AnchorRef | null // the direct-select tool's anchor, for Delete and the panel
@@ -195,6 +199,9 @@ export interface EditorState {
   setDraft(node: VectorNode | null): void
   setErasing(ids: NodeId[]): void
   setMarquee(rect: Rect | null): void
+  setSnapping(on: boolean): void
+  setGrid(on: boolean): void
+  setGuides(guides: Guide[]): void
   setPenHover(point: [number, number] | null): void
   setActiveAnchor(anchor: AnchorRef | null): void
   setTextStyle(style: Partial<TextStyle>): void
@@ -805,6 +812,9 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     draft: null,
     erasing: [],
     marquee: null,
+    snapping: true,
+    grid: false,
+    guides: [],
     clipboard: [],
     penHover: null,
     activeAnchor: null,
@@ -1217,6 +1227,18 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       set({ marquee: rect })
     },
 
+    setSnapping(on) {
+      set({ snapping: on })
+    },
+
+    setGrid(on) {
+      set({ grid: on })
+    },
+
+    setGuides(guides) {
+      if (!sameGuides(get().guides, guides)) set({ guides })
+    },
+
     setPenHover(point) {
       set({ penHover: point })
     },
@@ -1257,7 +1279,13 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       get().endGesture()
       const state = get()
       if (id === state.currentPageId || !pageById(state.doc, id)) return
-      set({ ...showPage(state, state.doc, id), marquee: null, erasing: [], penHover: null })
+      set({
+        ...showPage(state, state.doc, id),
+        marquee: null,
+        guides: [],
+        erasing: [],
+        penHover: null,
+      })
     },
 
     addPage() {

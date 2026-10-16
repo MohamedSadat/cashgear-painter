@@ -16,6 +16,7 @@ import {
   arrowHeadSize,
   canvasBounds,
   cubicBox,
+  inkBounds,
   invertTransform,
   nodeBounds,
   pointsBox,
@@ -209,5 +210,59 @@ describe('nodeBounds', () => {
     )
     // Its own box is in the group's coordinates.
     expect(nodeBounds(nodes.r)).toEqual({ minX: 0, minY: 0, maxX: 100, maxY: 50 })
+  })
+})
+
+describe('inkBounds', () => {
+  const brush = { color: '#000000', size: 16, usesPressure: false }
+  const line = () =>
+    createStrokeNode(
+      [
+        [0, 0, 0.5],
+        [100, 0, 0.5],
+      ],
+      brush,
+      's',
+    )
+
+  it('boxes a stroke by its drawn outline, within the reach nodeBounds allows for', () => {
+    const stroke = line()
+    const ink = inkBounds({ s: stroke }, 's')!
+    const reach = nodeBounds(stroke)!
+    expect(ink.minX).toBeGreaterThan(reach.minX)
+    expect(ink.maxX).toBeLessThan(reach.maxX)
+    expect(ink.minY).toBeGreaterThan(reach.minY)
+    expect(ink.maxY).toBeLessThan(reach.maxY)
+    // Around the line, at most half the brush past it.
+    expect(ink.minY).toBeLessThan(0)
+    expect(ink.minY).toBeGreaterThanOrEqual(-8 - 1e-9)
+    expect(ink.maxX).toBeGreaterThan(100)
+  })
+
+  it("places a stroke by its transform and its groups', and a group holds its children's ink", () => {
+    const stroke = { ...line(), parentId: 'g', transform: { ...line().transform, x: 10 } }
+    const group = {
+      ...createGroupNode(['s', 'r'], null, 'g'),
+      transform: { ...line().transform, y: 20 },
+    }
+    const rect = { ...createRectNode(box, filledOnly, 'r'), parentId: 'g' }
+    const nodes = { s: stroke, g: group, r: rect }
+    const alone = inkBounds({ s: line() }, 's')!
+    const placed = inkBounds(nodes, 's')!
+    expect(placed.minX).toBeCloseTo(alone.minX + 10)
+    expect(placed.minY).toBeCloseTo(alone.minY + 20)
+
+    // Other nodes are boxed as canvasBounds boxes them.
+    expect(inkBounds(nodes, 'r')).toEqual(canvasBounds(nodes, 'r'))
+    expect(inkBounds(nodes, 'g')).toEqual({
+      minX: placed.minX,
+      minY: placed.minY,
+      maxX: 400,
+      maxY: 320,
+    })
+    // A hidden child leaves the group's box.
+    const hidden = { ...nodes, r: { ...rect, hidden: true } }
+    expect(inkBounds(hidden, 'g')).toEqual(placed)
+    expect(inkBounds(nodes, 'missing')).toBeNull()
   })
 })

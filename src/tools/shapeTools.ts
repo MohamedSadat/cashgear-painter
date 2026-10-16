@@ -1,4 +1,6 @@
 import { snapAngle } from '../lib/geometry/transform'
+import { beginSnap, currentThreshold } from '../lib/snap/session'
+import { pointBox, snapMove, toSnapBox, type SnapTargets } from '../lib/snap/snap'
 import {
   DEFAULT_SHAPE_STYLE,
   createEllipseNode,
@@ -56,35 +58,64 @@ export function dragBox(
 type Build = (start: Xy, e: ToolEvent, id: NodeId, style: Style, minSide: number) => ShapeNode
 
 /**
- * Drag to draw: the shape grows as a draft, and on release it becomes a node, one undo step.
- * The new shape is selected and the select tool takes over, so its handles and its style in the
- * properties panel are right there.
+ * The event with its point on the nearest target line within reach, and the guides that show it.
+ * Ctrl or Cmd draws without snapping; so does `skip`, for a line Shift turns to 45°.
  */
-function shapeTool(build: Build, styleOf: (style: Style) => Style = (s) => s): ToolController {
-  let drawing: { start: Xy; id: NodeId; style: Style } | null = null
+function snapEvent(e: ToolEvent, targets: SnapTargets | null, skip: boolean): ToolEvent {
+  if (!targets || e.mod || skip) {
+    store().setGuides([])
+    return e
+  }
+  const snap = snapMove(toSnapBox(pointBox(...e.point)), targets, currentThreshold())
+  store().setGuides(snap.guides)
+  return { ...e, point: [e.point[0] + snap.dx, e.point[1] + snap.dy] }
+}
+
+/**
+ * Drag to draw: the shape grows as a draft, and on release it becomes a node, one undo step. The
+ * dragged corner (a line's end) snaps to the page and other objects. The new shape is selected
+ * and the select tool takes over, so its handles and its style in the properties panel are right
+ * there.
+ */
+function shapeTool(
+  build: Build,
+  {
+    styleOf = (s) => s,
+    angleSnaps = false,
+  }: { styleOf?(style: Style): Style; angleSnaps?: boolean } = {},
+): ToolController {
+  let drawing: { start: Xy; id: NodeId; style: Style; targets: SnapTargets | null } | null = null
+  const snapped = (e: ToolEvent) => snapEvent(e, drawing?.targets ?? null, angleSnaps && e.shift)
 
   return {
     cursor: 'crosshair',
 
     onDown(e) {
-      drawing = { start: e.point, id: newNodeId(), style: styleOf(store().shapeStyle) }
+      drawing = {
+        start: e.point,
+        id: newNodeId(),
+        style: styleOf(store().shapeStyle),
+        targets: beginSnap([]),
+      }
       store().setDraft(build(e.point, e, drawing.id, drawing.style, 0))
     },
 
     onMove(e) {
       if (!drawing) return
-      store().setDraft(build(drawing.start, e, drawing.id, drawing.style, 0))
+      store().setDraft(build(drawing.start, snapped(e), drawing.id, drawing.style, 0))
     },
 
     onUp(e) {
       const finished = drawing
-      drawing = null
       if (!finished) return
+      const end = snapped(e)
+      drawing = null
+      store().setGuides([])
       store().setDraft(null)
       const { start } = finished
       const travel = Math.hypot(e.point[0] - start[0], e.point[1] - start[1]) * zoomOf(store())
       if (travel < DRAW_SLOP) return
-      const node = build(start, e, finished.id, finished.style, MIN_SIDE)
+      const node = build(start, end, finished.id, finished.style, MIN_SIDE)
       store().addNodes([node])
       store().select([node.id])
       store().setTool('select')
@@ -92,6 +123,7 @@ function shapeTool(build: Build, styleOf: (style: Style) => Style = (s) => s): T
 
     onCancel() {
       drawing = null
+      store().setGuides([])
       store().setDraft(null)
     },
   }
@@ -114,5 +146,5 @@ export const ellipseTool = shapeTool((start, e, id, style, minSide) =>
 export const lineTool = shapeTool(
   (start, e, id, style) =>
     createLineNode(start, e.shift ? snapAngle(start, e.point) : e.point, style, id),
-  lineStyleOf,
+  { styleOf: lineStyleOf, angleSnaps: true },
 )

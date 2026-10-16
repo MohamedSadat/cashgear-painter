@@ -7,6 +7,7 @@ import type {
   Transform,
   VectorNode,
 } from '../../types'
+import { strokeOutlineBox } from '../strokePath'
 import { pathSegments, type Cubic } from './pathData'
 import { textHeight } from './textLayout'
 import { absoluteTransform, composeTransform } from './transform'
@@ -306,4 +307,25 @@ export function canvasBounds(nodes: Nodes, id: NodeId): Box | null {
   if (!node) return null
   if (node.parentId === null) return nodeBounds(node, nodes)
   return nodeBounds({ ...node, transform: absoluteTransform(nodes, id) }, nodes)
+}
+
+/**
+ * A node's box on the canvas as it shows, which snapping goes by: canvasBounds, except that a
+ * freehand stroke is boxed by its drawn outline rather than by how far its ink could reach at
+ * full pressure, which is up to a third more for a mouse stroke. A group holds its visible
+ * children's ink boxes.
+ */
+export function inkBounds(nodes: Nodes, id: NodeId): Box | null {
+  const node = nodes[id]
+  if (!node) return null
+  if (node.type === 'stroke') {
+    const local = strokeOutlineBox(node)
+    return local && transformedBox(absoluteTransform(nodes, id), local)
+  }
+  if (node.type === 'group') {
+    return unionBoxes(
+      node.childIds.map((child) => (nodes[child]?.hidden ? null : inkBounds(nodes, child))),
+    )
+  }
+  return canvasBounds(nodes, id)
 }

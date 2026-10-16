@@ -1,4 +1,4 @@
-import type { LucideIcon } from 'lucide-react'
+import { Check, type LucideIcon } from 'lucide-react'
 import {
   Fragment,
   useEffect,
@@ -14,6 +14,7 @@ export interface MenuItem {
   shortcut?: string
   icon?: LucideIcon
   disabled?: boolean
+  checked?: boolean // a menu item that toggles a setting, checked when it is on
   run(): void | Promise<void>
 }
 
@@ -32,7 +33,7 @@ interface MenuProps {
   style?: CSSProperties
 }
 
-const ENABLED_ITEM = '[role=menuitem]:not([disabled])'
+const ENABLED_ITEM = '[role^=menuitem]:not([disabled])'
 
 /**
  * A menu of buttons, focused on its first item when it opens. Arrow keys move between items; Esc,
@@ -106,11 +107,12 @@ export function Menu({
       {groups.map((group, i) => (
         <Fragment key={i}>
           {i > 0 && <div role="separator" className="my-1 h-px bg-neutral-200" />}
-          {group.map(({ label: itemLabel, shortcut, icon: Icon, disabled, run }, j) => (
+          {group.map(({ label: itemLabel, shortcut, icon: Icon, disabled, checked, run }, j) => (
             <button
               key={j}
               type="button"
-              role="menuitem"
+              role={checked === undefined ? 'menuitem' : 'menuitemcheckbox'}
+              aria-checked={checked}
               disabled={disabled}
               onClick={() => {
                 onClose()
@@ -123,6 +125,13 @@ export function Menu({
               <span className="min-w-0 flex-1 truncate">{itemLabel}</span>
               {shortcut && (
                 <span className="hidden text-xs text-neutral-400 sm:inline">{shortcut}</span>
+              )}
+              {checked !== undefined && (
+                <Check
+                  size={16}
+                  aria-hidden
+                  className={`shrink-0 text-sky-600 ${checked ? '' : 'invisible'}`}
+                />
               )}
             </button>
           ))}

@@ -5,8 +5,10 @@ import {
   FileDown,
   FileUp,
   FolderOpen,
+  Grid3x3,
   Hand,
   ImageDown,
+  Magnet,
   Menu as MenuIcon,
   MousePointer2,
   PenTool,
@@ -18,6 +20,7 @@ import {
   Trash2,
   Type,
   Undo2,
+  View,
   type LucideIcon,
 } from 'lucide-react'
 import { Fragment, useCallback, useRef, useState, type ReactNode } from 'react'
@@ -104,35 +107,30 @@ const TOOL_GROUPS: ToolButton[][] = [
 
 const SEPARATOR = 'mx-0.5 h-6 w-px bg-neutral-200 sm:mx-0 sm:my-1 sm:h-px sm:w-6'
 
+interface RailMenuProps {
+  label: string
+  title: string
+  icon: LucideIcon
+  groups: MenuItem[][]
+}
+
 /**
- * Open, save, import and export behind one button, so they fit the phone's second rail row. The
- * menu drops down on phones and opens to the right of the rail from 640 px up.
+ * A button on the rail that opens a menu: it drops down on phones and opens to the right of the
+ * rail from 640 px up.
  */
-function FileMenu({ onExportPng }: { onExportPng(): void }) {
+function RailMenu({ label, title, icon: Icon, groups }: RailMenuProps) {
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
   const buttonRef = useRef<HTMLButtonElement>(null)
   const close = useCallback(() => setOpen(false), [])
-
-  const groups: MenuItem[][] = [
-    [
-      { label: 'Open…', shortcut: 'Ctrl+O', icon: FolderOpen, run: openDrawing },
-      { label: 'Save', shortcut: 'Ctrl+S', icon: Save, run: saveDrawing },
-    ],
-    [
-      { label: 'Import SVG…', icon: FileUp, run: importSvgFile },
-      { label: 'Export SVG', icon: FileDown, run: exportSvgFile },
-      { label: 'Export PNG', icon: ImageDown, run: onExportPng },
-    ],
-  ]
 
   return (
     <div ref={rootRef} className="relative">
       <button
         ref={buttonRef}
         type="button"
-        aria-label="File"
-        title="Open, save, import and export"
+        aria-label={label}
+        title={title}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((was) => !was)}
@@ -140,11 +138,11 @@ function FileMenu({ onExportPng }: { onExportPng(): void }) {
           open ? 'bg-neutral-100' : ''
         }`}
       >
-        <MenuIcon size={20} />
+        <Icon size={20} />
       </button>
       {open && (
         <Menu
-          label="File"
+          label={label}
           groups={groups}
           onClose={close}
           ignoreRef={rootRef}
@@ -156,12 +154,44 @@ function FileMenu({ onExportPng }: { onExportPng(): void }) {
   )
 }
 
+/** Open, save, import and export behind one button, so they fit the phone's second rail row. */
+function FileMenu({ onExportPng }: { onExportPng(): void }) {
+  const groups: MenuItem[][] = [
+    [
+      { label: 'Open…', shortcut: 'Ctrl+O', icon: FolderOpen, run: openDrawing },
+      { label: 'Save', shortcut: 'Ctrl+S', icon: Save, run: saveDrawing },
+    ],
+    [
+      { label: 'Import SVG…', icon: FileUp, run: importSvgFile },
+      { label: 'Export SVG', icon: FileDown, run: exportSvgFile },
+      { label: 'Export PNG', icon: ImageDown, run: onExportPng },
+    ],
+  ]
+  return (
+    <RailMenu label="File" title="Open, save, import and export" icon={MenuIcon} groups={groups} />
+  )
+}
+
+/** Snapping and the grid, each turned on and off from the menu. */
+function ViewMenu() {
+  const snapping = useEditorStore((s) => s.snapping)
+  const grid = useEditorStore((s) => s.grid)
+  const { setSnapping, setGrid } = useEditorStore.getState()
+  const groups: MenuItem[][] = [
+    [
+      { label: 'Snapping', icon: Magnet, checked: snapping, run: () => setSnapping(!snapping) },
+      { label: 'Grid', icon: Grid3x3, checked: grid, run: () => setGrid(!grid) },
+    ],
+  ]
+  return <RailMenu label="View" title="Snapping and grid" icon={View} groups={groups} />
+}
+
 interface ToolRailProps {
   onExportPng(): void
 }
 
 /**
- * The tools, then history, zoom and the file menu. A vertical rail on the left from 640 px up;
+ * The tools, then history, zoom, the view menu and the file menu. A vertical rail on the left from 640 px up;
  * above the canvas, wrapping onto a second row, on phones.
  */
 export function ToolRail({ onExportPng }: ToolRailProps) {
@@ -223,6 +253,7 @@ export function ToolRail({ onExportPng }: ToolRailProps) {
         >
           {zoomPercent}%
         </button>
+        <ViewMenu />
         <FileMenu onExportPng={onExportPng} />
       </div>
     </nav>

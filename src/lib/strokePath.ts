@@ -22,13 +22,11 @@ export function getSvgPathFromStroke(outline: number[][]): string {
   return `${result}Z`
 }
 
-/** SVG path data for a stroke's filled outline. `last` is false while the stroke is still being drawn. */
-export function strokeToPath(
-  stroke: Pick<StrokeNode, 'points' | 'size' | 'usesPressure'>,
-  last = true,
-): string {
-  if (stroke.points.length === 0) return ''
-  const outline = getStroke(stroke.points, {
+type StrokeShape = Pick<StrokeNode, 'points' | 'size' | 'usesPressure'>
+
+/** perfect-freehand's outline polygon for a stroke. */
+function strokeOutline(stroke: StrokeShape, last: boolean): number[][] {
+  return getStroke(stroke.points, {
     size: stroke.size,
     thinning: 0.5,
     smoothing: 0.5,
@@ -36,7 +34,53 @@ export function strokeToPath(
     simulatePressure: !stroke.usesPressure,
     last,
   })
-  return getSvgPathFromStroke(outline)
+}
+
+/** SVG path data for a stroke's filled outline. `last` is false while the stroke is still being drawn. */
+export function strokeToPath(stroke: StrokeShape, last = true): string {
+  if (stroke.points.length === 0) return ''
+  return getSvgPathFromStroke(strokeOutline(stroke, last))
+}
+
+export interface OutlineBox {
+  minX: number
+  minY: number
+  maxX: number
+  maxY: number
+}
+
+const outlineBoxCache = new WeakMap<
+  Point[],
+  { size: number; usesPressure: boolean; box: OutlineBox | null }
+>()
+
+/**
+ * The box around a finished stroke's outline in its own coordinates, where its ink shows; null
+ * for a stroke without points. The path's curves stay inside the outline polygon, so this is
+ * the ink's box or a hair more. Cached by the points array, as the outline is.
+ */
+export function strokeOutlineBox(stroke: StrokeShape): OutlineBox | null {
+  const cached = outlineBoxCache.get(stroke.points)
+  if (cached && cached.size === stroke.size && cached.usesPressure === stroke.usesPressure) {
+    return cached.box
+  }
+  let box: OutlineBox | null = null
+  if (stroke.points.length > 0) {
+    box = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity }
+    for (const [x, y] of strokeOutline(stroke, true)) {
+      box.minX = Math.min(box.minX, x)
+      box.minY = Math.min(box.minY, y)
+      box.maxX = Math.max(box.maxX, x)
+      box.maxY = Math.max(box.maxY, y)
+    }
+    if (!Number.isFinite(box.minX)) box = null
+  }
+  outlineBoxCache.set(stroke.points, {
+    size: stroke.size,
+    usesPressure: stroke.usesPressure,
+    box,
+  })
+  return box
 }
 
 // Keyed by the points array: immer keeps it as the same object while a stroke is moved, rotated
@@ -44,9 +88,7 @@ export function strokeToPath(
 const pathCache = new WeakMap<Point[], { size: number; usesPressure: boolean; data: string }>()
 
 /** A finished stroke's outline data, from the cache when its points haven't changed. */
-export function cachedStrokePath(
-  node: Pick<StrokeNode, 'points' | 'size' | 'usesPressure'>,
-): string {
+export function cachedStrokePath(node: StrokeShape): string {
   const cached = pathCache.get(node.points)
   if (cached && cached.size === node.size && cached.usesPressure === node.usesPressure) {
     return cached.data

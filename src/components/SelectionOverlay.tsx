@@ -1,8 +1,10 @@
 import type Konva from 'konva'
 import type { KonvaEventObject } from 'konva/lib/Node'
+// A box as the Transformer measures it: on the Stage's container, in screen pixels, turned.
+import type { Box as TransformerBox } from 'konva/lib/shapes/Transformer'
 import { useEffect, useLayoutEffect, useRef, type RefObject } from 'react'
 import { Circle, Rect, Transformer } from 'react-konva'
-import { applyTransform, invertTransform } from '../lib/geometry/bounds'
+import { applyTransform, invertTransform, type Box as CanvasBox } from '../lib/geometry/bounds'
 import {
   absoluteTransform,
   bakeTransforms,
@@ -10,6 +12,9 @@ import {
   normalizeRotation,
   snapAngle,
 } from '../lib/geometry/transform'
+import { beginSnap } from '../lib/snap/session'
+import { snapResizeBox, snapThreshold, type Edge, type SnapTargets } from '../lib/snap/snap'
+import { inkBox } from '../lib/snap/targets'
 import { useEditorStore, zoomOf } from '../store/editorStore'
 import type { NodeId, NodeOf, Transform, VectorNode } from '../types'
 import { ACCENT, ANCHOR_SIZE, HANDLE_GRIP } from './overlayStyle'
@@ -38,6 +43,44 @@ const roundScale = (scale: number) => Math.round(scale * 1e6) / 1e6
 const BOX_PADDING = ANCHOR_SIZE / 2 + 4
 
 const store = () => useEditorStore.getState()
+
+/** The box edges a Transformer handle moves, from its name, such as 'top-left'. */
+function edgesOf(anchor: string): Edge[] {
+  const edges: Edge[] = []
+  if (anchor.includes('left')) edges.push('left')
+  if (anchor.includes('right')) edges.push('right')
+  if (anchor.startsWith('top')) edges.push('top')
+  if (anchor.startsWith('bottom')) edges.push('bottom')
+  return edges
+}
+
+/** Whether an angle in radians is a turn other than none. */
+const isTurned = (radians: number) =>
+  Math.abs(Math.atan2(Math.sin(radians), Math.cos(radians))) > 1e-6
+
+interface ResizeSnap {
+  targets: SnapTargets
+  // How far the selection's ink reaches past the Transformer's box on each side, in canvas units:
+  // the box leaves outlines out, while snapping goes by what shows. Measured on the first move.
+  pads: CanvasBox | null
+}
+
+/** Modifier keys as the latest pointer or key event had them; boundBoxFunc gets no event. */
+function useModifierKeys() {
+  const keys = useRef({ shift: false, alt: false, mod: false })
+  useEffect(() => {
+    const track = (e: PointerEvent | KeyboardEvent) => {
+      keys.current = { shift: e.shiftKey, alt: e.altKey, mod: e.ctrlKey || e.metaKey }
+    }
+    const events = ['pointerdown', 'pointermove', 'keydown', 'keyup'] as const
+    // Capturing on the window, so the keys are known before Konva's own handlers resize.
+    for (const type of events) window.addEventListener(type, track, true)
+    return () => {
+      for (const type of events) window.removeEventListener(type, track, true)
+    }
+  }, [])
+  return keys
+}
 
 /** Moves one end of a line to where its handle was dragged; Shift snaps the line to 45°. */
 function dragLineEnd(id: NodeId, end: 0 | 1, e: KonvaEventObject<DragEvent>) {
@@ -122,6 +165,8 @@ interface SelectionOverlayProps {
  */
 export function SelectionOverlay({ contentLayerRef }: SelectionOverlayProps) {
   const transformerRef = useRef<Konva.Transformer>(null)
+  const resizeSnap = useRef<ResizeSnap | null>(null)
+  const keys = useModifierKeys()
   const doc = useEditorStore((s) => s.doc)
   const selection = useEditorStore((s) => s.selection)
   const tool = useEditorStore((s) => s.tool)
@@ -166,7 +211,84 @@ export function SelectionOverlay({ contentLayerRef }: SelectionOverlayProps) {
     shape.setAttrs({ width: shape.width() * shape.scaleX(), scaleX: 1 })
   }
 
+  // A resize snaps the edges its handle moves to the page and other objects; a turn doesn't snap.
+  const handleTransformStart = () => {
+    const anchor = transformerRef.current?.getActiveAnchor() ?? ''
+    const targets = anchor.startsWith('rotater') ? null : beginSnap(store().selection)
+    resizeSnap.current = targets && { targets, pads: null }
+  }
+
+  /**
+   * The Transformer's next box with its moving edges snapped, unless Ctrl or Cmd is held. Only an
+   * unturned box snaps: a turned one's edges aren't the axis-aligned lines snapping goes by.
+   */
+  const snapBox = (oldBox: TransformerBox, newBox: TransformerBox): TransformerBox => {
+    const snap = resizeSnap.current
+    const anchor = transformerRef.current?.getActiveAnchor() ?? ''
+    const state = store()
+    const zoom = zoomOf(state)
+    if (
+      !snap ||
+      keys.current.mod ||
+      zoom <= 0 ||
+      isTurned(newBox.rotation) ||
+      newBox.width <= 0 ||
+      newBox.height <= 0
+    ) {
+      state.setGuides([])
+      return newBox
+    }
+    const { x: viewX, y: viewY } = state.view
+    const toCanvas = (b: TransformerBox): CanvasBox => ({
+      minX: (b.x - viewX) / zoom,
+      minY: (b.y - viewY) / zoom,
+      maxX: (b.x + b.width - viewX) / zoom,
+      maxY: (b.y + b.height - viewY) / zoom,
+    })
+    if (!snap.pads) {
+      const start = toCanvas(oldBox)
+      const ink = inkBox(state.doc, state.selection) ?? start
+      snap.pads = {
+        minX: start.minX - ink.minX,
+        minY: start.minY - ink.minY,
+        maxX: ink.maxX - start.maxX,
+        maxY: ink.maxY - start.maxY,
+      }
+    }
+    const pads = snap.pads
+    const box = toCanvas(newBox)
+    const { box: inked, guides } = snapResizeBox(
+      {
+        minX: box.minX - pads.minX,
+        minY: box.minY - pads.minY,
+        maxX: box.maxX + pads.maxX,
+        maxY: box.maxY + pads.maxY,
+      },
+      edgesOf(anchor),
+      snap.targets,
+      snapThreshold(zoom),
+      // As Konva decides: a corner keeps the ratio when the Transformer does or Shift is held,
+      // and Alt resizes about the center.
+      { keepRatio: !freeAspect || keys.current.shift, centered: keys.current.alt },
+    )
+    state.setGuides(guides)
+    const minX = inked.minX + pads.minX
+    const minY = inked.minY + pads.minY
+    return {
+      x: minX * zoom + viewX,
+      y: minY * zoom + viewY,
+      width: (inked.maxX - pads.maxX - minX) * zoom,
+      height: (inked.maxY - pads.maxY - minY) * zoom,
+      rotation: newBox.rotation,
+    }
+  }
+
+  const tooSmall = (box: TransformerBox) =>
+    Math.abs(box.width) < MIN_SIZE_PX || Math.abs(box.height) < MIN_SIZE_PX
+
   const handleTransformEnd = () => {
+    resizeSnap.current = null
+    store().setGuides([])
     const transformer = transformerRef.current
     if (!transformer) return
     const { doc, updateNodes } = useEditorStore.getState()
@@ -206,11 +328,12 @@ export function SelectionOverlay({ contentLayerRef }: SelectionOverlayProps) {
         anchorCornerRadius={2}
         anchorStroke={ACCENT}
         borderStroke={ACCENT}
-        boundBoxFunc={(oldBox, newBox) =>
-          Math.abs(newBox.width) < MIN_SIZE_PX || Math.abs(newBox.height) < MIN_SIZE_PX
-            ? oldBox
-            : newBox
-        }
+        boundBoxFunc={(oldBox, newBox) => {
+          if (tooSmall(newBox)) return oldBox
+          const snapped = snapBox(oldBox, newBox)
+          return tooSmall(snapped) ? oldBox : snapped
+        }}
+        onTransformStart={handleTransformStart}
         onTransform={handleTransform}
         onTransformEnd={handleTransformEnd}
       />

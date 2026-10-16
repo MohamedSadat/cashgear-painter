@@ -16,6 +16,7 @@ import { MoveToPageMenu } from './MoveToPageMenu'
 import { NodeView } from './NodeView'
 import { PathEditOverlay } from './PathEditOverlay'
 import { SelectionOverlay } from './SelectionOverlay'
+import { SnapOverlay } from './SnapOverlay'
 import { TextEditor } from './TextEditor'
 
 interface CanvasStageProps {
@@ -252,6 +253,7 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
               {draft && <NodeView key={draft.id} node={draft} isDraft />}
             </Layer>
             <Layer name={OVERLAY_LAYER_NAME}>
+              <SnapOverlay />
               <SelectionOverlay contentLayerRef={contentLayerRef} />
               <PathEditOverlay />
               <BrushCursor ref={cursorRef} tool={tool} size={size} />

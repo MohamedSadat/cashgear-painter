@@ -501,10 +501,11 @@ describe('selectTool', () => {
     const b = addLine(100)
     store().select([a.id, b.id])
 
-    drag(on(50, 50), [50, 60])
+    // Far enough down that the box's top doesn't snap to the page's.
+    drag(on(50, 50), [50, 80])
 
-    expect(transformOf(a.id).y).toBe(10)
-    expect(transformOf(b.id).y).toBe(10)
+    expect(transformOf(a.id).y).toBe(30)
+    expect(transformOf(b.id).y).toBe(30)
   })
 
   it('ignores a press that moves less than the drag slop', () => {
@@ -1382,5 +1383,170 @@ describe('eraserTool in split mode', () => {
 
     expect(store().doc.pages[0].rootIds).toHaveLength(2)
     expect(store().doc.pages[0].rootIds[0]).toBe(a.id)
+  })
+})
+
+describe.each([0.25, 1, 4])('snapping at %s× zoom', (zoom) => {
+  // The page fits at `zoom`, centered in a 1000 × 700 canvas; at 4× only its middle shows.
+  beforeEach(() => {
+    selectTool.onCancel?.()
+    rectTool.onCancel?.()
+    store().setViewport(measured(1000, 700, zoom))
+  })
+
+  // Canvas units for a distance in screen pixels.
+  const px = (n: number) => n / zoom
+  const noOutline = { ...DEFAULT_SHAPE_STYLE, stroke: null, fill: solid('#000000') }
+
+  /** A rect without an outline, so its box is its geometry, added as its own step. */
+  function addRect(x: number, y: number, width = 100, height = 100) {
+    const node = createRectNode({ x, y, width, height }, noOutline)
+    store().addNodes([node])
+    return node.id
+  }
+
+  const press = (x: number, y: number, target: string | null, mod = false): ToolEvent => ({
+    ...at(x, y),
+    target,
+    mod,
+  })
+
+  /** Drags the node `id` by (dx, dy) with the select tool, from a point inside it. */
+  function dragBy(id: string, dx: number, dy: number, mod = false) {
+    const { x, y } = store().doc.nodes[id].transform
+    selectTool.onDown(press(x + 1, y + 1, id))
+    selectTool.onMove(press(x + 1 + dx, y + 1 + dy, null, mod))
+    selectTool.onUp(press(x + 1 + dx, y + 1 + dy, null, mod))
+  }
+
+  const transformOf = (id: string) => store().doc.nodes[id].transform
+
+  it('moves an object onto a page edge within 6 screen px, and not from further', () => {
+    const near = addRect(200, 300)
+    dragBy(near, -200 + px(5), 0)
+    expect(transformOf(near)).toMatchObject({ x: 0, y: 300 })
+
+    // Not near the first one either, whose center is a target now.
+    store().deleteNodes([near])
+    const far = addRect(200, 600)
+    dragBy(far, -200 + px(7), 0)
+    expect(transformOf(far).x).toBeCloseTo(px(7))
+
+    // The right edge to the page's right.
+    const right = addRect(1200, 300)
+    dragBy(right, 300 - px(4), 0)
+    expect(transformOf(right).x).toBe(1500)
+  })
+
+  it('moves an object onto the page center within 6 screen px, and not from further', () => {
+    // 400 wide, so only its center comes near the page's.
+    const near = addRect(100, 300, 400)
+    dragBy(near, 500 + px(5), 0)
+    expect(transformOf(near).x).toBe(600)
+
+    const far = addRect(100, 600, 400)
+    dragBy(far, 500 + px(7), 0)
+    expect(transformOf(far).x).toBeCloseTo(600 + px(7))
+  })
+
+  it('moves an object onto another within 6 screen px, showing a guide while it drags', () => {
+    // In view at every zoom: the canvas shows at least x 675–925 and y 412–588.
+    const other = addRect(700, 420)
+    const moving = addRect(300, 700)
+
+    // Its top to the other's bottom, from 5 px below it.
+    selectTool.onDown(press(301, 701, moving))
+    selectTool.onMove(press(301, 701 - 180 + px(5), null))
+    expect(transformOf(moving).y).toBe(520)
+    expect(store().guides).toEqual([{ axis: 'y', at: 520, from: 300, to: 800 }])
+    selectTool.onUp(press(301, 701 - 180 + px(5), null))
+    expect(transformOf(moving).y).toBe(520)
+    expect(store().guides).toEqual([])
+    expect(transformOf(other).y).toBe(420)
+
+    // From 7 px below, it stays where it is dropped.
+    store().undo()
+    dragBy(moving, 0, -180 + px(7))
+    expect(transformOf(moving).y).toBeCloseTo(520 + px(7))
+  })
+
+  it('draws a shape whose dragged corner snaps to the page corner', () => {
+    store().setTool('rect')
+    rectTool.onDown(at(100, 100))
+    rectTool.onMove(at(1600 - px(5), 1000 - px(4)))
+    expect(store().draft).toMatchObject({ width: 1500, height: 900 })
+    expect(store().guides).toHaveLength(2)
+    rectTool.onUp(at(1600 - px(5), 1000 - px(4)))
+    const [id] = currentRoots()
+    expect(store().doc.nodes[id]).toMatchObject({ width: 1500, height: 900 })
+    expect(store().guides).toEqual([])
+
+    store().setTool('rect')
+    rectTool.onDown(at(100, 100))
+    rectTool.onUp(at(1600 - px(7), 1000 - px(7)))
+    const [, far] = currentRoots()
+    expect((store().doc.nodes[far] as { width: number }).width).toBeCloseTo(1500 - px(7))
+  })
+})
+
+const currentRoots = () => store().doc.pages[0].rootIds
+
+describe('snapping', () => {
+  beforeEach(() => {
+    selectTool.onCancel?.()
+    store().setViewport(measured(1000, 700, 1))
+  })
+
+  const noOutline = { ...DEFAULT_SHAPE_STYLE, stroke: null, fill: solid('#000000') }
+
+  function addRect(x: number, y: number) {
+    const node = createRectNode({ x, y, width: 100, height: 100 }, noOutline)
+    store().addNodes([node])
+    return node.id
+  }
+
+  function dragBy(id: string, dx: number, dy: number, mod = false) {
+    const { x, y } = store().doc.nodes[id].transform
+    const e = (px: number, py: number, target: string | null): ToolEvent => ({
+      ...at(px, py),
+      target,
+      mod,
+    })
+    selectTool.onDown(e(x + 1, y + 1, id))
+    selectTool.onMove(e(x + 1 + dx, y + 1 + dy, null))
+    selectTool.onUp(e(x + 1 + dx, y + 1 + dy, null))
+  }
+
+  it('is skipped while Ctrl or Cmd is held', () => {
+    const id = addRect(200, 300)
+    dragBy(id, -197, 0, true)
+    expect(store().doc.nodes[id].transform.x).toBe(3)
+    expect(store().guides).toEqual([])
+  })
+
+  it('is off with the View toggle', () => {
+    store().setSnapping(false)
+    const id = addRect(200, 300)
+    dragBy(id, -197, 0)
+    expect(store().doc.nodes[id].transform.x).toBe(3)
+  })
+
+  it('takes edges to the 8-unit grid when it shows', () => {
+    store().setGrid(true)
+    const id = addRect(200, 300)
+    // Left 213 is 3 from 216, right 313 is 1 from 312; top 321 is 1 from 320.
+    dragBy(id, 13, 21)
+    expect(store().doc.nodes[id].transform).toMatchObject({ x: 212, y: 320 })
+  })
+
+  it('leaves a line drawn with Shift at its 45° angle', () => {
+    store().setTool('line')
+    lineTool.onDown(at(100, 100))
+    // Without Shift, the end would snap to the page center at (800, 500).
+    lineTool.onUp({ ...at(797, 497), shift: true })
+    const [id] = currentRoots()
+    const { points } = store().doc.nodes[id] as { points: number[] }
+    expect(points[2]).toBeCloseTo(Math.hypot(697, 397) / Math.SQRT2)
+    expect(points[3]).toBeCloseTo(points[2])
   })
 })

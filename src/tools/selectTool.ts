@@ -1,5 +1,8 @@
 import { canvasBounds, nodeBounds, unionBoxes, type Box } from '../lib/geometry/bounds'
 import { deltaInParent } from '../lib/geometry/transform'
+import { beginSnap, currentThreshold } from '../lib/snap/session'
+import { shiftBox, snapMove, toSnapBox, type SnapTargets } from '../lib/snap/snap'
+import { inkBox } from '../lib/snap/targets'
 import { currentPageOf, outermost, useEditorStore, zoomOf, type Rect } from '../store/editorStore'
 import type { Doc, NodeId, Transform, VectorNode } from '../types'
 import { startTextEdit } from './textTool'
@@ -56,7 +59,15 @@ type Drag =
       wasSelected: boolean
       inSelection: boolean // on empty canvas, but inside the selection's box
     }
-  | { kind: 'move'; start: Xy; origins: Map<NodeId, Transform> }
+  // `box` is the moved nodes' box when the drag began, and `targets` what it snaps to; null when
+  // snapping is off.
+  | {
+      kind: 'move'
+      start: Xy
+      origins: Map<NodeId, Transform>
+      box: Box | null
+      targets: SnapTargets | null
+    }
   | { kind: 'marquee'; start: Xy; base: NodeId[] }
   // The second press of a double-click on a text: its editor opens on release, which phones
   // accept as a gesture that may raise the keyboard.
@@ -128,7 +139,10 @@ function rectBetween(a: Xy, b: Xy): Rect {
 const boxContains = (box: Box, [x, y]: Xy) =>
   x >= box.minX && x <= box.maxX && y >= box.minY && y <= box.maxY
 
-/** Starts moving the selected nodes, as one undo step; a group carries its children. */
+/**
+ * Starts moving the selected nodes, as one undo step; a group carries its children. The targets
+ * they snap to are collected once, here.
+ */
 function startMove(start: Xy): Drag {
   const { doc, selection } = store()
   const origins = new Map<NodeId, Transform>()
@@ -136,8 +150,10 @@ function startMove(start: Xy): Drag {
     const node = doc.nodes[id]
     if (!node.locked) origins.set(id, node.transform)
   }
+  const box = inkBox(doc, [...origins.keys()])
+  const targets = box ? beginSnap(selection) : null
   store().beginGesture()
-  return { kind: 'move', start, origins }
+  return { kind: 'move', start, origins, box, targets }
 }
 
 /**
@@ -215,8 +231,19 @@ export const selectTool: ToolController = {
     }
 
     if (drag.kind === 'move') {
-      const dx = e.point[0] - drag.start[0]
-      const dy = e.point[1] - drag.start[1]
+      let dx = e.point[0] - drag.start[0]
+      let dy = e.point[1] - drag.start[1]
+      // Ctrl or Cmd drags without snapping.
+      if (drag.box && drag.targets && !e.mod) {
+        const snap = snapMove(
+          toSnapBox(shiftBox(drag.box, dx, dy)),
+          drag.targets,
+          currentThreshold(),
+        )
+        dx += snap.dx
+        dy += snap.dy
+        store().setGuides(snap.guides)
+      } else store().setGuides([])
       const { nodes } = store().doc
       const patch: Record<NodeId, { transform: Transform }> = {}
       for (const [id, t] of drag.origins) {
@@ -240,8 +267,10 @@ export const selectTool: ToolController = {
     drag = null
     if (!finished) return
     if (finished.kind === 'edit') startTextEdit(finished.id)
-    else if (finished.kind === 'move') store().endGesture()
-    else if (finished.kind === 'marquee') store().setMarquee(null)
+    else if (finished.kind === 'move') {
+      store().setGuides([])
+      store().endGesture()
+    } else if (finished.kind === 'marquee') store().setMarquee(null)
     else if (finished.target !== null) {
       // A click on a node that was already selected: Shift removes it, a plain click keeps only it.
       if (finished.wasSelected)
@@ -305,7 +334,9 @@ export const selectTool: ToolController = {
   onCancel() {
     const cancelled = drag
     drag = null
-    if (cancelled?.kind === 'move') store().cancelGesture()
-    else if (cancelled?.kind === 'marquee') store().setMarquee(null)
+    if (cancelled?.kind === 'move') {
+      store().setGuides([])
+      store().cancelGesture()
+    } else if (cancelled?.kind === 'marquee') store().setMarquee(null)
   },
 }
