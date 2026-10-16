@@ -139,3 +139,26 @@ export function textLines(node: TextNode): string[] {
 export function textHeight(node: TextNode): number {
   return Math.max(1, textLines(node).length) * node.fontSize * TEXT_LINE_HEIGHT
 }
+
+// Konva's own fallbacks when a browser reports no font box: Arial's ascent and descent per em.
+const FALLBACK_ASCENT = 0.91
+const FALLBACK_DESCENT = 0.21
+
+/**
+ * Distance from the top of a text box to its first line's alphabetic baseline, as Konva 10 draws
+ * it: the font box of an 'M' centered in the line height. Each later line sits one line height
+ * lower. Without a canvas, Konva's fallback metrics stand in.
+ */
+export function firstBaseline(font: FontOf): number {
+  let ascent = font.fontSize * FALLBACK_ASCENT
+  let descent = font.fontSize * FALLBACK_DESCENT
+  const ctx = measureContext()
+  if (ctx) {
+    ctx.font = canvasFont(font)
+    // Older browsers lack the font box; Konva falls back to the glyph's box.
+    const metrics: Partial<TextMetrics> = ctx.measureText('M')
+    ascent = metrics.fontBoundingBoxAscent ?? metrics.actualBoundingBoxAscent ?? ascent
+    descent = metrics.fontBoundingBoxDescent ?? metrics.actualBoundingBoxDescent ?? descent
+  }
+  return (ascent - descent) / 2 + (font.fontSize * TEXT_LINE_HEIGHT) / 2
+}

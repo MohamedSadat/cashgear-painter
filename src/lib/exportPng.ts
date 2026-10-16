@@ -1,5 +1,6 @@
 import type Konva from 'konva'
 import { CANVAS_HEIGHT, CANVAS_WIDTH } from '../types'
+import { downloadUrl } from './files'
 
 export const OVERLAY_LAYER_NAME = 'overlay-layer'
 export const EXPORT_FILE_NAME = 'painting.png'
@@ -25,19 +26,10 @@ export function exportPng(stage: Konva.Stage): void {
       height: CANVAS_HEIGHT,
       pixelRatio: EXPORT_SCALE,
     })
-    downloadDataUrl(dataUrl, EXPORT_FILE_NAME)
+    downloadUrl(dataUrl, EXPORT_FILE_NAME)
   } finally {
     stage.scale(scale)
     stage.position(position)
     overlay?.visible(overlayWasVisible)
   }
-}
-
-function downloadDataUrl(url: string, fileName: string): void {
-  const link = document.createElement('a')
-  link.href = url
-  link.download = fileName
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
 }

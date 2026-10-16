@@ -199,6 +199,35 @@ export function sanitizeDoc(value: unknown): Doc {
   return doc
 }
 
+export const DOC_FILE_NAME = 'drawing.painter.json'
+export const NOT_A_DRAWING = "This file isn't a Simple Painter drawing."
+
+/** The text of a .painter.json file: the doc as JSON, rounded as autosave rounds it. */
+export function docToJson(doc: Doc): string {
+  return JSON.stringify(compactDoc(doc))
+}
+
+/**
+ * The doc in a .painter.json file, sanitized as a loaded doc is. Throws an Error whose message
+ * tells the user what is wrong: the file isn't a drawing, or comes from an unknown version.
+ */
+export function parseDocFile(text: string): Doc {
+  let value: unknown
+  try {
+    // Some editors put a byte order mark (U+FEFF) in front, which JSON.parse refuses.
+    value = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
+  } catch {
+    throw new Error(NOT_A_DRAWING)
+  }
+  if (!isObject(value) || !('version' in value)) throw new Error(NOT_A_DRAWING)
+  if (value.version !== 2) {
+    const version = String(JSON.stringify(value.version)).slice(0, 20)
+    throw new Error(`This drawing is from an unknown version (${version}).`)
+  }
+  if (!isObject(value.nodes) || !Array.isArray(value.rootIds)) throw new Error(NOT_A_DRAWING)
+  return sanitizeDoc(value)
+}
+
 /** The saved doc; undefined when nothing is saved yet or storage can't be read. */
 export async function loadDoc(
   kv: KeyValueStore | null = defaultKeyValueStore(),

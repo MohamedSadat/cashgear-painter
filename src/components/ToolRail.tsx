@@ -1,12 +1,17 @@
 import {
   Brush,
   Circle,
-  Download,
   Eraser,
+  FileDown,
+  FileUp,
+  FolderOpen,
   Hand,
+  ImageDown,
+  Menu,
   MousePointer2,
   PenTool,
   Redo2,
+  Save,
   Slash,
   SplinePointer,
   Square,
@@ -15,7 +20,8 @@ import {
   Undo2,
   type LucideIcon,
 } from 'lucide-react'
-import { Fragment, type ReactNode } from 'react'
+import { Fragment, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
+import { exportSvgFile, importSvgFile, openDrawing, saveDrawing } from '../lib/fileActions'
 import { useEditorStore, zoomOf } from '../store/editorStore'
 import type { ToolId } from '../types'
 
@@ -95,15 +101,127 @@ const TOOL_GROUPS: ToolButton[][] = [
 
 const SEPARATOR = 'mx-0.5 h-6 w-px bg-neutral-200 sm:mx-0 sm:my-1 sm:h-px sm:w-6'
 
-interface ToolRailProps {
-  onExport(): void
+interface FileItem {
+  label: string
+  shortcut?: string
+  icon: LucideIcon
+  run(): void | Promise<void>
 }
 
 /**
- * The tools, then history, zoom and export. A vertical rail on the left from 640 px up; above the
- * canvas, wrapping onto a second row, on phones.
+ * Open, save, import and export behind one button, so they fit the phone's second rail row. The
+ * menu drops down on phones and opens to the right of the rail from 640 px up. Arrow keys move
+ * between items; Esc, a pick or a press outside closes it.
  */
-export function ToolRail({ onExport }: ToolRailProps) {
+function FileMenu({ onExportPng }: { onExportPng(): void }) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const buttonRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  const groups: FileItem[][] = [
+    [
+      { label: 'Open…', shortcut: 'Ctrl+O', icon: FolderOpen, run: openDrawing },
+      { label: 'Save', shortcut: 'Ctrl+S', icon: Save, run: saveDrawing },
+    ],
+    [
+      { label: 'Import SVG…', icon: FileUp, run: importSvgFile },
+      { label: 'Export SVG', icon: FileDown, run: exportSvgFile },
+      { label: 'Export PNG', icon: ImageDown, run: onExportPng },
+    ],
+  ]
+
+  useEffect(() => {
+    if (!open) return
+    menuRef.current?.querySelector<HTMLElement>('[role=menuitem]')?.focus()
+    const onPointerDown = (e: PointerEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown, true)
+    return () => document.removeEventListener('pointerdown', onPointerDown, true)
+  }, [open])
+
+  const onKeyDown = (e: KeyboardEvent) => {
+    const items = [...(menuRef.current?.querySelectorAll<HTMLElement>('[role=menuitem]') ?? [])]
+    const at = items.indexOf(document.activeElement as HTMLElement)
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      const step = e.key === 'ArrowDown' ? 1 : -1
+      items[(at + step + items.length) % items.length]?.focus()
+    } else if (e.key === 'Escape') {
+      setOpen(false)
+      buttonRef.current?.focus()
+    } else if (e.key === 'Tab') {
+      setOpen(false)
+      return
+    } else return
+    // Not for the canvas shortcuts: Esc would also drop the selection.
+    e.preventDefault()
+    e.stopPropagation()
+  }
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        ref={buttonRef}
+        type="button"
+        aria-label="File"
+        title="Open, save, import and export"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((was) => !was)}
+        className={`flex h-9 w-9 items-center justify-center rounded-md text-neutral-700 transition-colors hover:bg-neutral-100 ${
+          open ? 'bg-neutral-100' : ''
+        }`}
+      >
+        <Menu size={20} />
+      </button>
+      {open && (
+        <div
+          ref={menuRef}
+          role="menu"
+          aria-label="File"
+          onKeyDown={onKeyDown}
+          className="absolute top-full right-0 z-50 mt-1 w-52 rounded-lg border border-neutral-200 bg-white py-1 shadow-lg sm:top-auto sm:right-auto sm:bottom-0 sm:left-full sm:mt-0 sm:ml-2"
+        >
+          {groups.map((group, i) => (
+            <Fragment key={group[0].label}>
+              {i > 0 && <div role="separator" className="my-1 h-px bg-neutral-200" />}
+              {group.map(({ label, shortcut, icon: Icon, run }) => (
+                <button
+                  key={label}
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setOpen(false)
+                    // Synchronously inside the click, so a file picker may open.
+                    void run()
+                  }}
+                  className="flex h-10 w-full items-center gap-3 px-3 text-left text-sm text-neutral-800 hover:bg-neutral-100 focus:bg-neutral-100 focus:outline-none"
+                >
+                  <Icon size={18} className="text-neutral-500" />
+                  <span className="flex-1">{label}</span>
+                  {shortcut && (
+                    <span className="hidden text-xs text-neutral-400 sm:inline">{shortcut}</span>
+                  )}
+                </button>
+              ))}
+            </Fragment>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+interface ToolRailProps {
+  onExportPng(): void
+}
+
+/**
+ * The tools, then history, zoom and the file menu. A vertical rail on the left from 640 px up;
+ * above the canvas, wrapping onto a second row, on phones.
+ */
+export function ToolRail({ onExportPng }: ToolRailProps) {
   const tool = useEditorStore((s) => s.tool)
   const canUndo = useEditorStore((s) => s.past.length > 0)
   const canRedo = useEditorStore((s) => s.future.length > 0)
@@ -162,9 +280,7 @@ export function ToolRail({ onExport }: ToolRailProps) {
         >
           {zoomPercent}%
         </button>
-        <IconButton label="Export PNG" onClick={onExport}>
-          <Download size={20} />
-        </IconButton>
+        <FileMenu onExportPng={onExportPng} />
       </div>
     </nav>
   )

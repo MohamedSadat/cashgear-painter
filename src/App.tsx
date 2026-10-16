@@ -3,6 +3,7 @@ import { useRef, useState } from 'react'
 import { CanvasStage } from './components/CanvasStage'
 import { LayersPanel } from './components/LayersPanel'
 import { PropertiesPanel } from './components/PropertiesPanel'
+import { Toast } from './components/Toast'
 import { ToolRail } from './components/ToolRail'
 import { useShortcuts } from './hooks/useShortcuts'
 import { exportPng } from './lib/exportPng'
@@ -31,7 +32,7 @@ export default function App() {
   // on the right, the properties sit above the layers.
   return (
     <div className="flex h-dvh flex-col bg-neutral-100 sm:flex-row">
-      <ToolRail onExport={handleExport} />
+      <ToolRail onExportPng={handleExport} />
       <CanvasStage stageRef={stageRef} />
       <div className="flex h-56 shrink-0 flex-col border-t border-neutral-200 bg-white sm:h-auto sm:w-72 sm:border-t-0 sm:border-l">
         <div
@@ -60,6 +61,7 @@ export default function App() {
           className={`${shownOn('layers')} sm:flex-1 sm:border-t sm:border-neutral-200`}
         />
       </div>
+      <Toast />
     </div>
   )
 }

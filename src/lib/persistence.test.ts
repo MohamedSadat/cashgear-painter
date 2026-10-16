@@ -23,9 +23,12 @@ import {
   type VectorNode,
 } from '../types'
 import {
+  NOT_A_DRAWING,
   SAVE_DELAY_MS,
   STORAGE_KEY,
+  docToJson,
   loadDoc,
+  parseDocFile,
   sanitizeDoc,
   saveDoc,
   startAutosave,
@@ -154,6 +157,53 @@ describe('saveDoc and loadDoc', () => {
 
     expect(await saveDoc(docWith(stroke('a')), kv)).toBe(false)
     expect(await saveDoc(docWith(stroke('a')), null)).toBe(false)
+  })
+})
+
+describe('docToJson and parseDocFile', () => {
+  it('round-trips a drawing through a .painter.json file, rounded as autosave rounds it', () => {
+    const doc = groups()
+    doc.nodes.a = stroke('a', [[10.04, 20.06, 0.123]])
+    const text = docToJson(doc)
+
+    expect(JSON.parse(text).nodes.a.points).toEqual([[10, 20.1, 0.12]])
+    expect(parseDocFile(text)).toEqual({
+      ...doc,
+      nodes: { ...doc.nodes, a: stroke('a', [[10, 20.1, 0.12]]) },
+    })
+    // A byte order mark in front is fine.
+    expect(parseDocFile(String.fromCharCode(0xfeff) + text).rootIds).toEqual(['a', 'outer'])
+  })
+
+  it('rejects files that are not drawings', () => {
+    for (const text of [
+      '',
+      'not json',
+      '[]',
+      '{"nodes":{},"rootIds":[]}',
+      '{"version":2}',
+      'null',
+    ]) {
+      expect(() => parseDocFile(text)).toThrow(NOT_A_DRAWING)
+    }
+  })
+
+  it('rejects unknown versions, naming them', () => {
+    expect(() => parseDocFile('{"version":3,"nodes":{},"rootIds":[]}')).toThrow(
+      'This drawing is from an unknown version (3).',
+    )
+    expect(() => parseDocFile('{"version":"2","nodes":{},"rootIds":[]}')).toThrow('("2")')
+  })
+
+  it('drops malformed nodes as a loaded doc does', () => {
+    const doc = docWith(stroke('a'))
+    const file = {
+      ...doc,
+      nodes: { ...doc.nodes, b: { id: 'b', type: 'blob' } },
+      rootIds: ['a', 'b'],
+    }
+
+    expect(parseDocFile(JSON.stringify(file))).toEqual(doc)
   })
 })
 

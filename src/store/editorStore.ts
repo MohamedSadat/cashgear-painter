@@ -93,6 +93,11 @@ export interface Viewport {
   fit: number // scale at which the artboard fits the canvas area
 }
 
+export interface Toast {
+  id: number // a new id per message, so the same text shown twice still restarts its timer
+  message: string
+}
+
 /** An anchor of a path, by the path's id and the anchor's index. */
 export interface AnchorRef {
   id: NodeId
@@ -118,8 +123,10 @@ export interface EditorState {
   activeAnchor: AnchorRef | null // the direct-select tool's anchor, for Delete and the panel
   textStyle: TextStyle // for new text; not in history or autosave
   editingText: NodeId | null // the text the textarea overlay is editing
+  toast: Toast | null // a short message, such as what an import skipped
 
   addNodes(nodes: VectorNode[], parentId?: NodeId): void
+  replaceDoc(doc: Doc): void
   updateNodes(patch: Record<NodeId, Partial<VectorNode>>, mergeKey?: string): void
   deleteNodes(ids: NodeId[]): void
   reorder(ids: NodeId[], where: ZOrder): void
@@ -148,6 +155,8 @@ export interface EditorState {
   setActiveAnchor(anchor: AnchorRef | null): void
   setTextStyle(style: Partial<TextStyle>): void
   setEditingText(id: NodeId | null): void
+  showToast(message: string): void
+  dismissToast(id: number): void
   setViewport(viewport: Viewport): void
   setView(view: View): void
   zoomTo(zoom: number, anchor?: [x: number, y: number]): void
@@ -563,6 +572,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
   }
   // Pastes since the last copy, so repeated pastes step away from the original.
   let pasteCount = 0
+  let toastCount = 0
 
   return {
     doc: emptyDoc(),
@@ -583,8 +593,11 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     activeAnchor: null,
     textStyle: DEFAULT_TEXT_STYLE,
     editingText: null,
+    toast: null,
 
     addNodes(nodes, parentId) {
+      // Nodes inside an added group stay there: the group's childIds already place them.
+      const batch = new Set(nodes.map((node) => node.id))
       commit((doc) => {
         let order = doc.rootIds
         if (parentId !== undefined) {
@@ -595,9 +608,30 @@ export const useEditorStore = create<EditorState>()((set, get) => {
         const parentKey = parentId ?? null
         for (const node of nodes) {
           if (node.id in doc.nodes) continue
+          if (node.parentId !== null && batch.has(node.parentId)) {
+            doc.nodes[node.id] = node
+            continue
+          }
           doc.nodes[node.id] = node.parentId === parentKey ? node : { ...node, parentId: parentKey }
           order.push(node.id)
         }
+      })
+    },
+
+    replaceDoc(next) {
+      // An edit still open ends first, as its own step.
+      get().endGesture()
+      const { doc, past } = get()
+      if (next === doc) return
+      set({
+        doc: next,
+        past: pushSnapshot(past, doc),
+        future: [],
+        selection: [],
+        activeAnchor: null,
+        editingText: null,
+        erasing: [],
+        marquee: null,
       })
     },
 
@@ -936,6 +970,15 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 
     setEditingText(id) {
       set({ editingText: id })
+    },
+
+    showToast(message) {
+      toastCount += 1
+      set({ toast: { id: toastCount, message } })
+    },
+
+    dismissToast(id) {
+      if (get().toast?.id === id) set({ toast: null })
     },
 
     setViewport(next) {

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   IDENTITY_TRANSFORM,
+  emptyDoc,
   type GroupNode,
   type Point,
   type StrokeNode,
@@ -19,6 +20,7 @@ import {
   MIN_ZOOM,
   PASTE_OFFSET,
   createEllipseNode,
+  createGroupNode,
   createLineNode,
   createPathNode,
   createRectNode,
@@ -983,5 +985,59 @@ describe('text', () => {
     store().setTextStyle({ fontSize: 2 })
     expect(store().textStyle.fontSize).toBe(MIN_FONT_SIZE)
     expect(store().past).toHaveLength(0)
+  })
+})
+
+describe('files', () => {
+  it('adds a group with its children in one step, the group on top and the children inside', () => {
+    const before = draw(0)
+    const group = createGroupNode(['x', 'y'], null, 'g')
+    const x = { ...stroke(10, 'x'), parentId: 'g' }
+    const y = { ...stroke(20, 'y'), parentId: 'g' }
+
+    store().addNodes([group, x, y])
+
+    expect(ids()).toEqual([before.id, 'g'])
+    expect(store().doc.nodes.g).toEqual(group)
+    expect(store().doc.nodes.x.parentId).toBe('g')
+    expect(store().past).toHaveLength(2)
+  })
+
+  it('opens a doc in place of the drawing as one undo step, dropping the selection', () => {
+    const a = draw(0)
+    store().select([a.id])
+    const opened = { ...emptyDoc(), rootIds: ['b'], nodes: { b: stroke(5, 'b') } }
+
+    store().replaceDoc(opened)
+
+    expect(store().doc).toBe(opened)
+    expect(store().selection).toEqual([])
+    store().undo()
+    expect(ids()).toEqual([a.id])
+    store().redo()
+    expect(store().doc).toBe(opened)
+  })
+
+  it('ends an open gesture before opening, as its own step', () => {
+    const a = draw(0)
+    store().beginGesture()
+    store().updateNodes({ [a.id]: { size: 20 } })
+    store().replaceDoc(emptyDoc())
+
+    expect(store().gestureStart).toBeNull()
+    expect(store().past).toHaveLength(3)
+    store().undo()
+    expect(node(a.id).size).toBe(20)
+  })
+
+  it('shows one toast at a time, which only its own timer dismisses', () => {
+    store().showToast('first')
+    const first = store().toast!
+    store().showToast('second')
+    store().dismissToast(first.id)
+
+    expect(store().toast?.message).toBe('second')
+    store().dismissToast(store().toast!.id)
+    expect(store().toast).toBeNull()
   })
 })

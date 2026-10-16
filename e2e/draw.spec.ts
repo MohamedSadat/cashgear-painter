@@ -159,10 +159,16 @@ function handleAt(page: Page, name: string): Promise<Xy> {
   }, name)
 }
 
-/** Clicks Export PNG and returns the downloaded file with the RGBA values at the given pixels. */
+/** Opens the File menu and picks an item, such as 'Export PNG'. */
+async function fromFileMenu(page: Page, item: string) {
+  await page.getByRole('button', { name: 'File', exact: true }).click()
+  await page.getByRole('menuitem', { name: item }).click()
+}
+
+/** Picks File → Export PNG and returns the downloaded file with the RGBA values at the pixels. */
 async function exportPixels(page: Page, pixels: [number, number][]) {
   const downloadPromise = page.waitForEvent('download')
-  await page.getByRole('button', { name: 'Export PNG' }).click()
+  await fromFileMenu(page, 'Export PNG')
   const download = await downloadPromise
   const png = await readFile(await download.path())
 
@@ -1254,5 +1260,237 @@ test.describe('text, groups and layers on a 375 px phone', () => {
     expect((await exportPixels(page, [exportPixel([0.6, 0.65])])).values).toEqual([GREEN])
     await undo.tap()
     expect(await shownShapes(page)).toEqual(['Text', 'Rect'])
+  })
+})
+
+/** Picks a File menu item that opens a file picker, and hands the picker a file. */
+async function chooseFromFileMenu(page: Page, item: string, name: string, text: string) {
+  const chooser = page.waitForEvent('filechooser')
+  await fromFileMenu(page, item)
+  await (await chooser).setFiles({ name, mimeType: 'text/plain', buffer: Buffer.from(text) })
+}
+
+/** Picks a File menu item that downloads a file; returns its suggested name and its text. */
+async function downloadFromFileMenu(page: Page, item: string) {
+  const downloadPromise = page.waitForEvent('download')
+  await fromFileMenu(page, item)
+  const download = await downloadPromise
+  return { name: download.suggestedFilename(), text: await readFile(await download.path(), 'utf8') }
+}
+
+/**
+ * Draws the SVG at the PNG export's size, 3200 × 2000, and counts the pixels that differ from the
+ * PNG: `some` by more than 16 of 255 in a channel, as anti-aliased edges may, `far` by more than 96.
+ */
+function svgAgainstPng(page: Page, svg: string, png: Buffer) {
+  return page.evaluate(
+    async ({ svgUrl, pngUrl }) => {
+      const pixels = async (url: string) => {
+        const image = new Image()
+        image.src = url
+        await image.decode()
+        const canvas = document.createElement('canvas')
+        canvas.width = 3200
+        canvas.height = 2000
+        const ctx = canvas.getContext('2d')!
+        ctx.drawImage(image, 0, 0, 3200, 2000)
+        return ctx.getImageData(0, 0, 3200, 2000).data
+      }
+      const a = await pixels(pngUrl)
+      const b = await pixels(svgUrl)
+      let some = 0
+      let far = 0
+      for (let i = 0; i < a.length; i += 4) {
+        const d = Math.max(
+          Math.abs(a[i] - b[i]),
+          Math.abs(a[i + 1] - b[i + 1]),
+          Math.abs(a[i + 2] - b[i + 2]),
+        )
+        if (d > 16) some++
+        if (d > 96) far++
+      }
+      return { some, far }
+    },
+    {
+      svgUrl: `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`,
+      pngUrl: `data:image/png;base64,${png.toString('base64')}`,
+    },
+  )
+}
+
+test('the SVG export matches the PNG, and imports back as one group in one undo step', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const box = await artboardBox(page)
+
+  // A brush stroke, a red rectangle, a blue ellipse, an arrow, a green pen triangle and a text.
+  await drawLine(page, [0.1, 0.6], [0.4, 0.9])
+  await page.getByRole('button', { name: 'Rectangle' }).click()
+  await drawLine(page, [0.1, 0.1], [0.3, 0.3])
+  await page.getByRole('button', { name: 'Fill #ef4444' }).click()
+  await page.keyboard.press('o')
+  await drawLine(page, [0.4, 0.1], [0.6, 0.3])
+  await page.getByRole('button', { name: 'Fill #3b82f6' }).click()
+  await page.keyboard.press('l')
+  await drawLine(page, [0.5, 0.6], [0.9, 0.6])
+  await page.getByRole('button', { name: 'End arrowhead' }).click()
+  await page.keyboard.press('p')
+  await page.mouse.click(...onArtboard(box, [0.7, 0.1]))
+  await page.mouse.click(...onArtboard(box, [0.9, 0.2]))
+  await drag(page, onArtboard(box, [0.8, 0.4]), onArtboard(box, [0.75, 0.45]))
+  await page.mouse.click(...onArtboard(box, [0.7, 0.1]))
+  await page.getByRole('button', { name: 'Fill #22c55e' }).click()
+  await page.keyboard.press('t')
+  await page.mouse.click(...onArtboard(box, [0.55, 0.75]))
+  await page.keyboard.type('Hello SVG')
+  await page.keyboard.press('Control+Enter')
+  expect(await shownShapes(page)).toEqual(['Path', 'Rect', 'Ellipse', 'Arrow', 'Path', 'Text'])
+
+  const { name, text: svg } = await downloadFromFileMenu(page, 'Export SVG')
+  expect(name).toBe('drawing.svg')
+  expect(svg).toContain('viewBox="0 0 1600 1000" width="1600" height="1000"')
+  expect(svg).toContain('<marker id="arrow-end-1"')
+  expect(svg).toContain('>Hello SVG</tspan></text>')
+
+  // Drawn by Chrome's SVG renderer, the export looks like the canvas.
+  const { png } = await exportPixels(page, [])
+  const { some, far } = await svgAgainstPng(page, svg, png)
+  expect(far).toBeLessThan(200)
+  expect(some).toBeLessThan(3200 * 2000 * 0.002)
+
+  // Imported, it lands as one group on top, selected, named after the file. The text and the
+  // arrowhead's marker are skipped, and a toast says so.
+  await chooseFromFileMenu(page, 'Import SVG', 'drawing.svg', svg)
+  await expect(page.getByRole('status')).toContainText(
+    'Imported drawing. Skipped 2 unsupported elements',
+  )
+  expect(await shownShapes(page)).toEqual([
+    'Path',
+    'Rect',
+    'Ellipse',
+    'Arrow',
+    'Path',
+    'Text',
+    'Group',
+  ])
+  expect((await groupChildren(page, 6)).map((child) => child.type)).toEqual(Array(5).fill('Path'))
+  await expect(page.getByRole('button', { name: 'Select', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  expect(await selectedCount(page)).toBe(1)
+  await page.getByRole('button', { name: 'Dismiss' }).click()
+  await expect(page.getByRole('status')).toHaveText('')
+
+  // The import lies exactly over the drawing, and went in as one step.
+  const again = await exportPixels(page, [])
+  expect((await svgAgainstPng(page, svg, again.png)).far).toBeLessThan(200)
+  await undo.click()
+  expect(await shownShapes(page)).toHaveLength(6)
+})
+
+test('save and open a .painter.json drawing; Open is one undo step and refuses unknown versions', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const redo = page.getByRole('button', { name: 'Redo' })
+  await drawLine(page, [0.1, 0.6], [0.4, 0.9])
+  await page.getByRole('button', { name: 'Rectangle' }).click()
+  await drawLine(page, [0.1, 0.1], [0.3, 0.3])
+  const drawn = await shownAttr(page, 'x')
+
+  const saved = await downloadFromFileMenu(page, 'Save')
+  expect(saved.name).toBe('drawing.painter.json')
+  const doc = JSON.parse(saved.text)
+  expect(doc).toMatchObject({ version: 2, width: 1600, height: 1000, background: '#ffffff' })
+  expect(doc.rootIds).toHaveLength(2)
+
+  // Ctrl+S saves too, instead of the browser saving the page.
+  const viaKeys = page.waitForEvent('download')
+  await page.keyboard.press('Control+s')
+  expect((await viaKeys).suggestedFilename()).toBe('drawing.painter.json')
+
+  await page.getByRole('button', { name: 'Clear' }).click()
+  expect(await shownShapes(page)).toEqual([])
+
+  // Ctrl+O opens the file picker, as File → Open does.
+  const chooser = page.waitForEvent('filechooser')
+  await page.keyboard.press('Control+o')
+  await (
+    await chooser
+  ).setFiles({
+    name: 'drawing.painter.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(saved.text),
+  })
+  await expect.poll(() => shownShapes(page)).toEqual(['Path', 'Rect'])
+  expect(await shownAttr(page, 'x')).toEqual(drawn)
+
+  // Opening replaced the drawing in one step: undo brings back the cleared canvas.
+  await undo.click()
+  expect(await shownShapes(page)).toEqual([])
+  await redo.click()
+  expect(await shownShapes(page)).toEqual(['Path', 'Rect'])
+
+  // A file from a newer version, or not a drawing at all, changes nothing.
+  const future = JSON.stringify({ ...doc, version: 3 })
+  await chooseFromFileMenu(page, 'Open', 'future.painter.json', future)
+  await expect(page.getByRole('status')).toHaveText('This drawing is from an unknown version (3).')
+  await chooseFromFileMenu(page, 'Open', 'notes.json', '{"hello": "world"}')
+  await expect(page.getByRole('status')).toHaveText("This file isn't a Simple Painter drawing.")
+  expect(await shownShapes(page)).toEqual(['Path', 'Rect'])
+
+  // The opened drawing is autosaved like any other.
+  await expect.poll(() => savedNodeCount(page)).toBe(2)
+})
+
+test.describe('files on a 375 px phone', () => {
+  test.use({ viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: true })
+
+  test('the file menu exports and imports by touch', async ({ page }) => {
+    const finger = await fingerOn(page)
+    const undo = page.getByRole('button', { name: 'Undo' })
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(375)
+
+    await page.getByRole('button', { name: 'Ellipse' }).tap()
+    const box = await artboardBox(page)
+    await finger.drag(onArtboard(box, [0.2, 0.2]), onArtboard(box, [0.5, 0.6]))
+    expect(await shownShapes(page)).toEqual(['Ellipse'])
+
+    // The menu drops down inside the screen, with items big enough for a finger.
+    await page.getByRole('button', { name: 'File', exact: true }).tap()
+    const menu = (await page.getByRole('menu', { name: 'File' }).boundingBox())!
+    expect(menu.x).toBeGreaterThanOrEqual(0)
+    expect(menu.x + menu.width).toBeLessThanOrEqual(375)
+    const item = (await page.getByRole('menuitem', { name: 'Export SVG' }).boundingBox())!
+    expect(item.height).toBeGreaterThanOrEqual(40)
+    const downloadPromise = page.waitForEvent('download')
+    await page.getByRole('menuitem', { name: 'Export SVG' }).tap()
+    expect((await downloadPromise).suggestedFilename()).toBe('drawing.svg')
+    await expect(page.getByRole('menu')).toHaveCount(0)
+
+    // A circle, a line and a text: two paths in a group, and the text skipped.
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+      <circle cx="50" cy="50" r="40" fill="#22c55e"/>
+      <line x1="10" y1="90" x2="90" y2="90" stroke="#000" stroke-width="4"/>
+      <text x="10" y="20">Hi</text>
+    </svg>`
+    const chooser = page.waitForEvent('filechooser')
+    await page.getByRole('button', { name: 'File', exact: true }).tap()
+    await page.getByRole('menuitem', { name: 'Import SVG' }).tap()
+    await (
+      await chooser
+    ).setFiles({
+      name: 'badge.svg',
+      mimeType: 'image/svg+xml',
+      buffer: Buffer.from(svg),
+    })
+    await expect(page.getByRole('status')).toContainText('Skipped 1 unsupported element ')
+    expect(await shownShapes(page)).toEqual(['Ellipse', 'Group'])
+    expect((await exportPixels(page, [[100, 100]])).values).toEqual([GREEN])
+
+    await undo.tap()
+    expect(await shownShapes(page)).toEqual(['Ellipse'])
   })
 })
