@@ -122,9 +122,9 @@ async function savedNodeCount(page: Page) {
 
 /**
  * The top-level nodes of the autosaved doc, bottom to top; empty when nothing is saved or it
- * can't be read. Autosave lags edits by 500 ms, and a reload doesn't save (Chromium drops
- * IndexedDB writes begun in pagehide), so a test polls this for the doc it expects before it
- * reloads, rather than a node count an earlier save may already have.
+ * can't be read. Autosave lags edits by 500 ms, so a test polls this for the doc it expects,
+ * rather than a node count an earlier save may already have. A reload saves pending edits
+ * itself, from beforeunload; "a refresh right after drawing…" covers that.
  */
 async function savedNodes(page: Page) {
   const doc = await savedDoc(page)
@@ -729,6 +729,19 @@ test('the properties panel shows mixed values and restyles a whole selection as 
   await waitForCanvas(page)
   expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
   expect((await exportPixels(page, inside)).values).toEqual([RED, BLUE])
+})
+
+test('a refresh right after drawing keeps the drawing, though autosave waits 500 ms', async ({
+  page,
+}) => {
+  await page.keyboard.press('r')
+  await drawLine(page, [0.1, 0.1], [0.3, 0.3])
+
+  // Reloads at once, inside autosave's wait, so only the save before unload can keep the rectangle.
+  await page.reload()
+  await waitForCanvas(page)
+  expect(await shownShapes(page)).toEqual(['Rect'])
+  expect(await savedNodes(page)).toMatchObject([{ type: 'rect' }])
 })
 
 test('duplicate, delete and z-order have buttons for touch screens', async ({ page }) => {

@@ -258,19 +258,28 @@ export async function saveDoc(
 }
 
 /**
- * Saves the doc 500 ms after it stops changing, and right away when the page is hidden
- * (a refresh, tab switch or app switch). Returns a function that stops autosaving.
+ * Saves the doc 500 ms after it stops changing, and right away when the page is about to unload
+ * (a refresh or closed tab) or is hidden (a tab or app switch). Returns a function that stops
+ * autosaving.
+ *
+ * Chromium drops IndexedDB writes begun in `pagehide`, or in a `visibilitychange` to hidden
+ * during unload, so a refresh or close is saved from `beforeunload`. That listener is there only
+ * while a save is pending, because Firefox keeps a page with one out of its back/forward cache.
+ * `pagehide` and `visibilitychange` cover tab and app switches, and iOS Safari, which doesn't
+ * reliably fire `beforeunload`.
  */
 export function startAutosave(
   store: DocStore,
   kv: KeyValueStore | null = defaultKeyValueStore(),
 ): () => void {
+  const hasWindow = typeof window !== 'undefined'
   let timer: ReturnType<typeof setTimeout> | undefined
 
   const flush = () => {
     if (timer === undefined) return
     clearTimeout(timer)
     timer = undefined
+    if (hasWindow) window.removeEventListener('beforeunload', flush)
     void saveDoc(store.getState().doc, kv)
   }
 
@@ -278,12 +287,13 @@ export function startAutosave(
     if (state.doc === previous.doc) return
     clearTimeout(timer)
     timer = setTimeout(flush, SAVE_DELAY_MS)
+    // Adding the same listener again does nothing.
+    if (hasWindow) window.addEventListener('beforeunload', flush)
   })
 
   const onVisibilityChange = () => {
     if (document.visibilityState === 'hidden') flush()
   }
-  const hasWindow = typeof window !== 'undefined'
   if (hasWindow) {
     window.addEventListener('pagehide', flush)
     document.addEventListener('visibilitychange', onVisibilityChange)
@@ -293,6 +303,7 @@ export function startAutosave(
     clearTimeout(timer)
     unsubscribe()
     if (hasWindow) {
+      window.removeEventListener('beforeunload', flush)
       window.removeEventListener('pagehide', flush)
       document.removeEventListener('visibilitychange', onVisibilityChange)
     }

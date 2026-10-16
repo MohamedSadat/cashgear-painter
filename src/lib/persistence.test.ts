@@ -119,6 +119,7 @@ function docWith(...nodes: VectorNode[]): Doc {
 afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 describe('saveDoc and loadDoc', () => {
@@ -340,6 +341,31 @@ describe('sanitizeDoc', () => {
   })
 })
 
+/**
+ * Stand-ins for the window and document that autosave listens to, since tests run in Node.
+ * `beforeunloadListeners` counts the window's beforeunload listeners.
+ */
+function stubPage() {
+  const window = new EventTarget()
+  const document = Object.assign(new EventTarget(), {
+    visibilityState: 'visible' as DocumentVisibilityState,
+  })
+  const beforeunload = new Set<unknown>()
+  const add = window.addEventListener.bind(window)
+  const remove = window.removeEventListener.bind(window)
+  window.addEventListener = (type, listener, options) => {
+    if (type === 'beforeunload') beforeunload.add(listener)
+    add(type, listener, options)
+  }
+  window.removeEventListener = (type, listener, options) => {
+    if (type === 'beforeunload') beforeunload.delete(listener)
+    remove(type, listener, options)
+  }
+  vi.stubGlobal('window', window)
+  vi.stubGlobal('document', document)
+  return { window, document, beforeunloadListeners: () => beforeunload.size }
+}
+
 describe('startAutosave', () => {
   it(`saves ${SAVE_DELAY_MS} ms after the doc stops changing`, async () => {
     vi.useFakeTimers()
@@ -382,6 +408,53 @@ describe('startAutosave', () => {
     vi.advanceTimersByTime(SAVE_DELAY_MS * 2)
 
     expect(kv.data.has(STORAGE_KEY)).toBe(false)
+    stop()
+  })
+
+  it('saves a pending doc at once before unload, listening only while a save is pending', async () => {
+    vi.useFakeTimers()
+    const page = stubPage()
+    const kv = memoryStore()
+    const store = createStore<{ doc: Doc }>()(() => ({ doc: emptyDoc() }))
+    const stop = startAutosave(store, kv)
+    expect(page.beforeunloadListeners()).toBe(0)
+
+    store.setState({ doc: docWith(stroke('a')) })
+    store.setState({ doc: docWith(stroke('a'), stroke('b')) })
+    expect(page.beforeunloadListeners()).toBe(1)
+
+    // A refresh in Chromium saves only from here: writes begun in pagehide never land.
+    page.window.dispatchEvent(new Event('beforeunload'))
+    expect((await loadDoc(kv))?.rootIds).toEqual(['a', 'b'])
+    expect(page.beforeunloadListeners()).toBe(0)
+
+    // The timer's own save stops listening too, and stopping leaves no listener behind.
+    store.setState({ doc: docWith(stroke('c')) })
+    vi.advanceTimersByTime(SAVE_DELAY_MS)
+    expect((await loadDoc(kv))?.rootIds).toEqual(['c'])
+    expect(page.beforeunloadListeners()).toBe(0)
+    store.setState({ doc: docWith(stroke('d')) })
+    stop()
+    expect(page.beforeunloadListeners()).toBe(0)
+  })
+
+  it('saves a pending doc at once when the page is hidden', async () => {
+    vi.useFakeTimers()
+    const page = stubPage()
+    const kv = memoryStore()
+    const store = createStore<{ doc: Doc }>()(() => ({ doc: emptyDoc() }))
+    const stop = startAutosave(store, kv)
+
+    store.setState({ doc: docWith(stroke('a')) })
+    page.window.dispatchEvent(new Event('pagehide'))
+    expect((await loadDoc(kv))?.rootIds).toEqual(['a'])
+
+    store.setState({ doc: docWith(stroke('b')) })
+    page.document.visibilityState = 'hidden'
+    page.document.dispatchEvent(new Event('visibilitychange'))
+    expect((await loadDoc(kv))?.rootIds).toEqual(['b'])
+    expect(page.beforeunloadListeners()).toBe(0)
+
     stop()
   })
 })
