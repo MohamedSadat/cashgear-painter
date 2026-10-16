@@ -1,3 +1,4 @@
+import { useEditorStore } from '../store/editorStore'
 import type { ToolId } from '../types'
 import { brushTool } from './brushTool'
 import { directTool } from './directTool'
@@ -25,4 +26,14 @@ const TOOLS: Record<ToolId, ToolController> = {
 
 export function toolFor(id: ToolId): ToolController | undefined {
   return TOOLS[id]
+}
+
+/**
+ * Ends what the active tool is drawing, keeping what can be kept, such as a pen path: before a
+ * page switch or a file action.
+ */
+export function settleTool(): void {
+  const tool = toolFor(useEditorStore.getState().tool)
+  if (tool?.onSettle) tool.onSettle()
+  else tool?.onCancel?.()
 }

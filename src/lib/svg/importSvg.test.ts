@@ -14,6 +14,7 @@ import {
 import { applyTransform, canvasSegments, nodeBounds } from '../geometry/bounds'
 import { corner, type Cubic, type Xy } from '../geometry/pathData'
 import { absoluteTransform } from '../geometry/transform'
+import { solid } from '../paint/paint'
 import { strokeToPath } from '../strokePath'
 import {
   IDENTITY_TRANSFORM,
@@ -26,7 +27,13 @@ import {
   type VectorNode,
 } from '../../types'
 import { exportSvg } from './exportSvg'
-import { contourAnchors, contoursOf, importSvgElement, type SvgElementLike } from './importSvg'
+import {
+  contourAnchors,
+  contoursOf,
+  importSvgElement,
+  type ImportArea,
+  type SvgElementLike,
+} from './importSvg'
 
 /** Just enough of an XML element for the importer, as the DOM gives it in the browser. */
 class XmlElement implements SvgElementLike {
@@ -92,7 +99,8 @@ function parseXml(text: string): XmlElement {
 }
 
 const SVG_OPEN = '<svg xmlns="http://www.w3.org/2000/svg">'
-const importText = (svg: string, name?: string) => importSvgElement(parseXml(svg), name)
+const importText = (svg: string, name?: string, area?: ImportArea) =>
+  importSvgElement(parseXml(svg), name, area)
 
 /** The imported nodes by id, and the import's top-level children in order. */
 function imported(svg: string) {
@@ -133,7 +141,7 @@ function docOf(...nodes: VectorNode[]): Doc {
   const doc = emptyDoc()
   for (const node of nodes) {
     doc.nodes[node.id] = node
-    if (node.parentId === null) doc.rootIds.push(node.id)
+    if (node.parentId === null) doc.pages[0].rootIds.push(node.id)
   }
   return doc
 }
@@ -151,7 +159,7 @@ describe('importSvg round trip', () => {
   const rect = {
     ...createRectNode(
       { x: 100, y: 100, width: 300, height: 120 },
-      { ...DEFAULT_SHAPE_STYLE, fill: '#ef4444' },
+      { ...DEFAULT_SHAPE_STYLE, fill: solid('#ef4444') },
       'rect',
     ),
     cornerRadius: 12,
@@ -159,7 +167,7 @@ describe('importSvg round trip', () => {
   rect.transform = { ...rect.transform, rotation: 30 }
   const ellipse = createEllipseNode(
     { x: 500, y: 100, width: 200, height: 120 },
-    { fill: '#22c55e', stroke: null, strokeWidth: 4, opacity: 0.5 },
+    { fill: solid('#22c55e'), stroke: null, strokeWidth: 4, opacity: 0.5 },
     'ellipse',
   )
   const line = {
@@ -171,7 +179,12 @@ describe('importSvg round trip', () => {
     ),
     arrowEnd: true,
   }
-  const heart = createPathNode(HEART, true, { ...DEFAULT_SHAPE_STYLE, fill: '#fde047' }, 'heart')
+  const heart = createPathNode(
+    HEART,
+    true,
+    { ...DEFAULT_SHAPE_STYLE, fill: solid('#fde047') },
+    'heart',
+  )
   heart.transform = { ...heart.transform, x: 600, y: 400, rotation: 15 }
   const stroke: StrokeNode = {
     ...createStrokeNode(
@@ -238,12 +251,14 @@ describe('importSvg round trip', () => {
   it('keeps shapes where they were, with their corners and curves', () => {
     const [rectPath, ellipsePath, linePath] = result.children.slice(0, 3).map(asPath)
     expectSameCurves(canvasSegments(rectPath), canvasSegments(shapeToPath(rect)))
-    expect(rectPath.anchors).toHaveLength(8)
-    expect(rectPath.closed).toBe(true)
+    expect(rectPath.contours[0].anchors).toHaveLength(8)
+    expect(rectPath.contours[0].closed).toBe(true)
     expectSameCurves(canvasSegments(ellipsePath), canvasSegments(shapeToPath(ellipse)))
-    expect(ellipsePath.anchors.map((a) => a.kind)).toEqual(Array(4).fill('symmetric'))
-    expect(linePath.closed).toBe(false)
-    expect(linePath.anchors.map((a) => applyTransform(linePath.transform, a.x, a.y))).toEqual([
+    expect(ellipsePath.contours[0].anchors.map((a) => a.kind)).toEqual(Array(4).fill('symmetric'))
+    expect(linePath.contours[0].closed).toBe(false)
+    expect(
+      linePath.contours[0].anchors.map((a) => applyTransform(linePath.transform, a.x, a.y)),
+    ).toEqual([
       [450, 400],
       [700, 450],
     ])
@@ -252,8 +267,13 @@ describe('importSvg round trip', () => {
   it('keeps paths anchor for anchor, kinds included', () => {
     const path = asPath(result.children[3])
     expectSameCurves(canvasSegments(path), canvasSegments(heart))
-    expect(path.anchors.map((a) => a.kind)).toEqual(['corner', 'smooth', 'corner', 'symmetric'])
-    expect(path.closed).toBe(true)
+    expect(path.contours[0].anchors.map((a) => a.kind)).toEqual([
+      'corner',
+      'smooth',
+      'corner',
+      'symmetric',
+    ])
+    expect(path.contours[0].closed).toBe(true)
   })
 
   it('keeps a freehand stroke as its filled outline', () => {
@@ -261,10 +281,10 @@ describe('importSvg round trip', () => {
     const [outline] = contoursOf(strokeToPath(stroke), [
       'translate(50 0) rotate(10) scale(1.5 1.2)',
     ])
-    expect(path.closed).toBe(true)
+    expect(path.contours[0].closed).toBe(true)
     // The outline's own points, from its quadratic curves, are the path's anchors.
     const ends = [outline.start, ...outline.segments.map((segment) => segment[3])]
-    const anchors = path.anchors.map((a) => applyTransform(path.transform, a.x, a.y))
+    const anchors = path.contours[0].anchors.map((a) => applyTransform(path.transform, a.x, a.y))
     expect(anchors.length).toBeGreaterThan(10)
     anchors.forEach(([x, y], i) => {
       expect(x).toBeCloseTo(ends[i][0], 2)
@@ -280,14 +300,14 @@ describe('importSvg round trip', () => {
   it('keeps fill, outline and opacity, with a group’s opacity passed to its children', () => {
     const [rectPath, ellipsePath, linePath, , strokePath, groupCopy] = result.children
     expect(rectPath.style).toEqual({
-      fill: '#ef4444',
+      fill: solid('#ef4444'),
       stroke: '#000000',
       strokeWidth: 4,
       opacity: 1,
     })
-    expect(ellipsePath.style).toMatchObject({ fill: '#22c55e', stroke: null, opacity: 0.5 })
+    expect(ellipsePath.style).toMatchObject({ fill: solid('#22c55e'), stroke: null, opacity: 0.5 })
     expect(linePath.style).toEqual({ fill: null, stroke: '#3b82f6', strokeWidth: 6, opacity: 1 })
-    expect(strokePath.style).toMatchObject({ fill: '#a855f7', stroke: null, opacity: 1 })
+    expect(strokePath.style).toMatchObject({ fill: solid('#a855f7'), stroke: null, opacity: 1 })
     expect(groupCopy.style.opacity).toBe(1)
 
     const copy = asPath(result.nodes.get((groupCopy as GroupNode).childIds[0]))
@@ -323,7 +343,7 @@ describe('importSvg', () => {
       <polygon points="100 30, 110 40 120+5e-1"/>
     </svg>`)
     const paths = children.map(asPath)
-    expect(paths.map((p) => [p.anchors.length, p.closed])).toEqual([
+    expect(paths.map((p) => [p.contours[0].anchors.length, p.contours[0].closed])).toEqual([
       [4, true],
       [4, true],
       [8, true],
@@ -335,9 +355,16 @@ describe('importSvg', () => {
     // An rx alone rounds both ways.
     expect(nodeBounds(paths[2])).toEqual({ minX: 10, minY: 20, maxX: 40, maxY: 60 })
     expect(paths[3].style).toEqual({ fill: null, stroke: '#ff0000', strokeWidth: 1, opacity: 1 })
-    expect(paths[0].style).toEqual({ fill: '#000000', stroke: null, strokeWidth: 4, opacity: 1 })
+    expect(paths[0].style).toEqual({
+      fill: solid('#000000'),
+      stroke: null,
+      strokeWidth: 4,
+      opacity: 1,
+    })
     // Numbers may run together when the next one has a sign.
-    expect(paths[5].anchors.map((a) => applyTransform(paths[5].transform, a.x, a.y))).toEqual([
+    expect(
+      paths[5].contours[0].anchors.map((a) => applyTransform(paths[5].transform, a.x, a.y)),
+    ).toEqual([
       [100, 30],
       [110, 40],
       [120, 0.5],
@@ -381,10 +408,10 @@ describe('importSvg', () => {
     expect(group.style.opacity).toBe(0.5)
     const styles = (group as GroupNode).childIds.map((id) => nodes.get(id)!.style)
     expect(styles).toEqual([
-      { fill: '#00ff00', stroke: '#0000ff', strokeWidth: 3, opacity: 1 },
-      { fill: '#ff0000', stroke: null, strokeWidth: 4, opacity: 0.5 },
-      { fill: '#112233', stroke: null, strokeWidth: 4, opacity: 1 },
-      { fill: '#ffffff', stroke: null, strokeWidth: 4, opacity: 1 },
+      { fill: solid('#00ff00'), stroke: '#0000ff', strokeWidth: 3, opacity: 1 },
+      { fill: solid('#ff0000'), stroke: null, strokeWidth: 4, opacity: 0.5 },
+      { fill: solid('#112233'), stroke: null, strokeWidth: 4, opacity: 1 },
+      { fill: solid('#ffffff'), stroke: null, strokeWidth: 4, opacity: 1 },
     ])
   })
 
@@ -402,7 +429,7 @@ describe('importSvg', () => {
     // 100 mm is 377.95 px for 50 units: a scale of 7.559, and 2 more from the rect's own.
     const s = (100 * 96) / 25.4 / 50
     expect(path.style.strokeWidth).toBeCloseTo(2 * 2 * s, 2)
-    const corners = path.anchors.map((a) => applyTransform(path.transform, a.x, a.y))
+    const corners = path.contours[0].anchors.map((a) => applyTransform(path.transform, a.x, a.y))
     // (10, 5) turns to (-5, 10), doubles to (-10, 20), moves to (10, 30) and scales by s.
     expect(corners[2][0]).toBeCloseTo(10 * s, 2)
     expect(corners[2][1]).toBeCloseTo(30 * s, 2)
@@ -417,16 +444,24 @@ describe('importSvg', () => {
     expect(nodeBounds(children[0])).toEqual({ minX: 0, minY: 100, maxX: 400, maxY: 300 })
   })
 
-  it('makes a group of a shape with several subpaths, one path each', () => {
+  it('makes one path of a shape with several subpaths, a contour each, with its fill rule', () => {
     const { children, nodes } = imported(`${SVG_OPEN}
       <path d="M 0 0 h 10 v 10 h -10 z m 2 2 h 6 v 6 h -6 z" opacity="0.5"/>
+      <g style="fill-rule: evenodd"><path d="M 20 0 h 10 v 10 h -10 z m 2 2 h 6 v 6 h -6 z"/></g>
     </svg>`)
-    const [group] = children as [GroupNode]
-    expect(group.type).toBe('group')
-    expect(group.style.opacity).toBe(0.5)
-    const paths = group.childIds.map((id) => asPath(nodes.get(id)))
-    expect(paths.map((p) => p.anchors.length)).toEqual([4, 4])
-    expect(paths[1].transform).toMatchObject({ x: 2, y: 2 })
+    const [square, group] = children
+    const path = asPath(square)
+    expect(path.style.opacity).toBe(0.5)
+    expect(path.contours.map((c) => [c.anchors.length, c.closed])).toEqual([
+      [4, true],
+      [4, true],
+    ])
+    expect(path.transform).toMatchObject({ x: 0, y: 0 })
+    expect(path.contours[1].anchors[0]).toMatchObject({ x: 2, y: 2 })
+    // Nonzero is the default; the rule is inherited from groups.
+    expect(path.fillRule).toBe('nonzero')
+    const inner = asPath(nodes.get((group as GroupNode).childIds[0]))
+    expect(inner.fillRule).toBe('evenodd')
   })
 
   it('raises quadratic curves and arcs to cubics', () => {
@@ -441,7 +476,7 @@ describe('importSvg', () => {
     expect(c1[1] - start[1]).toBeCloseTo(200 / 3)
     expect(c2[0] - start[0]).toBeCloseTo(200 / 3)
     // The smooth quadratic continues the curve: a symmetric anchor between them.
-    expect(path.anchors[1].kind).toBe('symmetric')
+    expect(path.contours[0].anchors[1].kind).toBe('symmetric')
     // The half circle's top is 50 above its ends, plus half the outline.
     expect(nodeBounds(path)!.minY - start[1]).toBeCloseTo(-50.5, 1)
   })
@@ -460,6 +495,19 @@ describe('importSvg', () => {
     expect(nodeBounds(off.children[0])).toEqual({ minX: 750, minY: 450, maxX: 850, maxY: 550 })
   })
 
+  it('fits and centers the drawing on the page it is imported into', () => {
+    const result = importText(
+      `${SVG_OPEN}<rect x="0" y="0" width="1600" height="1000"/></svg>`,
+      'big',
+      { width: 794, height: 1123 },
+    )
+    const nodes = new Map(result.nodes.map((node) => [node.id, node]))
+    const group = nodes.get(result.groupId!) as GroupNode
+    const box = nodeBounds(nodes.get(group.childIds[0])!)!
+    expect(box.maxX - box.minX).toBeCloseTo(794)
+    expect((box.minY + box.maxY) / 2).toBeCloseTo(1123 / 2)
+  })
+
   it('leaves out a background rect that comes first and covers the whole viewBox', () => {
     const { children, skipped } =
       imported(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 50">
@@ -469,7 +517,7 @@ describe('importSvg', () => {
     </svg>`)
     expect(skipped).toBe(0)
     expect(children).toHaveLength(1)
-    expect(children[0].style.fill).toBe('#000000')
+    expect(children[0].style.fill).toEqual(solid('#000000'))
   })
 
   it('names the group after the file', () => {

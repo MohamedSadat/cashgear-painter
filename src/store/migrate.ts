@@ -1,6 +1,13 @@
 import { eraseSplit } from '../lib/geometry/eraseSplit'
-import { defaultKeyValueStore, loadDoc, saveDoc, type KeyValueStore } from '../lib/persistence'
-import { emptyDoc, type Doc, type Point, type StrokeNode } from '../types'
+import {
+  DEFAULT_PAGE_HEIGHT,
+  DEFAULT_PAGE_WIDTH,
+  FIRST_PAGE_ID,
+  emptyDoc,
+  type Doc,
+  type Point,
+  type StrokeNode,
+} from '../types'
 import { createStrokeNode, newNodeId } from './editorStore'
 
 export const V1_STORAGE_KEY = 'painter:v1'
@@ -15,7 +22,7 @@ export interface V1Stroke {
   points: Point[]
 }
 
-function defaultStorage(): Storage | null {
+export function defaultStorage(): Storage | null {
   // Reading localStorage itself throws when site data is blocked.
   try {
     return globalThis.localStorage ?? null
@@ -61,7 +68,7 @@ export function loadV1Strokes(storage: Storage | null = defaultStorage()): V1Str
 }
 
 /**
- * Turns v1 strokes into a v2 doc. Brush strokes become stroke nodes. v1 erased with
+ * Turns v1 strokes into a doc of one page. Brush strokes become stroke nodes. v1 erased with
  * destination-out, which only cut what was drawn before it, so each eraser stroke splits the
  * strokes collected so far and leaves later ones alone.
  */
@@ -83,23 +90,55 @@ export function migrateV1(strokes: V1Stroke[]): Doc {
   for (const node of kept) {
     const id = node.id in doc.nodes ? newNodeId() : node.id
     doc.nodes[id] = id === node.id ? node : { ...node, id }
-    doc.rootIds.push(id)
+    doc.pages[0].rootIds.push(id)
   }
   return doc
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+/** A v2 node in v3's shape: a fill string becomes a solid paint, a path's anchors one contour. */
+function migrateNodeV2(node: unknown): unknown {
+  if (!isObject(node)) return node
+  let out: Record<string, unknown> = node
+  const style = node.style
+  if (isObject(style) && typeof style.fill === 'string') {
+    out = { ...out, style: { ...style, fill: { kind: 'solid', color: style.fill } } }
+  }
+  if (node.type === 'path' && !('contours' in node)) {
+    const { anchors, closed, ...rest } = out
+    out = { ...rest, contours: [{ anchors, closed }], fillRule: 'nonzero' }
+  }
+  return out
+}
+
 /**
- * The doc to open on start: the v2 autosave when there is one, otherwise the v1 drawing migrated
- * once. The v1 key stays as a backup. Unreadable v2 data opens as an empty doc, without migrating.
+ * A v2 doc (autosave or file) in v3's shape, before sanitizeDoc checks it: the artboard becomes
+ * "Page 1", 1600 × 1000, with the same background and objects; fills become solid paints and
+ * each path's anchors one contour with the nonzero rule. Anything that isn't a v2 doc comes back
+ * as it is, for sanitizeDoc to refuse.
  */
-export async function loadStartupDoc(
-  kv: KeyValueStore | null = defaultKeyValueStore(),
-  storage: Storage | null = defaultStorage(),
-): Promise<Doc> {
-  const saved = await loadDoc(kv)
-  if (saved) return saved
-  const strokes = loadV1Strokes(storage)
-  const doc = migrateV1(strokes)
-  if (strokes.length > 0) await saveDoc(doc, kv)
-  return doc
+export function migrateV2(value: unknown): unknown {
+  if (!isObject(value) || value.version !== 2) return value
+  const nodes = isObject(value.nodes)
+    ? Object.fromEntries(Object.entries(value.nodes).map(([id, node]) => [id, migrateNodeV2(node)]))
+    : value.nodes
+  const background = typeof value.background === 'string' ? value.background : '#ffffff'
+  return {
+    version: 3,
+    pages: [
+      {
+        id: FIRST_PAGE_ID,
+        name: 'Page 1',
+        width: DEFAULT_PAGE_WIDTH,
+        height: DEFAULT_PAGE_HEIGHT,
+        background: { kind: 'solid', color: background },
+        rootIds: value.rootIds,
+      },
+    ],
+    nodes,
+    assets: {},
+  }
 }

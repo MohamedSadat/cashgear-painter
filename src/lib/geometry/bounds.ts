@@ -134,17 +134,28 @@ export function cubicBox(cubic: Cubic): Box {
   return pointsBox(points)
 }
 
-/** A path's segments in canvas units: transforming the control points transforms the curve. */
+/**
+ * A path's segments in canvas units, one list per contour: transforming the control points
+ * transforms the curve.
+ */
+export function contourSegments(node: PathNode): Cubic[][] {
+  const map = (x: number, y: number) => applyTransform(node.transform, x, y)
+  return node.contours.map((c) => pathSegments(c.anchors, c.closed, map))
+}
+
+/** All of a path's segments in canvas units, contour after contour. */
 export function canvasSegments(node: PathNode): Cubic[] {
-  return pathSegments(node.anchors, node.closed, (x, y) => applyTransform(node.transform, x, y))
+  return contourSegments(node).flat()
 }
 
 function pathBounds(node: PathNode): Box | null {
   const t = node.transform
   const boxes = canvasSegments(node).map(cubicBox)
   if (boxes.length === 0) {
-    if (node.anchors.length === 0) return null
-    boxes.push(pointsBox(node.anchors.map((a) => applyTransform(t, a.x, a.y))))
+    // A pen path's first anchor, before it has a segment.
+    const anchors = node.contours.flatMap((c) => c.anchors)
+    if (anchors.length === 0) return null
+    boxes.push(pointsBox(anchors.map((a) => applyTransform(t, a.x, a.y))))
   }
   // Boxed in canvas units, so the outline's reach scales here; paths bake their scale anyway.
   const pad = outlineReach(node) * Math.max(Math.abs(t.scaleX), Math.abs(t.scaleY))

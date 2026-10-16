@@ -11,6 +11,7 @@ import {
   useEditorStore,
   zoomOf,
 } from '../store/editorStore'
+import { solid } from '../lib/paint/paint'
 import type { Anchor, GroupNode, PathNode, Point, StrokeNode, TextNode } from '../types'
 import { brushTool } from './brushTool'
 import {
@@ -48,6 +49,14 @@ const at = (x: number, y: number, pointerType = 'mouse', pressure = 0.5): ToolEv
   mod: false,
   target: null,
   timeStamp: clock,
+})
+
+/** A measured canvas area whose box fits the 1600 × 1000 first page at `fit`. */
+const measured = (width: number, height: number, fit: number) => ({
+  width,
+  height,
+  boxWidth: 1600 * fit,
+  boxHeight: 1000 * fit,
 })
 
 /** A size-8 horizontal stroke along y from x = 0 to 100, added as its own history step. */
@@ -119,7 +128,7 @@ describe('dragBox', () => {
 describe('shape tools', () => {
   // At zoom 1, canvas units are screen pixels.
   beforeEach(() => {
-    store().setViewport({ width: 1000, height: 700, fit: 1 })
+    store().setViewport(measured(1000, 700, 1))
     store().setTool('rect')
   })
 
@@ -130,30 +139,30 @@ describe('shape tools', () => {
   })
 
   it('draws a rectangle as a draft, then commits it as one step, selected, with the select tool', () => {
-    store().setShapeStyle({ fill: '#22c55e' })
+    store().setShapeStyle({ fill: solid('#22c55e') })
 
     rectTool.onDown(at(10, 20))
     rectTool.onMove(at(60, 40))
     expect(store().draft).toMatchObject({ type: 'rect', width: 50, height: 20 })
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
     rectTool.onUp(at(110, 70))
 
     expect(store().draft).toBeNull()
     expect(store().past).toHaveLength(1)
-    const [id] = store().doc.rootIds
+    const [id] = store().doc.pages[0].rootIds
     expect(store().doc.nodes[id]).toMatchObject({
       type: 'rect',
       transform: { x: 10, y: 20, rotation: 0, scaleX: 1, scaleY: 1 },
       width: 100,
       height: 50,
       cornerRadius: 0,
-      style: { ...DEFAULT_SHAPE_STYLE, fill: '#22c55e' },
+      style: { ...DEFAULT_SHAPE_STYLE, fill: solid('#22c55e') },
     })
     expect(store().selection).toEqual([id])
     expect(store().tool).toBe('select')
 
     store().undo()
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
     expect(store().selection).toEqual([])
   })
 
@@ -163,7 +172,7 @@ describe('shape tools', () => {
     expect(store().draft).toMatchObject({ width: 40, height: 40 })
     rectTool.onUp(mods(140, 120, false, true))
 
-    const [id] = store().doc.rootIds
+    const [id] = store().doc.pages[0].rootIds
     expect(store().doc.nodes[id]).toMatchObject({
       transform: { x: 60, y: 80 },
       width: 80,
@@ -175,7 +184,7 @@ describe('shape tools', () => {
     ellipseTool.onDown(at(100, 100))
     ellipseTool.onUp(mods(160, 120, true))
 
-    const [id] = store().doc.rootIds
+    const [id] = store().doc.pages[0].rootIds
     expect(store().doc.nodes[id]).toMatchObject({
       type: 'ellipse',
       transform: { x: 130, y: 130 },
@@ -190,7 +199,7 @@ describe('shape tools', () => {
     lineTool.onDown(at(100, 100))
     lineTool.onUp(mods(200, 105, true))
 
-    const [line, snapped] = store().doc.rootIds.map((id) => store().doc.nodes[id])
+    const [line, snapped] = store().doc.pages[0].rootIds.map((id) => store().doc.nodes[id])
     expect(line).toMatchObject({
       type: 'line',
       transform: { x: 100, y: 100 },
@@ -202,12 +211,12 @@ describe('shape tools', () => {
   })
 
   it('gives a line an outline even when new shapes have none', () => {
-    store().setShapeStyle({ stroke: null, fill: '#ef4444' })
+    store().setShapeStyle({ stroke: null, fill: solid('#ef4444') })
 
     lineTool.onDown(at(0, 0))
     lineTool.onUp(at(100, 0))
 
-    const [id] = store().doc.rootIds
+    const [id] = store().doc.pages[0].rootIds
     expect(store().doc.nodes[id].style).toMatchObject({ fill: null, stroke: '#000000' })
     expect(lineStyleOf(store().shapeStyle).stroke).toBe('#000000')
   })
@@ -215,13 +224,13 @@ describe('shape tools', () => {
   it('draws nothing for a click, and keeps a level drag at least 1 unit tall', () => {
     rectTool.onDown(at(100, 100))
     rectTool.onUp(at(101, 101))
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
     expect(store().past).toEqual([])
     expect(store().tool).toBe('rect')
 
     rectTool.onDown(at(100, 100))
     rectTool.onUp(at(200, 100))
-    const [id] = store().doc.rootIds
+    const [id] = store().doc.pages[0].rootIds
     expect(store().doc.nodes[id]).toMatchObject({ width: 100, height: 1 })
   })
 
@@ -231,7 +240,7 @@ describe('shape tools', () => {
     rectTool.onDown(at(100, 100))
     rectTool.onUp(at(100.5, 100.5))
 
-    expect(store().doc.rootIds).toHaveLength(1)
+    expect(store().doc.pages[0].rootIds).toHaveLength(1)
   })
 
   it('drops the draft on cancel', () => {
@@ -241,7 +250,7 @@ describe('shape tools', () => {
     rectTool.onUp(at(50, 50))
 
     expect(store().draft).toBeNull()
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
     expect(store().tool).toBe('rect')
   })
 })
@@ -259,17 +268,17 @@ describe('brushTool', () => {
         [3, 4, 0.5],
       ],
     })
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
 
     brushTool.onUp(at(3, 4))
 
     expect(store().draft).toBeNull()
     expect(store().past).toHaveLength(1)
-    const [id] = store().doc.rootIds
+    const [id] = store().doc.pages[0].rootIds
     expect(store().doc.nodes[id]).toMatchObject({
       type: 'stroke',
       size: 20,
-      style: { fill: '#ef4444' },
+      style: { fill: solid('#ef4444') },
       usesPressure: false,
     })
   })
@@ -280,9 +289,9 @@ describe('brushTool', () => {
       brushTool.onUp(at(0, 0, pointerType))
     }
 
-    const nodes = store().doc.rootIds.map((id) => store().doc.nodes[id] as StrokeNode)
+    const nodes = store().doc.pages[0].rootIds.map((id) => store().doc.nodes[id] as StrokeNode)
     expect(nodes.map((n) => n.usesPressure)).toEqual([false, false, true])
-    expect(new Set(store().doc.rootIds).size).toBe(3)
+    expect(new Set(store().doc.pages[0].rootIds).size).toBe(3)
   })
 
   it('drops the draft on cancel', () => {
@@ -291,7 +300,7 @@ describe('brushTool', () => {
     brushTool.onUp(at(0, 0))
 
     expect(store().draft).toBeNull()
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
     expect(store().past).toEqual([])
   })
 })
@@ -305,16 +314,16 @@ describe('eraserTool', () => {
     eraserTool.onDown(at(50, -40))
     eraserTool.onMove(at(50, 40)) // a fast swipe across the top line only
     expect(store().erasing).toEqual([top.id])
-    expect(store().doc.rootIds).toHaveLength(2)
+    expect(store().doc.pages[0].rootIds).toHaveLength(2)
 
     eraserTool.onUp(at(50, 40))
 
     expect(store().erasing).toEqual([])
-    expect(store().doc.rootIds).toEqual([bottom.id])
+    expect(store().doc.pages[0].rootIds).toEqual([bottom.id])
     expect(store().past).toHaveLength(3)
 
     store().undo()
-    expect(store().doc.rootIds).toEqual([top.id, bottom.id])
+    expect(store().doc.pages[0].rootIds).toEqual([top.id, bottom.id])
   })
 
   it('skips hidden and locked nodes', () => {
@@ -324,7 +333,7 @@ describe('eraserTool', () => {
     eraserTool.onDown(at(50, 0))
     eraserTool.onUp(at(50, 0))
 
-    expect(store().doc.rootIds).toHaveLength(2)
+    expect(store().doc.pages[0].rootIds).toHaveLength(2)
     expect(store().past).toHaveLength(2)
   })
 
@@ -345,18 +354,18 @@ describe('eraserTool', () => {
     eraserTool.onUp(at(50, 0))
 
     expect(store().erasing).toEqual([])
-    expect(store().doc.rootIds).toHaveLength(1)
+    expect(store().doc.pages[0].rootIds).toHaveLength(1)
   })
 
   it('erases shapes it touches, and unfilled ones only on their outline', () => {
     const box = { x: 0, y: 0, width: 200, height: 100 }
     const empty = createRectNode(box, DEFAULT_SHAPE_STYLE)
-    const solid = createEllipseNode(
+    const filled = createEllipseNode(
       { ...box, x: 300 },
-      { ...DEFAULT_SHAPE_STYLE, fill: '#ef4444', stroke: null },
+      { ...DEFAULT_SHAPE_STYLE, fill: solid('#ef4444'), stroke: null },
     )
     const arrow = createLineNode([0, 300], [200, 300], DEFAULT_SHAPE_STYLE)
-    store().addNodes([empty, solid, arrow])
+    store().addNodes([empty, filled, arrow])
     store().setBrush({ size: 10 })
     const erase = (from: [number, number], to: [number, number]) => {
       eraserTool.onDown(at(...from))
@@ -365,19 +374,19 @@ describe('eraserTool', () => {
     }
 
     erase([100, 50], [120, 60]) // inside the empty rectangle
-    expect(store().doc.rootIds).toEqual([empty.id, solid.id, arrow.id])
-    erase([400, 50], [410, 50]) // inside the solid ellipse
+    expect(store().doc.pages[0].rootIds).toEqual([empty.id, filled.id, arrow.id])
+    erase([400, 50], [410, 50]) // inside the filled ellipse
     erase([100, 250], [100, 350]) // across the line
-    expect(store().doc.rootIds).toEqual([empty.id])
+    expect(store().doc.pages[0].rootIds).toEqual([empty.id])
     erase([100, -3], [120, -3]) // along the rectangle's top edge
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
     expect(store().past).toHaveLength(4)
   })
 })
 
 describe('handTool', () => {
   beforeEach(() => {
-    store().setViewport({ width: 1000, height: 700, fit: 0.5 })
+    store().setViewport(measured(1000, 700, 0.5))
     store().zoomTo(2)
   })
 
@@ -413,7 +422,7 @@ describe('selectTool', () => {
   // At zoom 1, canvas units are screen pixels.
   beforeEach(() => {
     selectTool.onCancel?.()
-    store().setViewport({ width: 1000, height: 700, fit: 1 })
+    store().setViewport(measured(1000, 700, 1))
   })
 
   const on = (x: number, y: number, target: string | null = null, shift = false): ToolEvent => ({
@@ -578,19 +587,19 @@ describe('selectTool', () => {
     expect(transformOf(a.id)).toMatchObject({ x: 10, y: 1 })
 
     selectTool.onKey?.(key(']', { ctrlKey: true, code: 'BracketRight' }))
-    expect(store().doc.rootIds).toEqual([b.id, a.id])
+    expect(store().doc.pages[0].rootIds).toEqual([b.id, a.id])
     selectTool.onKey?.(key('[', { metaKey: true, code: 'BracketLeft' }))
-    expect(store().doc.rootIds).toEqual([a.id, b.id])
+    expect(store().doc.pages[0].rootIds).toEqual([a.id, b.id])
     selectTool.onKey?.(key('}', { ctrlKey: true, shiftKey: true, code: 'BracketRight' }))
-    expect(store().doc.rootIds).toEqual([b.id, a.id])
+    expect(store().doc.pages[0].rootIds).toEqual([b.id, a.id])
 
     selectTool.onKey?.(key('d', { ctrlKey: true }))
-    expect(store().doc.rootIds).toHaveLength(3)
+    expect(store().doc.pages[0].rootIds).toHaveLength(3)
     const [copyId] = store().selection
     expect(copyId).not.toBe(a.id)
 
     selectTool.onKey?.(key('Delete'))
-    expect(store().doc.rootIds).toEqual([b.id, a.id])
+    expect(store().doc.pages[0].rootIds).toEqual([b.id, a.id])
     expect(store().selection).toEqual([])
     expect(selectTool.onKey?.(key('Delete'))).toBe(false)
   })
@@ -600,12 +609,12 @@ describe('selectTool', () => {
     store().select([a.id])
 
     selectTool.onKey?.(key('c', { ctrlKey: true }))
-    expect(store().doc.rootIds).toEqual([a.id])
+    expect(store().doc.pages[0].rootIds).toEqual([a.id])
     selectTool.onKey?.(key('x', { ctrlKey: true }))
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
 
     store().paste()
-    expect(store().doc.rootIds).toHaveLength(1)
+    expect(store().doc.pages[0].rootIds).toHaveLength(1)
     expect(store().clipboard.map((n) => n.id)).toEqual([a.id])
   })
 })
@@ -634,7 +643,7 @@ const keyEvent = (key: string, mods: Partial<KeyboardEvent> = {}) =>
 describe('penTool', () => {
   // At zoom 1, canvas units are screen pixels.
   beforeEach(() => {
-    store().setViewport({ width: 1000, height: 700, fit: 1 })
+    store().setViewport(measured(1000, 700, 1))
     store().setTool('pen')
   })
   // A path still being drawn ends with its test, not in the next test's fresh store.
@@ -653,15 +662,15 @@ describe('penTool', () => {
     penTool.onMove({ ...at(...to), shift })
     penTool.onUp(at(...to))
   }
-  const draftAnchors = () => (store().draft as PathNode | null)?.anchors
-  const added = () => store().doc.nodes[store().doc.rootIds[0]] as PathNode
+  const draftAnchors = () => (store().draft as PathNode | null)?.contours[0].anchors
+  const added = () => store().doc.nodes[store().doc.pages[0].rootIds[0]] as PathNode
 
   it('adds a corner per click and ends the open path on Enter, as one undo step', () => {
     click(10, 20)
     click(110, 20)
     click(110, 120)
     expect(draftAnchors()).toEqual([corner(0, 0), corner(100, 0), corner(100, 100)])
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
 
     expect(penTool.onKey?.(keyEvent('Enter'))).toBe(true)
 
@@ -669,15 +678,14 @@ describe('penTool', () => {
     expect(store().past).toHaveLength(1)
     expect(added()).toMatchObject({
       type: 'path',
-      closed: false,
       transform: { x: 10, y: 20, rotation: 0, scaleX: 1, scaleY: 1 },
       style: DEFAULT_SHAPE_STYLE,
-      anchors: [corner(0, 0), corner(100, 0), corner(100, 100)],
+      contours: [{ closed: false, anchors: [corner(0, 0), corner(100, 0), corner(100, 100)] }],
     })
     expect(store().selection).toEqual([added().id])
     expect(store().tool).toBe('select')
     store().undo()
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
   })
 
   it('pulls out smooth handles on a drag, opposite and equal at first', () => {
@@ -709,8 +717,7 @@ describe('penTool', () => {
 
     expect(store().draft).toBeNull()
     expect(added()).toMatchObject({
-      closed: true,
-      anchors: [corner(0, 0), corner(100, 0), corner(100, 100)],
+      contours: [{ closed: true, anchors: [corner(0, 0), corner(100, 0), corner(100, 100)] }],
     })
   })
 
@@ -718,13 +725,15 @@ describe('penTool', () => {
     click(0, 0)
     click(100, 0)
     click(102, 1)
-    expect(added()).toMatchObject({ closed: false, anchors: [corner(0, 0), corner(100, 0)] })
+    expect(added()).toMatchObject({
+      contours: [{ closed: false, anchors: [corner(0, 0), corner(100, 0)] }],
+    })
 
     store().setTool('pen')
     click(0, 300)
     click(100, 300)
     expect(penTool.onKey?.(keyEvent('Escape'))).toBe(true)
-    expect(store().doc.rootIds).toHaveLength(2)
+    expect(store().doc.pages[0].rootIds).toHaveLength(2)
     expect(store().past).toHaveLength(2)
   })
 
@@ -748,7 +757,7 @@ describe('penTool', () => {
 
     click(0, 0)
     finishPath()
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
     expect(store().past).toEqual([])
   })
 
@@ -762,7 +771,7 @@ describe('penTool', () => {
     // CanvasStage cancels the old tool after the switch.
     store().setTool('brush')
     penTool.onCancel?.()
-    expect(added().anchors).toEqual([corner(0, 0), corner(100, 0)])
+    expect(added().contours[0].anchors).toEqual([corner(0, 0), corner(100, 0)])
     expect(store().selection).toEqual([added().id])
     expect(store().tool).toBe('brush')
   })
@@ -781,7 +790,7 @@ describe('penTool', () => {
 describe('directTool', () => {
   // At zoom 1, canvas units are screen pixels.
   beforeEach(() => {
-    store().setViewport({ width: 1000, height: 700, fit: 1 })
+    store().setViewport(measured(1000, 700, 1))
     store().setTool('direct')
   })
 
@@ -827,18 +836,20 @@ describe('directTool', () => {
     press(on(50, 2, square.id))
     press(on(50, 2, square.id))
 
-    expect(pathOf(square.id).anchors).toHaveLength(5)
-    const added = pathOf(square.id).anchors[1]
+    expect(pathOf(square.id).contours[0].anchors).toHaveLength(5)
+    const added = pathOf(square.id).contours[0].anchors[1]
     expect(added.x).toBeCloseTo(50, 1)
     expect(added.y).toBe(0)
     expect(added.kind).toBe('corner')
-    expect(store().activeAnchor).toEqual({ id: square.id, index: 1 })
+    expect(store().activeAnchor).toEqual({ id: square.id, contour: 0, index: 1 })
     expect(store().past).toHaveLength(2)
   })
 
   it('adds nothing on a double-click far from the outline, or one slow to follow', () => {
     const square = addSquare()
-    store().updateNodes({ [square.id]: { style: { ...DEFAULT_SHAPE_STYLE, fill: '#ef4444' } } })
+    store().updateNodes({
+      [square.id]: { style: { ...DEFAULT_SHAPE_STYLE, fill: solid('#ef4444') } },
+    })
 
     press(on(50, 50, square.id))
     press(on(50, 50, square.id))
@@ -847,7 +858,7 @@ describe('directTool', () => {
     wait(1000)
     press(on(50, 1, square.id))
 
-    expect(pathOf(square.id).anchors).toHaveLength(4)
+    expect(pathOf(square.id).contours[0].anchors).toHaveLength(4)
   })
 
   it('deletes the active anchor, then the path once it has fewer than 2', () => {
@@ -858,20 +869,20 @@ describe('directTool', () => {
     )
     store().addNodes([path])
     store().select([path.id])
-    store().setActiveAnchor({ id: path.id, index: 1 })
+    store().setActiveAnchor({ id: path.id, contour: 0, index: 1 })
 
     expect(directTool.onKey?.(keyEvent('Delete'))).toBe(true)
-    expect(pathOf(path.id).anchors).toEqual([corner(0, 0), corner(100, 0)])
+    expect(pathOf(path.id).contours[0].anchors).toEqual([corner(0, 0), corner(100, 0)])
     expect(store().activeAnchor).toBeNull()
 
-    store().setActiveAnchor({ id: path.id, index: 0 })
+    store().setActiveAnchor({ id: path.id, contour: 0, index: 0 })
     expect(deleteActiveAnchor()).toBe(true)
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
     expect(store().selection).toEqual([])
     expect(deleteActiveAnchor()).toBe(false)
     store().undo()
     store().undo()
-    expect(pathOf(path.id).anchors).toHaveLength(3)
+    expect(pathOf(path.id).contours[0].anchors).toHaveLength(3)
   })
 
   it('deletes and nudges the selection without an active anchor', () => {
@@ -881,21 +892,21 @@ describe('directTool', () => {
     directTool.onKey?.(keyEvent('ArrowRight', { shiftKey: true }))
     expect(pathOf(square.id).transform).toMatchObject({ x: 10, y: 0 })
     directTool.onKey?.(keyEvent('Backspace'))
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
   })
 
   it('nudges the active anchor on screen, merging quick nudges into one step', () => {
     const square = addSquare()
     store().updateNodes({ [square.id]: { transform: { ...square.transform, rotation: 90 } } })
     store().select([square.id])
-    store().setActiveAnchor({ id: square.id, index: 1 })
+    store().setActiveAnchor({ id: square.id, contour: 0, index: 1 })
     const steps = store().past.length
 
     directTool.onKey?.(keyEvent('ArrowRight'))
     directTool.onKey?.(keyEvent('ArrowRight'))
 
     // Turned a quarter, the path's own -y axis points right on screen.
-    const anchor = pathOf(square.id).anchors[1]
+    const anchor = pathOf(square.id).contours[0].anchors[1]
     expect(anchor.x).toBeCloseTo(100, 9)
     expect(anchor.y).toBeCloseTo(-2, 9)
     expect(store().past).toHaveLength(steps + 1)
@@ -905,20 +916,30 @@ describe('directTool', () => {
     const smooth: Anchor = { x: 100, y: 0, inX: -20, inY: 0, outX: 20, outY: 0, kind: 'smooth' }
     const path = createPathNode([corner(0, 0), smooth, corner(200, 0)], false, DEFAULT_SHAPE_STYLE)
     store().addNodes([{ ...path, transform: { ...path.transform, x: 1000, y: 500 } }])
-    const ref = { id: path.id, index: 1 }
+    const ref = { id: path.id, contour: 0, index: 1 }
 
     store().beginGesture()
     moveAnchorTo(ref, [1090, 510])
     moveAnchorTo(ref, [1100, 520])
     store().endGesture()
-    expect(pathOf(path.id).anchors[1]).toMatchObject({ x: 100, y: 20, inX: -20, outX: 20 })
+    expect(pathOf(path.id).contours[0].anchors[1]).toMatchObject({
+      x: 100,
+      y: 20,
+      inX: -20,
+      outX: 20,
+    })
     expect(store().past).toHaveLength(2)
 
     // A smooth anchor turns its other handle in line; Alt breaks the link.
     moveHandleTo(ref, 'out', [1100, 560], false)
-    expect(pathOf(path.id).anchors[1]).toMatchObject({ outX: 0, outY: 40, inX: 0, inY: -20 })
+    expect(pathOf(path.id).contours[0].anchors[1]).toMatchObject({
+      outX: 0,
+      outY: 40,
+      inX: 0,
+      inY: -20,
+    })
     moveHandleTo(ref, 'out', [1130, 520], true)
-    expect(pathOf(path.id).anchors[1]).toMatchObject({
+    expect(pathOf(path.id).contours[0].anchors[1]).toMatchObject({
       outX: 30,
       outY: 0,
       inY: -20,
@@ -930,11 +951,11 @@ describe('directTool', () => {
   it('sets the active anchor kind, pulling out handles for a bare corner', () => {
     const square = addSquare()
     store().select([square.id])
-    store().setActiveAnchor({ id: square.id, index: 1 })
+    store().setActiveAnchor({ id: square.id, contour: 0, index: 1 })
 
     setActiveAnchorKind('symmetric')
 
-    const anchor = pathOf(square.id).anchors[1]
+    const anchor = pathOf(square.id).contours[0].anchors[1]
     expect(anchor.kind).toBe('symmetric')
     expect(anchor.outX).toBeCloseTo(-anchor.inX, 9)
     expect(Math.hypot(anchor.outX, anchor.outY)).toBeCloseTo(100 / 3, 9)
@@ -943,7 +964,7 @@ describe('directTool', () => {
   it('clears the active anchor on Esc, then the selection', () => {
     const square = addSquare()
     store().select([square.id])
-    store().setActiveAnchor({ id: square.id, index: 0 })
+    store().setActiveAnchor({ id: square.id, contour: 0, index: 0 })
 
     expect(directTool.onKey?.(keyEvent('Escape'))).toBe(true)
     expect(store().activeAnchor).toBeNull()
@@ -956,7 +977,7 @@ describe('directTool', () => {
 
 describe('selectTool double-click', () => {
   beforeEach(() => {
-    store().setViewport({ width: 1000, height: 700, fit: 1 })
+    store().setViewport(measured(1000, 700, 1))
     store().setTool('select')
   })
   afterEach(() => {
@@ -1057,12 +1078,12 @@ describe('selectTool groups from the keyboard', () => {
 
     expect(selectTool.onKey?.(keyEvent('g', { ctrlKey: true }))).toBe(true)
     const [second] = store().selection
-    expect(store().doc.rootIds).toEqual([first, second])
+    expect(store().doc.pages[0].rootIds).toEqual([first, second])
     const steps = store().past.length
 
     store().select([first, second])
     expect(selectTool.onKey?.(keyEvent('G', { ctrlKey: true, shiftKey: true }))).toBe(true)
-    expect(store().doc.rootIds).toEqual([a.id, b.id, c.id, d.id])
+    expect(store().doc.pages[0].rootIds).toEqual([a.id, b.id, c.id, d.id])
     expect(store().selection).toEqual([a.id, b.id, c.id, d.id])
     expect(store().past).toHaveLength(steps + 1)
   })
@@ -1088,7 +1109,7 @@ describe('selectTool groups from the keyboard', () => {
 describe('textTool', () => {
   // At zoom 1, canvas units are screen pixels.
   beforeEach(() => {
-    store().setViewport({ width: 1000, height: 700, fit: 1 })
+    store().setViewport(measured(1000, 700, 1))
     store().setTool('text')
   })
   afterEach(() => {
@@ -1122,7 +1143,7 @@ describe('textTool', () => {
     expect(store().tool).toBe('select')
     expect(store().selection).toEqual([id])
     store().undo()
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
   })
 
   it('sets the width with a drag, showing the box meanwhile', () => {
@@ -1142,7 +1163,7 @@ describe('textTool', () => {
     textTool.onUp(at(100, 200))
     type('   ')
     finishTextEdit()
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
     expect(store().past).toHaveLength(0)
     expect(store().tool).toBe('text')
 
@@ -1150,7 +1171,7 @@ describe('textTool', () => {
     textTool.onUp(at(100, 200))
     type('Gone')
     cancelTextEdit()
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
     expect(store().past).toHaveLength(0)
   })
 
@@ -1161,7 +1182,7 @@ describe('textTool', () => {
     textTool.onDown(e)
     textTool.onUp(e)
     expect(store().editingText).toBe(text.id)
-    expect(store().doc.rootIds).toHaveLength(1)
+    expect(store().doc.pages[0].rootIds).toHaveLength(1)
 
     type('Hi there')
     finishTextEdit()
@@ -1170,7 +1191,7 @@ describe('textTool', () => {
     startTextEdit(text.id)
     type('')
     finishTextEdit()
-    expect(store().doc.rootIds).toEqual([])
+    expect(store().doc.pages[0].rootIds).toEqual([])
     expect(store().past).toHaveLength(3)
     store().undo()
     expect(textOf(text.id).text).toBe('Hi there')
@@ -1203,7 +1224,7 @@ describe('eraserTool in groups', () => {
     eraserTool.onMove(at(50, 505))
     eraserTool.onUp(at(50, 505))
     expect(a.id in store().doc.nodes).toBe(false)
-    expect(store().doc.rootIds).toEqual([groupId])
+    expect(store().doc.pages[0].rootIds).toEqual([groupId])
 
     eraserTool.onDown(at(50, 600))
     eraserTool.onUp(at(50, 600))
@@ -1226,8 +1247,8 @@ describe('eraserTool in split mode', () => {
 
     eraserTool.onDown(at(50, -40))
     eraserTool.onMove(at(50, 40)) // a fast swipe across the top line only
-    const [, cutOff] = store().doc.rootIds
-    expect(store().doc.rootIds).toEqual([top.id, cutOff, bottom.id])
+    const [, cutOff] = store().doc.pages[0].rootIds
+    expect(store().doc.pages[0].rootIds).toEqual([top.id, cutOff, bottom.id])
     // Reach is eraser radius 5 + brush radius 4.
     expect(xs(top.id)[1]).toBeCloseTo(41, 1)
     expect(xs(cutOff)[0]).toBeCloseTo(59, 1)
@@ -1237,7 +1258,7 @@ describe('eraserTool in split mode', () => {
     eraserTool.onMove(at(80, -40)) // a second cut, through the piece on the right
     eraserTool.onUp(at(80, -40))
 
-    expect(store().doc.rootIds).toHaveLength(4)
+    expect(store().doc.pages[0].rootIds).toHaveLength(4)
     expect(store().doc.nodes[bottom.id]).toBe(bottom)
     expect(store().past).toHaveLength(3)
     expect(store().past.at(-1)).toBe(before)
@@ -1258,7 +1279,7 @@ describe('eraserTool in split mode', () => {
     eraserTool.onDown(at(50, 0))
     eraserTool.onUp(at(50, 0))
 
-    expect(store().doc.rootIds).toEqual([other.id])
+    expect(store().doc.pages[0].rootIds).toEqual([other.id])
     expect(Object.keys(store().doc.nodes)).toEqual([other.id])
   })
 
@@ -1267,7 +1288,7 @@ describe('eraserTool in split mode', () => {
       { x: 0, y: -50, width: 100, height: 100 },
       {
         ...DEFAULT_SHAPE_STYLE,
-        fill: '#ef4444',
+        fill: solid('#ef4444'),
       },
     )
     const line = createLineNode([0, 0], [100, 0], DEFAULT_SHAPE_STYLE)
@@ -1317,7 +1338,7 @@ describe('eraserTool in split mode', () => {
     eraserTool.onUp(at(100, 40))
 
     // Reach on the canvas is 5 + 8: from x = 87 to 113, which is 43.5 to 56.5 in its own units.
-    const [, other] = store().doc.rootIds
+    const [, other] = store().doc.pages[0].rootIds
     expect(xs(a.id)[1]).toBeCloseTo(43.5, 1)
     expect(xs(other)[0]).toBeCloseTo(56.5, 1)
     expect(store().doc.nodes[other].transform).toEqual(a.transform)
@@ -1330,7 +1351,7 @@ describe('eraserTool in split mode', () => {
 
     eraserTool.onDown(at(50, -40))
     eraserTool.onMove(at(50, 40))
-    expect(store().doc.rootIds).toHaveLength(2)
+    expect(store().doc.pages[0].rootIds).toHaveLength(2)
     eraserTool.onCancel?.()
     eraserTool.onUp(at(50, 40))
 
@@ -1359,7 +1380,7 @@ describe('eraserTool in split mode', () => {
     eraserTool.onMove(at(50, 40))
     eraserTool.onUp(at(50, 40))
 
-    expect(store().doc.rootIds).toHaveLength(2)
-    expect(store().doc.rootIds[0]).toBe(a.id)
+    expect(store().doc.pages[0].rootIds).toHaveLength(2)
+    expect(store().doc.pages[0].rootIds[0]).toBe(a.id)
   })
 })

@@ -1,10 +1,10 @@
 import { Bezier } from 'bezier-js'
-import type { PathNode, ShapeNode, StrokeNode, TextNode, VectorNode } from '../../types'
+import type { FillRule, PathNode, ShapeNode, StrokeNode, TextNode, VectorNode } from '../../types'
 import {
   applyTransform,
   arrowHeadSize,
   boxesOverlap,
-  canvasSegments,
+  contourSegments,
   isIdentity,
   nodeBounds,
   outlineReach,
@@ -61,6 +61,35 @@ export function pointInPolygon(p: Vec, polygon: ReadonlyArray<Vec>): boolean {
   return inside
 }
 
+/** How many times the polygon winds around the point: positive counterclockwise on screen. */
+function windingNumber(p: Vec, polygon: ReadonlyArray<Vec>): number {
+  let winding = 0
+  for (let i = 0; i < polygon.length; i++) {
+    const a = polygon[i]
+    const b = polygon[(i + 1) % polygon.length]
+    if (a[1] <= p[1]) {
+      if (b[1] > p[1] && cross(a, b, p) > 0) winding += 1
+    } else if (b[1] <= p[1] && cross(a, b, p) < 0) winding -= 1
+  }
+  return winding
+}
+
+/**
+ * Whether the point lies inside the area the polygons fill together, as canvas and SVG fill a
+ * path of several contours: under even-odd, inside an odd number of them; under nonzero, wound
+ * around a nonzero number of times, so a contour turning the other way cuts a hole.
+ */
+export function pointInPolygons(
+  p: Vec,
+  polygons: ReadonlyArray<ReadonlyArray<Vec>>,
+  rule: FillRule,
+): boolean {
+  if (rule === 'evenodd') {
+    return polygons.reduce((inside, polygon) => inside !== pointInPolygon(p, polygon), false)
+  }
+  return polygons.reduce((sum, polygon) => sum + windingNumber(p, polygon), 0) !== 0
+}
+
 const canvasPointsCache = new WeakMap<StrokeNode, Vec[]>()
 
 /** A stroke's points in canvas units, after its transform. */
@@ -74,11 +103,22 @@ function canvasPoints(node: StrokeNode): ReadonlyArray<Vec> {
   return points
 }
 
-/** A piece of a shape's outline in canvas units; filled pieces are hit inside too. */
-interface Contour {
+/** A piece of a shape's outline. */
+interface Outline {
   points: Vec[]
   closed: boolean
-  filled: boolean
+}
+
+/** An area a shape fills: one or more polygons, filled together by the rule. */
+interface Area {
+  polygons: Vec[][]
+  rule: FillRule
+}
+
+/** Where a shape has ink: its outlines, hit near their edges, and its filled areas. */
+interface Ink {
+  outlines: Outline[]
+  areas: Area[]
 }
 
 // Segments per quarter of a rounded corner, and around a whole ellipse.
@@ -147,67 +187,77 @@ function flattenSegments(segments: Cubic[]): Vec[] {
   return points
 }
 
-/** A shape's outline pieces in its own coordinates. */
-function localContours(node: ShapeNode): Contour[] {
+/** A shape's ink in its own coordinates. */
+function localInk(node: ShapeNode): Ink {
+  const filled = node.style.fill !== null
+  const closedShape = (points: Vec[]): Ink => ({
+    outlines: [{ points, closed: true }],
+    areas: filled ? [{ polygons: [points], rule: 'nonzero' }] : [],
+  })
   switch (node.type) {
     case 'path': {
-      const points = flattenSegments(pathSegments(node.anchors, node.closed))
-      // Canvas and SVG fill an open path as if it were closed.
-      return points.length < 2
-        ? []
-        : [{ points, closed: node.closed, filled: node.style.fill !== null }]
+      // One outline per contour; each segment of a contour starts where the previous one ended.
+      const outlines = node.contours
+        .map((c) => ({
+          points: flattenSegments(pathSegments(c.anchors, c.closed)),
+          closed: c.closed,
+        }))
+        .filter((outline) => outline.points.length >= 2)
+      // Canvas and SVG fill an open contour as if it were closed.
+      const areas: Area[] =
+        filled && outlines.length > 0
+          ? [{ polygons: outlines.map((o) => o.points), rule: node.fillRule }]
+          : []
+      return { outlines, areas }
     }
     case 'rect':
-      return [
-        {
-          points: roundedRectPoints(node.width, node.height, node.cornerRadius),
-          closed: true,
-          filled: node.style.fill !== null,
-        },
-      ]
+      return closedShape(roundedRectPoints(node.width, node.height, node.cornerRadius))
     case 'ellipse': {
       const points: Vec[] = []
       for (let i = 0; i < ELLIPSE_STEPS; i++) {
         const angle = (i / ELLIPSE_STEPS) * Math.PI * 2
         points.push([node.rx * Math.cos(angle), node.ry * Math.sin(angle)])
       }
-      return [{ points, closed: true, filled: node.style.fill !== null }]
+      return closedShape(points)
     }
     case 'line': {
       const [x1, y1, x2, y2] = node.points
       const start: Vec = [x1, y1]
       const end: Vec = [x2, y2]
-      const contours: Contour[] = [{ points: [start, end], closed: false, filled: false }]
+      const ink: Ink = { outlines: [{ points: [start, end], closed: false }], areas: [] }
       // Arrowheads are filled with the line's color.
       const size = arrowHeadSize(node.style.strokeWidth)
-      const filled = node.style.stroke !== null
-      if (node.arrowEnd)
-        contours.push({ points: arrowHead(end, start, size), closed: true, filled })
-      if (node.arrowStart) {
-        contours.push({ points: arrowHead(start, end, size), closed: true, filled })
+      const heads: Vec[][] = []
+      if (node.arrowEnd) heads.push(arrowHead(end, start, size))
+      if (node.arrowStart) heads.push(arrowHead(start, end, size))
+      for (const head of heads) {
+        ink.outlines.push({ points: head, closed: true })
+        if (node.style.stroke !== null) ink.areas.push({ polygons: [head], rule: 'nonzero' })
       }
-      return contours
+      return ink
     }
   }
 }
 
-const contoursCache = new WeakMap<ShapeNode, Contour[]>()
+const inkCache = new WeakMap<ShapeNode, Ink>()
 
-/** A shape's outline pieces in canvas units, after its transform. */
-function canvasContours(node: ShapeNode): Contour[] {
-  let contours = contoursCache.get(node)
-  if (!contours) {
-    contours = localContours(node).map((c) => ({
-      ...c,
-      points: c.points.map((p) => applyTransform(node.transform, p[0], p[1])),
-    }))
-    contoursCache.set(node, contours)
+/** A shape's ink in canvas units, after its transform. */
+function canvasInk(node: ShapeNode): Ink {
+  let ink = inkCache.get(node)
+  if (!ink) {
+    const place = (points: Vec[]) => points.map((p) => applyTransform(node.transform, p[0], p[1]))
+    const local = localInk(node)
+    ink = {
+      outlines: local.outlines.map((o) => ({ ...o, points: place(o.points) })),
+      areas: local.areas.map((a) => ({ ...a, polygons: a.polygons.map(place) })),
+    }
+    inkCache.set(node, ink)
   }
-  return contours
+  return ink
 }
 
-/** Shortest distance from the segment a–b to the contour's edges. */
-function contourDistance({ points, closed }: Contour, a: Vec, b: Vec): number {
+/** Shortest distance from the segment a–b to the outline's edges. */
+function outlineDistance({ points, closed }: Outline, a: Vec, b: Vec): number {
   let best = Infinity
   const count = closed ? points.length : points.length - 1
   for (let i = 0; i < count; i++) {
@@ -221,7 +271,7 @@ const isShape = (node: VectorNode): node is ShapeNode =>
   node.type === 'rect' || node.type === 'ellipse' || node.type === 'line' || node.type === 'path'
 
 /** A text's box in canvas units, after its transform: Konva picks text anywhere in its box. */
-function textContour(node: TextNode): Contour {
+function textOutline(node: TextNode): Outline {
   const box = textBox(node)
   const corners: Vec[] = [
     [box.minX, box.minY],
@@ -229,11 +279,7 @@ function textContour(node: TextNode): Contour {
     [box.maxX, box.maxY],
     [box.minX, box.maxY],
   ]
-  return {
-    points: corners.map((p) => applyTransform(node.transform, p[0], p[1])),
-    closed: true,
-    filled: true,
-  }
+  return { points: corners.map((p) => applyTransform(node.transform, p[0], p[1])), closed: true }
 }
 
 /**
@@ -261,21 +307,22 @@ export function nodeHitsSegment(node: VectorNode, a: Vec, b: Vec, radius: number
   }
 
   if (node.type === 'text') {
-    const contour = textContour(node)
-    return contourDistance(contour, a, b) <= radius || pointInPolygon(a, contour.points)
+    const outline = textOutline(node)
+    return outlineDistance(outline, a, b) <= radius || pointInPolygon(a, outline.points)
   }
 
   if (!isShape(node)) return false
   const reach = radius + outlineReach(node) * scale
-  return canvasContours(node).some(
-    (contour) =>
-      contourDistance(contour, a, b) <= reach ||
-      (contour.filled && pointInPolygon(a, contour.points)),
+  const ink = canvasInk(node)
+  return (
+    ink.outlines.some((outline) => outlineDistance(outline, a, b) <= reach) ||
+    ink.areas.some((area) => pointInPolygons(a, area.polygons, area.rule))
   )
 }
 
 export interface PathPoint {
-  segment: number // index of the segment, which starts at the anchor of the same index
+  contour: number // index of the contour
+  segment: number // index of the segment in it, which starts at the anchor of the same index
   t: number // 0..1 along it
   distance: number // canvas units from the point asked about
 }
@@ -283,11 +330,12 @@ export interface PathPoint {
 /** The point of a path's outline nearest a canvas point, found by bezier-js; null without segments. */
 export function nearestOnPath(node: PathNode, { 0: x, 1: y }: Vec): PathPoint | null {
   let best: PathPoint | null = null
-  const segments = canvasSegments(node)
-  for (let segment = 0; segment < segments.length; segment++) {
-    const p = new Bezier(...segments[segment].flat()).project({ x, y })
-    const distance = Math.hypot(p.x - x, p.y - y)
-    if (!best || distance < best.distance) best = { segment, t: p.t, distance }
-  }
+  contourSegments(node).forEach((segments, contour) => {
+    for (let segment = 0; segment < segments.length; segment++) {
+      const p = new Bezier(...segments[segment].flat()).project({ x, y })
+      const distance = Math.hypot(p.x - x, p.y - y)
+      if (!best || distance < best.distance) best = { contour, segment, t: p.t, distance }
+    }
+  })
   return best
 }

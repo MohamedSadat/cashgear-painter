@@ -86,21 +86,24 @@ function paintedPixels(page: Page) {
   })
 }
 
-type SavedDoc = { rootIds: string[]; nodes: Record<string, { transform: Transform }> }
+type SavedDoc = {
+  pages: { rootIds: string[] }[]
+  nodes: Record<string, { transform: Transform }>
+}
 type Transform = { x: number; y: number; rotation: number; scaleX: number; scaleY: number }
 
-/** The autosaved doc in IndexedDB: null when nothing is saved, undefined when it can't be read. */
-function savedDoc(page: Page) {
+/** A value the app keeps in IndexedDB: null when there is none, undefined when it can't be read. */
+function savedValue(page: Page, key: string) {
   return page.evaluate(
-    () =>
-      new Promise<SavedDoc | null | undefined>((resolve) => {
+    (key) =>
+      new Promise<unknown>((resolve) => {
         const open = indexedDB.open('painter')
         // Never create the database here: the app's own first open has to do that.
         open.onupgradeneeded = () => open.transaction?.abort()
         open.onerror = () => resolve(undefined)
         open.onsuccess = () => {
           const db = open.result
-          const request = db.transaction('kv').objectStore('kv').get('painter:v2')
+          const request = db.transaction('kv').objectStore('kv').get(key)
           request.onsuccess = () => {
             db.close()
             resolve(request.result ?? null)
@@ -111,24 +114,29 @@ function savedDoc(page: Page) {
           }
         }
       }),
+    key,
   )
 }
 
-/** Number of nodes in the autosaved doc in IndexedDB; -1 when it can't be read. */
+/** The autosaved doc in IndexedDB: null when nothing is saved, undefined when it can't be read. */
+const savedDoc = (page: Page) =>
+  savedValue(page, 'painter:v3') as Promise<SavedDoc | null | undefined>
+
+/** Number of top-level nodes on the autosaved doc's first page; -1 when it can't be read. */
 async function savedNodeCount(page: Page) {
   const doc = await savedDoc(page)
-  return doc === undefined ? -1 : (doc?.rootIds.length ?? 0)
+  return doc === undefined ? -1 : (doc?.pages[0].rootIds.length ?? 0)
 }
 
 /**
- * The top-level nodes of the autosaved doc, bottom to top; empty when nothing is saved or it
+ * The top-level nodes of the autosaved doc's first page, bottom to top; empty when nothing is saved or it
  * can't be read. Autosave lags edits by 500 ms, so a test polls this for the doc it expects,
  * rather than a node count an earlier save may already have. A reload saves pending edits
  * itself, from beforeunload; "a refresh right after drawing…" covers that.
  */
 async function savedNodes(page: Page) {
   const doc = await savedDoc(page)
-  return doc ? doc.rootIds.map((id) => doc.nodes[id]) : []
+  return doc ? doc.pages[0].rootIds.map((id) => doc.nodes[id]) : []
 }
 
 /** The transform of every shape on the content layer, bottom to top, as Konva holds it. */
@@ -289,7 +297,7 @@ test('opens a v1 drawing with its eraser strokes applied', async ({ page }) => {
   await page.reload()
   await waitForCanvas(page)
 
-  // Migration is not an undo step, and it is saved as v2 right away.
+  // Migration is not an undo step, and it is saved as v3 right away.
   await expect(page.getByRole('button', { name: 'Undo' })).toBeDisabled()
   await expect(page.getByRole('button', { name: 'Clear' })).toBeEnabled()
   await expect.poll(() => savedNodeCount(page)).toBe(2)
@@ -319,7 +327,7 @@ test('opens a v1 drawing with its eraser strokes applied', async ({ page }) => {
 })
 
 test('the PNG is the same at any zoom and pan', async ({ page }) => {
-  const zoomLabel = page.getByRole('button', { name: 'Fit artboard' })
+  const zoomLabel = page.getByRole('button', { name: 'Fit page' })
   await drawLine(page, [0.2, 0.3], [0.8, 0.7])
   const fitted = await exportPixels(page, [[1600, 1000]])
   expect(fitted.values).toEqual([BLACK])
@@ -338,7 +346,7 @@ test('the PNG is the same at any zoom and pan', async ({ page }) => {
 })
 
 test('strokes land under the pointer at 10% and 3200%', async ({ page }) => {
-  const zoomLabel = page.getByRole('button', { name: 'Fit artboard' })
+  const zoomLabel = page.getByRole('button', { name: 'Fit page' })
   // The biggest brush, so a pointer rounded to whole pixels at 10% still lands inside the stroke.
   for (let i = 0; i < 40; i++) await page.keyboard.press(']')
   await expect(page.getByLabel('Brush size')).toHaveValue('64')
@@ -371,7 +379,7 @@ test('Space-drag and the hand tool pan without drawing; Ctrl+0 and Ctrl+1 zoom',
   page,
 }) => {
   const undo = page.getByRole('button', { name: 'Undo' })
-  const zoomLabel = page.getByRole('button', { name: 'Fit artboard' })
+  const zoomLabel = page.getByRole('button', { name: 'Fit page' })
   const fitted = await artboardBox(page)
   const fittedZoom = (await zoomLabel.textContent())!
   const start = onArtboard(fitted, [0.5, 0.5])
@@ -722,8 +730,8 @@ test('the properties panel shows mixed values and restyles a whole selection as 
   await expect
     .poll(() => savedNodes(page))
     .toMatchObject([
-      { type: 'rect', style: { fill: '#ef4444', strokeWidth: 4 } },
-      { type: 'ellipse', style: { fill: '#3b82f6', strokeWidth: 4 } },
+      { type: 'rect', style: { fill: { kind: 'solid', color: '#ef4444' }, strokeWidth: 4 } },
+      { type: 'ellipse', style: { fill: { kind: 'solid', color: '#3b82f6' }, strokeWidth: 4 } },
     ])
   await page.reload()
   await waitForCanvas(page)
@@ -754,9 +762,9 @@ test('duplicate, delete and z-order have buttons for touch screens', async ({ pa
   expect(await shownShapes(page)).toEqual(['Ellipse', 'Rect'])
   await page.getByRole('button', { name: 'Bring forward' }).click()
   expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
-  await page.getByRole('button', { name: 'Duplicate' }).click()
+  await page.getByRole('button', { name: 'Duplicate', exact: true }).click()
   expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse', 'Ellipse'])
-  await page.getByRole('button', { name: 'Delete' }).click()
+  await page.getByRole('button', { name: 'Delete', exact: true }).click()
   expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
   await expect(page.getByRole('heading', { name: 'Nothing selected' })).toBeVisible()
 
@@ -851,7 +859,7 @@ function anchorCount(page: Page) {
   return page.evaluate(
     () =>
       (window as unknown as { Konva: typeof Konva }).Konva.stages[0].find((n: Konva.Node) =>
-        /^anchor-\d+$/.test(n.name()),
+        /^anchor-\d+-\d+$/.test(n.name()),
       ).length,
   )
 }
@@ -895,16 +903,16 @@ test('the pen draws a closed heart that reshapes by its handles, one undo step e
   const [heart] = (await shownAttr(page, 'data')) as string[]
 
   // Pulling the left lobe's handle up makes the lobe taller.
-  await drag(page, await overlayPointOf(page, 'handle-out-1'), onArtboard(box, [0.3, 0]))
+  await drag(page, await overlayPointOf(page, 'handle-out-0-1'), onArtboard(box, [0.3, 0]))
   expect((await exportPixels(page, [aboveLobe])).values).toEqual([RED])
   const [taller] = (await shownAttr(page, 'data')) as string[]
 
   // Alt-drag moves one handle of the smooth right lobe and leaves the other alone.
-  const otherHandle = await overlayPointOf(page, 'handle-in-3')
+  const otherHandle = await overlayPointOf(page, 'handle-in-0-3')
   await page.keyboard.down('Alt')
-  await drag(page, await overlayPointOf(page, 'handle-out-3'), onArtboard(box, [0.8, 0.6]))
+  await drag(page, await overlayPointOf(page, 'handle-out-0-3'), onArtboard(box, [0.8, 0.6]))
   await page.keyboard.up('Alt')
-  expect(await overlayPointOf(page, 'handle-in-3')).toEqual(otherHandle)
+  expect(await overlayPointOf(page, 'handle-in-0-3')).toEqual(otherHandle)
   await expect(page.getByRole('button', { name: 'Corner' })).toHaveAttribute('aria-pressed', 'true')
 
   // Alt-drag, drag, fill and the path itself: a step each.
@@ -1021,12 +1029,12 @@ test.describe('paths on a 375 px phone', () => {
     // The path stays selected; direct select shows its anchors, and a handle drags by touch.
     await page.getByRole('button', { name: 'Direct select' }).tap()
     await expect.poll(() => anchorCount(page)).toBe(3)
-    const handle = await overlayPointOf(page, 'handle-out-1')
-    const twin = await overlayPointOf(page, 'handle-in-1')
+    const handle = await overlayPointOf(page, 'handle-out-0-1')
+    const twin = await overlayPointOf(page, 'handle-in-0-1')
     await finger.drag(handle, [handle[0], handle[1] + 60])
     expect(await shownAttr(page, 'data')).not.toEqual(drawn)
     // The smooth anchor's other handle swings to stay in line.
-    expect(await overlayPointOf(page, 'handle-in-1')).not.toEqual(twin)
+    expect(await overlayPointOf(page, 'handle-in-0-1')).not.toEqual(twin)
 
     // A rectangle converts with a tap.
     await page.getByRole('button', { name: 'Rectangle' }).tap()
@@ -1452,8 +1460,11 @@ test('save and open a .painter.json drawing; Open is one undo step and refuses u
   const saved = await downloadFromFileMenu(page, 'Save')
   expect(saved.name).toBe('drawing.painter.json')
   const doc = JSON.parse(saved.text)
-  expect(doc).toMatchObject({ version: 2, width: 1600, height: 1000, background: '#ffffff' })
-  expect(doc.rootIds).toHaveLength(2)
+  expect(doc).toMatchObject({
+    version: 3,
+    pages: [{ width: 1600, height: 1000, background: { kind: 'solid', color: '#ffffff' } }],
+  })
+  expect(doc.pages[0].rootIds).toHaveLength(2)
 
   // Ctrl+S saves too, instead of the browser saving the page.
   const viaKeys = page.waitForEvent('download')
@@ -1485,9 +1496,9 @@ test('save and open a .painter.json drawing; Open is one undo step and refuses u
   expect(await shownShapes(page)).toEqual(['Path', 'Rect'])
 
   // A file from a newer version, or not a drawing at all, changes nothing.
-  const future = JSON.stringify({ ...doc, version: 3 })
+  const future = JSON.stringify({ ...doc, version: 4 })
   await chooseFromFileMenu(page, 'Open', 'future.painter.json', future)
-  await expect(page.getByRole('status')).toHaveText('This drawing is from an unknown version (3).')
+  await expect(page.getByRole('status')).toHaveText('This drawing is from an unknown version (4).')
   await chooseFromFileMenu(page, 'Open', 'notes.json', '{"hello": "world"}')
   await expect(page.getByRole('status')).toHaveText("This file isn't a Simple Painter drawing.")
   expect(await shownShapes(page)).toEqual(['Path', 'Rect'])
@@ -1834,4 +1845,233 @@ test('release: every object type turns, restyles, reorders and deletes, one undo
   }
   await undo.click()
   await expect(undo).toBeDisabled()
+})
+
+/** Writes a value into the app's IndexedDB store, as an older version would have saved it. */
+function putSaved(page: Page, key: string, value: unknown) {
+  return page.evaluate(
+    ({ key, value }) =>
+      new Promise<void>((resolve, reject) => {
+        const open = indexedDB.open('painter')
+        open.onerror = () => reject(open.error)
+        open.onsuccess = () => {
+          const db = open.result
+          const tx = db.transaction('kv', 'readwrite')
+          tx.objectStore('kv').put(value, key)
+          tx.oncomplete = () => {
+            db.close()
+            resolve()
+          }
+          tx.onerror = () => {
+            db.close()
+            reject(tx.error)
+          }
+        }
+      }),
+    { key, value },
+  )
+}
+
+/** The pages panel's page names, in order, and the current one. */
+async function pageNames(page: Page) {
+  const buttons = page.getByRole('list', { name: 'Page list' }).getByRole('button')
+  const names = await buttons.evaluateAll((all) =>
+    all.map((b) => `${b.getAttribute('aria-label')}${b.getAttribute('aria-current') ? '*' : ''}`),
+  )
+  return names
+}
+
+/** The artboard's width over its height, as the canvas shows the current page. */
+async function pageRatio(page: Page) {
+  const box = await artboardBox(page)
+  return Math.round((box.width / box.height) * 100) / 100
+}
+
+test('a v2 drawing opens as one 1600 × 1000 page that looks the same', async ({ page }) => {
+  const corner = (x: number, y: number) => ({
+    x,
+    y,
+    inX: 0,
+    inY: 0,
+    outX: 0,
+    outY: 0,
+    kind: 'corner',
+  })
+  const base = {
+    parentId: null,
+    hidden: false,
+    locked: false,
+    transform: { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1 },
+  }
+  const v2 = {
+    version: 2,
+    width: 1600,
+    height: 1000,
+    background: '#ffffff',
+    rootIds: ['r', 'p'],
+    nodes: {
+      r: {
+        ...base,
+        id: 'r',
+        type: 'rect',
+        name: 'Rectangle',
+        transform: { ...base.transform, x: 200, y: 200 },
+        style: { fill: '#ef4444', stroke: '#000000', strokeWidth: 8, opacity: 1 },
+        width: 400,
+        height: 300,
+        cornerRadius: 0,
+      },
+      p: {
+        ...base,
+        id: 'p',
+        type: 'path',
+        name: 'Path',
+        transform: { ...base.transform, x: 800, y: 500 },
+        style: { fill: '#3b82f6', stroke: null, strokeWidth: 4, opacity: 1 },
+        anchors: [corner(0, 0), corner(300, 0), corner(300, 300)],
+        closed: true,
+      },
+    },
+  }
+  await putSaved(page, 'painter:v2', v2)
+  await page.reload()
+  await waitForCanvas(page)
+
+  // Migration is not an undo step, and the drawing shows on one page of the same size.
+  await expect(page.getByRole('button', { name: 'Undo' })).toBeDisabled()
+  expect(await shownShapes(page)).toEqual(['Rect', 'Path'])
+  expect(await pageNames(page)).toEqual(['Page 1*'])
+  const { png, values } = await exportPixels(page, [
+    [800, 700],
+    [2100, 1100],
+    [2600, 1800],
+  ])
+  expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([3200, 2000])
+  expect(values).toEqual([RED, BLUE, WHITE])
+
+  // Saved as v3 right away; the v2 drawing stays as a backup.
+  await expect
+    .poll(async () => ((await savedDoc(page)) as { version?: number } | null)?.version)
+    .toBe(3)
+  expect(await savedValue(page, 'painter:v2')).toEqual(v2)
+})
+
+test('pages add, show, resize, rename, reorder and delete, one undo step each', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const redo = page.getByRole('button', { name: 'Redo' })
+  const pages = page.getByRole('complementary', { name: 'Pages' })
+
+  await drawLine(page, [0.2, 0.5], [0.8, 0.5])
+  await pages.getByRole('button', { name: 'Add page' }).click()
+  expect(await pageNames(page)).toEqual(['Page 1', 'Page 2*'])
+  expect(await shownShapes(page)).toEqual([])
+  await drawLine(page, [0.2, 0.2], [0.4, 0.4])
+  expect(await shownShapes(page)).toEqual(['Path'])
+
+  // PageUp and PageDown go through the pages; each keeps what was drawn on it.
+  await page.keyboard.press('PageUp')
+  expect(await pageNames(page)).toEqual(['Page 1*', 'Page 2'])
+  expect(await shownShapes(page)).toEqual(['Path'])
+  await page.keyboard.press('PageDown')
+  expect(await pageNames(page)).toEqual(['Page 1', 'Page 2*'])
+
+  // Its thumbnail is drawn from the page.
+  await expect(pages.getByRole('button', { name: 'Page 1' }).locator('img')).toHaveAttribute(
+    'src',
+    /^blob:/,
+  )
+
+  // A square page exports as a square PNG, twice its size.
+  await page.getByRole('button', { name: 'Select', exact: true }).click()
+  await page.getByRole('combobox', { name: 'Page size' }).selectOption('square')
+  expect(await pageRatio(page)).toBe(1)
+  const { png } = await exportPixels(page, [])
+  expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([2160, 2160])
+
+  // Undo takes back the resize, the stroke and the added page, one step each.
+  await undo.click()
+  expect(await pageRatio(page)).toBe(1.6)
+  await undo.click()
+  expect(await shownShapes(page)).toEqual([])
+  await undo.click()
+  expect(await pageNames(page)).toEqual(['Page 1*'])
+  await redo.click()
+  await redo.click()
+  await redo.click()
+  expect(await pageNames(page)).toEqual(['Page 1', 'Page 2*'])
+  expect(await pageRatio(page)).toBe(1)
+
+  // A double-click renames a page, as one step.
+  await pages.getByRole('button', { name: 'Page 2' }).dblclick()
+  await pages.getByRole('textbox', { name: 'Page name' }).fill('Cover')
+  await page.keyboard.press('Enter')
+  expect(await pageNames(page)).toEqual(['Page 1', 'Cover*'])
+
+  // Dragging a page above another moves it there.
+  const cover = (await pages.getByRole('button', { name: 'Cover' }).boundingBox())!
+  const first = (await pages.getByRole('button', { name: 'Page 1' }).boundingBox())!
+  await drag(
+    page,
+    [cover.x + cover.width / 2, cover.y + cover.height / 2],
+    [first.x + first.width / 2, first.y + 4],
+  )
+  expect(await pageNames(page)).toEqual(['Cover*', 'Page 1'])
+  await undo.click()
+  expect(await pageNames(page)).toEqual(['Page 1', 'Cover*'])
+
+  // Deleting the page shows its neighbour; undo brings it back and shows it.
+  await pages.getByRole('button', { name: 'Delete page' }).click()
+  expect(await pageNames(page)).toEqual(['Page 1*'])
+  await expect(pages.getByRole('button', { name: 'Delete page' })).toBeDisabled()
+  await undo.click()
+  expect(await pageNames(page)).toEqual(['Page 1', 'Cover*'])
+  expect(await shownShapes(page)).toEqual(['Path'])
+})
+
+test('a right-click moves the selection to another page, where it was on this one', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  await page.getByRole('button', { name: 'Rectangle' }).click()
+  await drawLine(page, [0.1, 0.1], [0.3, 0.3])
+  const placed = await shownAttr(page, 'x')
+  await page
+    .getByRole('complementary', { name: 'Pages' })
+    .getByRole('button', { name: 'Add page' })
+    .click()
+  await page.keyboard.press('PageUp')
+  expect(await shownShapes(page)).toEqual(['Rect'])
+
+  // On its outline: an unfilled rectangle is picked there only.
+  const box = await artboardBox(page)
+  await page.mouse.click(...onArtboard(box, [0.1, 0.2]), { button: 'right' })
+  await page.getByRole('menuitem', { name: 'Move to Page 2' }).click()
+  await expect(page.getByRole('status')).toHaveText('Moved 1 object to Page 2.')
+  expect(await shownShapes(page)).toEqual([])
+  await page.keyboard.press('PageDown')
+  expect(await shownShapes(page)).toEqual(['Rect'])
+  expect(await shownAttr(page, 'x')).toEqual(placed)
+
+  // One undo step, shown where it happened.
+  await undo.click()
+  expect(await shownShapes(page)).toEqual([])
+  await page.keyboard.press('PageUp')
+  expect(await shownShapes(page)).toEqual(['Rect'])
+})
+
+test.describe('pages on a 375 px phone', () => {
+  test.use({ viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: true })
+
+  test('the Pages tab adds and shows pages by touch, within the screen', async ({ page }) => {
+    await page.getByRole('tab', { name: 'Pages' }).tap()
+    const pages = page.getByRole('complementary', { name: 'Pages' })
+    await pages.getByRole('button', { name: 'Add page' }).tap()
+    await pages.getByRole('button', { name: 'Add page' }).tap()
+    expect(await pageNames(page)).toEqual(['Page 1', 'Page 2', 'Page 3*'])
+    await pages.getByRole('button', { name: 'Page 1' }).tap()
+    expect(await pageNames(page)).toEqual(['Page 1*', 'Page 2', 'Page 3'])
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(375)
+  })
 })

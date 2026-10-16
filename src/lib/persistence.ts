@@ -1,7 +1,24 @@
 import { createStore, get, set } from 'idb-keyval'
-import { emptyDoc, type Doc, type NodeId, type Point, type VectorNode } from '../types'
+import { defaultStorage, loadV1Strokes, migrateV1, migrateV2 } from '../store/migrate'
+import {
+  DEFAULT_PAGE_HEIGHT,
+  DEFAULT_PAGE_WIDTH,
+  emptyDoc,
+  newPage,
+  type AssetMeta,
+  type Contour,
+  type Doc,
+  type NodeId,
+  type Page,
+  type Point,
+  type VectorNode,
+} from '../types'
+import { clampPageSize } from './pages'
+import { isPaint } from './paint/paint'
 
-export const STORAGE_KEY = 'painter:v2'
+export const STORAGE_KEY = 'painter:v3'
+// v2's autosave, migrated once and then kept as a backup.
+export const V2_STORAGE_KEY = 'painter:v2'
 export const SAVE_DELAY_MS = 500
 const DB_NAME = 'painter'
 const DB_STORE_NAME = 'kv'
@@ -92,7 +109,7 @@ const isColor = (value: unknown) => value === null || typeof value === 'string'
 function isStyle(value: unknown): boolean {
   return (
     isObject(value) &&
-    isColor(value.fill) &&
+    (value.fill === null || isPaint(value.fill)) &&
     isColor(value.stroke) &&
     isFiniteNumber(value.strokeWidth) &&
     isFiniteNumber(value.opacity)
@@ -102,6 +119,7 @@ function isStyle(value: unknown): boolean {
 const isLength = (value: unknown) => isFiniteNumber(value) && value >= 0
 
 const ANCHOR_KINDS: ReadonlySet<unknown> = new Set(['corner', 'smooth', 'symmetric'])
+const FILL_RULES: ReadonlySet<unknown> = new Set(['nonzero', 'evenodd'])
 const FONT_STYLES: ReadonlySet<unknown> = new Set(['normal', 'bold', 'italic', 'bold italic'])
 const ALIGNS: ReadonlySet<unknown> = new Set(['left', 'center', 'right'])
 
@@ -110,6 +128,17 @@ function isAnchor(value: unknown): boolean {
     isObject(value) &&
     ['x', 'y', 'inX', 'inY', 'outX', 'outY'].every((key) => isFiniteNumber(value[key])) &&
     ANCHOR_KINDS.has(value.kind)
+  )
+}
+
+// A contour needs a segment, so at least 2 anchors; the editor drops one that falls below that.
+function isContour(value: unknown): value is Contour {
+  return (
+    isObject(value) &&
+    Array.isArray(value.anchors) &&
+    value.anchors.length >= 2 &&
+    value.anchors.every(isAnchor) &&
+    typeof value.closed === 'boolean'
   )
 }
 
@@ -129,12 +158,9 @@ const TYPE_CHECKS: Record<string, (node: Record<string, unknown>) => boolean> = 
     node.points.every(isFiniteNumber) &&
     typeof node.arrowStart === 'boolean' &&
     typeof node.arrowEnd === 'boolean',
-  // A path needs a segment, so at least 2 anchors; the editor deletes one that drops below that.
+  // Malformed contours are dropped one by one (see keep); a path keeps at least one.
   path: (node) =>
-    Array.isArray(node.anchors) &&
-    node.anchors.length >= 2 &&
-    node.anchors.every(isAnchor) &&
-    typeof node.closed === 'boolean',
+    Array.isArray(node.contours) && node.contours.some(isContour) && FILL_RULES.has(node.fillRule),
   // Empty text is deleted when its edit ends, so a saved one is a leftover.
   text: (node) =>
     typeof node.text === 'string' &&
@@ -165,17 +191,37 @@ function isNode(id: string, value: unknown): value is VectorNode {
   )
 }
 
+const MIMES: ReadonlySet<unknown> = new Set(['image/png', 'image/jpeg', 'image/webp'])
+
+function isAssetMeta(id: string, value: unknown): value is AssetMeta {
+  return (
+    isObject(value) &&
+    value.id === id &&
+    MIMES.has(value.mime) &&
+    isLength(value.width) &&
+    isLength(value.height) &&
+    isLength(value.bytes)
+  )
+}
+
+/** A page id not taken yet: page-1, page-2 and so on. */
+function freePageId(taken: ReadonlySet<string>): string {
+  let n = 1
+  while (taken.has(`page-${n}`)) n += 1
+  return `page-${n}`
+}
+
 /**
  * A doc that is safe to render: unreadable data becomes an empty doc, and malformed nodes are
- * dropped. The tree is walked from the roots: a node is kept only under the parent its `parentId`
- * names, once, and a group keeps the children that pass; a group left empty goes too, as do
- * nodes no list reaches.
+ * dropped. Each page's tree is walked from its roots: a node is kept only under the parent its
+ * `parentId` names, once in the whole doc, and a group keeps the children that pass; a group left
+ * empty goes too, as do nodes no list reaches. Page ids are made unique, sizes kept in range and
+ * unreadable backgrounds made white; a doc without pages gets an empty one.
  */
 export function sanitizeDoc(value: unknown): Doc {
   const doc = emptyDoc()
-  if (!isObject(value) || value.version !== 2 || !isObject(value.nodes)) return doc
-  if (!Array.isArray(value.rootIds)) return doc
-  if (typeof value.background === 'string') doc.background = value.background
+  if (!isObject(value) || value.version !== 3 || !isObject(value.nodes)) return doc
+  if (!Array.isArray(value.pages)) return doc
 
   const nodes = value.nodes
   const seen = new Set<string>()
@@ -186,6 +232,10 @@ export function sanitizeDoc(value: unknown): Doc {
       const node = nodes[id]
       if (!isNode(id, node) || node.parentId !== parentId) return []
       seen.add(id)
+      if (node.type === 'path') {
+        doc.nodes[id] = { ...node, contours: node.contours.filter(isContour) }
+        return [id]
+      }
       if (node.type !== 'group') {
         doc.nodes[id] = node
         return [id]
@@ -195,7 +245,35 @@ export function sanitizeDoc(value: unknown): Doc {
       doc.nodes[id] = { ...node, childIds }
       return [id]
     })
-  doc.rootIds = keep(value.rootIds, null)
+
+  const pages: Page[] = []
+  const pageIds = new Set<string>()
+  for (const raw of value.pages) {
+    if (!isObject(raw)) continue
+    const id =
+      typeof raw.id === 'string' && raw.id !== '' && !pageIds.has(raw.id)
+        ? raw.id
+        : freePageId(pageIds)
+    pageIds.add(id)
+    const page = newPage(
+      id,
+      typeof raw.name === 'string' && raw.name.trim() !== ''
+        ? raw.name
+        : `Page ${pages.length + 1}`,
+      isFiniteNumber(raw.width) ? clampPageSize(raw.width) : DEFAULT_PAGE_WIDTH,
+      isFiniteNumber(raw.height) ? clampPageSize(raw.height) : DEFAULT_PAGE_HEIGHT,
+    )
+    if (isPaint(raw.background)) page.background = raw.background
+    page.rootIds = Array.isArray(raw.rootIds) ? keep(raw.rootIds, null) : []
+    pages.push(page)
+  }
+  if (pages.length > 0) doc.pages = pages
+
+  if (isObject(value.assets)) {
+    for (const [id, meta] of Object.entries(value.assets)) {
+      if (isAssetMeta(id, meta)) doc.assets[id] = meta
+    }
+  }
   return doc
 }
 
@@ -208,8 +286,9 @@ export function docToJson(doc: Doc): string {
 }
 
 /**
- * The doc in a .painter.json file, sanitized as a loaded doc is. Throws an Error whose message
- * tells the user what is wrong: the file isn't a drawing, or comes from an unknown version.
+ * The doc in a .painter.json file, sanitized as a loaded doc is; a v2 file is migrated to one
+ * page. Throws an Error whose message tells the user what is wrong: the file isn't a drawing, or
+ * comes from an unknown version.
  */
 export function parseDocFile(text: string): Doc {
   let value: unknown
@@ -220,12 +299,13 @@ export function parseDocFile(text: string): Doc {
     throw new Error(NOT_A_DRAWING)
   }
   if (!isObject(value) || !('version' in value)) throw new Error(NOT_A_DRAWING)
-  if (value.version !== 2) {
+  if (value.version !== 2 && value.version !== 3) {
     const version = String(JSON.stringify(value.version)).slice(0, 20)
     throw new Error(`This drawing is from an unknown version (${version}).`)
   }
-  if (!isObject(value.nodes) || !Array.isArray(value.rootIds)) throw new Error(NOT_A_DRAWING)
-  return sanitizeDoc(value)
+  const list = value.version === 2 ? value.rootIds : value.pages
+  if (!isObject(value.nodes) || !Array.isArray(list)) throw new Error(NOT_A_DRAWING)
+  return sanitizeDoc(value.version === 2 ? migrateV2(value) : value)
 }
 
 /** The saved doc; undefined when nothing is saved yet or storage can't be read. */
@@ -240,6 +320,39 @@ export async function loadDoc(
     console.warn('Loading the saved drawing failed', error)
     return undefined
   }
+}
+
+/**
+ * The doc to open on start: the v3 autosave when there is one; otherwise the v2 autosave, or else
+ * the v1 drawing, migrated once and saved as v3. The older keys stay as backups. Unreadable data
+ * opens as an empty doc without migrating anything, and storage that can't be read at all opens
+ * an empty doc and saves nothing, so a passing error can't put an older drawing over a newer one.
+ */
+export async function loadStartupDoc(
+  kv: KeyValueStore | null = defaultKeyValueStore(),
+  storage: Storage | null = defaultStorage(),
+): Promise<Doc> {
+  if (kv) {
+    let saved: unknown
+    let v2: unknown
+    try {
+      saved = await kv.get(STORAGE_KEY)
+      if (saved === undefined) v2 = await kv.get(V2_STORAGE_KEY)
+    } catch (error) {
+      console.warn('Loading the saved drawing failed', error)
+      return emptyDoc()
+    }
+    if (saved !== undefined) return sanitizeDoc(saved)
+    if (v2 !== undefined) {
+      const doc = sanitizeDoc(migrateV2(v2))
+      await saveDoc(doc, kv)
+      return doc
+    }
+  }
+  const strokes = loadV1Strokes(storage)
+  const doc = migrateV1(strokes)
+  if (strokes.length > 0) await saveDoc(doc, kv)
+  return doc
 }
 
 /** Returns false when the write failed, for example because storage is full or blocked. */

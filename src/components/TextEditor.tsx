@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, type CSSProperties } from 'react'
 import { TEXT_LINE_HEIGHT } from '../lib/geometry/textLayout'
 import { absoluteTransform } from '../lib/geometry/transform'
+import { fillColor } from '../lib/paint/paint'
 import { useEditorStore, zoomOf } from '../store/editorStore'
 import { cancelTextEdit, finishTextEdit } from '../tools/textTool'
 import { ACCENT } from './overlayStyle'
@@ -56,7 +57,7 @@ export function TextEditor() {
     fontStyle: node.fontStyle.includes('italic') ? 'italic' : 'normal',
     lineHeight: TEXT_LINE_HEIGHT,
     textAlign: node.align,
-    color: node.style.fill ?? '#000000',
+    color: fillColor(node.style.fill) ?? '#000000',
     opacity: node.style.opacity,
     outline: `${1 / shrink}px dashed ${ACCENT}`,
     outlineOffset: 2 / shrink,

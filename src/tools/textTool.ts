@@ -18,10 +18,10 @@ const MIN_WIDTH = 20
  * restyle on the way, is a single undo step.
  */
 export function startTextEdit(id: NodeId): void {
-  const { doc, editingText } = store()
+  const { doc, editingText, currentPageId } = store()
   if (editingText === id) return
   if (editingText !== null) finishTextEdit()
-  if (doc.nodes[id]?.type !== 'text' || !isPickable(doc, id)) return
+  if (doc.nodes[id]?.type !== 'text' || !isPickable(doc, id, currentPageId)) return
   store().beginGesture()
   store().select([id])
   store().setEditingText(id)

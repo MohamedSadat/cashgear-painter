@@ -1,6 +1,6 @@
 import { canvasBounds, nodeBounds, unionBoxes, type Box } from '../lib/geometry/bounds'
 import { deltaInParent } from '../lib/geometry/transform'
-import { outermost, useEditorStore, zoomOf, type Rect } from '../store/editorStore'
+import { currentPageOf, outermost, useEditorStore, zoomOf, type Rect } from '../store/editorStore'
 import type { Doc, NodeId, Transform, VectorNode } from '../types'
 import { startTextEdit } from './textTool'
 import type { ToolController, ToolEvent } from './types'
@@ -100,9 +100,9 @@ export function unionBounds(doc: Doc, ids: NodeId[]): Box | null {
   return unionBoxes(ids.map((id) => canvasBounds(doc.nodes, id)))
 }
 
-/** The visible, unlocked top-level nodes whose bounds lie fully inside the rectangle. */
-export function nodesInRect(doc: Doc, rect: Rect): NodeId[] {
-  return doc.rootIds.filter((id) => {
+/** The visible, unlocked top-level nodes of a page whose bounds lie fully inside the rectangle. */
+export function nodesInRect(doc: Doc, rootIds: NodeId[], rect: Rect): NodeId[] {
+  return rootIds.filter((id) => {
     const node = doc.nodes[id]
     if (!node || node.hidden || node.locked) return false
     const box = nodeBounds(node, doc.nodes)
@@ -228,7 +228,10 @@ export const selectTool: ToolController = {
     } else if (drag.kind === 'marquee') {
       const rect = rectBetween(drag.start, e.point)
       store().setMarquee(rect)
-      store().select([...drag.base, ...nodesInRect(store().doc, rect)])
+      store().select([
+        ...drag.base,
+        ...nodesInRect(store().doc, currentPageOf(store()).rootIds, rect),
+      ])
     }
   },
 

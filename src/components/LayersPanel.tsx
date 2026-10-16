@@ -15,14 +15,10 @@ import {
   Type,
   type LucideIcon,
 } from 'lucide-react'
-import {
-  useRef,
-  useState,
-  type MouseEvent as ReactMouseEvent,
-  type PointerEvent as ReactPointerEvent,
-} from 'react'
-import { isWithin, useEditorStore } from '../store/editorStore'
-import type { Doc, NodeId, NodeType, VectorNode } from '../types'
+import { useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
+import { useRowDrag } from '../hooks/useRowDrag'
+import { currentPageOf, isWithin, useEditorStore } from '../store/editorStore'
+import type { Doc, NodeId, NodeType, Page, VectorNode } from '../types'
 
 const store = () => useEditorStore.getState()
 
@@ -36,11 +32,6 @@ const TYPE_ICONS: Record<NodeType, LucideIcon> = {
   group: Folder,
 }
 
-// Pixels a press on a row must travel before it drags the row.
-const DRAG_SLOP = 4
-// Pixels from the list's top or bottom edge where a drag scrolls it.
-const SCROLL_EDGE = 24
-const SCROLL_STEP = 8
 // Two clicks or taps on a name this soon rename the layer, besides the browser's dblclick, which
 // phones don't always send.
 const DOUBLE_MS = 400
@@ -55,9 +46,13 @@ interface LayerRow {
 /** Where a dragged layer lands: above or below a row, inside a group on top, or at the bottom. */
 type DropTarget = { id: NodeId; where: 'above' | 'below' | 'inside' } | { id: null; where: 'end' }
 
-/** The tree as rows, front-most first; a collapsed group hides its children unless one is selected. */
+/**
+ * The page's tree as rows, front-most first; a collapsed group hides its children unless one is
+ * selected.
+ */
 function layerRows(
   doc: Doc,
+  page: Page,
   collapsed: ReadonlySet<NodeId>,
   open: ReadonlySet<NodeId>,
 ): LayerRow[] {
@@ -72,7 +67,7 @@ function layerRows(
         visit(node.childIds, depth + 1, inHidden || node.hidden)
     }
   }
-  visit(doc.rootIds, 0, false)
+  visit(page.rootIds, 0, false)
   return rows
 }
 
@@ -90,6 +85,7 @@ function selectionAncestors(doc: Doc, selection: NodeId[]): Set<NodeId> {
 /** The moveNodes call a drop makes; null when the target is one of the moved layers or in one. */
 function dropMove(
   doc: Doc,
+  page: Page,
   ids: NodeId[],
   target: DropTarget,
 ): { parentId: NodeId | null; index: number } | null {
@@ -101,18 +97,11 @@ function dropMove(
   }
   const siblings =
     node.parentId === null
-      ? doc.rootIds
+      ? page.rootIds
       : (doc.nodes[node.parentId] as { childIds: NodeId[] }).childIds
   const index = siblings.filter((s) => !ids.includes(s)).indexOf(node.id)
   // Front-most is on top, so above a row is in front of it: one step higher in the z-order.
   return { parentId: node.parentId, index: target.where === 'above' ? index + 1 : index }
-}
-
-interface Drag {
-  pointerId: number
-  id: NodeId
-  startY: number
-  active: boolean
 }
 
 /**
@@ -124,16 +113,15 @@ interface Drag {
  */
 export function LayersPanel({ className = '' }: { className?: string }) {
   const doc = useEditorStore((s) => s.doc)
+  const page = useEditorStore(currentPageOf)
   const selection = useEditorStore((s) => s.selection)
   const [collapsed, setCollapsed] = useState<ReadonlySet<NodeId>>(new Set())
   const [renaming, setRenaming] = useState<NodeId | null>(null)
   const [drop, setDrop] = useState<DropTarget | null>(null)
   const listRef = useRef<HTMLUListElement>(null)
-  const drag = useRef<Drag | null>(null)
   const lastClick = useRef<{ id: NodeId; at: number } | null>(null)
-  const suppressClick = useRef(false)
 
-  const rows = layerRows(doc, collapsed, selectionAncestors(doc, selection))
+  const rows = layerRows(doc, page, collapsed, selectionAncestors(doc, selection))
   const selected = new Set(selection)
 
   /** The layers a drag of `id` moves: the whole selection when the row is in it. */
@@ -160,53 +148,26 @@ export function LayersPanel({ className = '' }: { className?: string }) {
     return last && clientY > last.getBoundingClientRect().bottom ? { id: null, where: 'end' } : null
   }
 
-  const onPointerDown = (e: ReactPointerEvent<HTMLLIElement>, id: NodeId) => {
-    suppressClick.current = false
-    if (e.button !== 0 || renaming !== null) return
-    const onGrip = (e.target as HTMLElement).closest('[data-grip]') !== null
-    // Fingers drag only by the grip, so a swipe elsewhere scrolls the list.
-    if (!onGrip && (e.pointerType === 'touch' || (e.target as HTMLElement).closest('input'))) return
-    drag.current = { pointerId: e.pointerId, id, startY: e.clientY, active: false }
-  }
-
-  const onPointerMove = (e: ReactPointerEvent<HTMLLIElement>) => {
-    const current = drag.current
-    if (!current || current.pointerId !== e.pointerId) return
-    if (!current.active) {
-      if (Math.abs(e.clientY - current.startY) < DRAG_SLOP) return
-      current.active = true
-      // Captured only once it is a drag, so a click on the row's buttons stays a click.
-      e.currentTarget.setPointerCapture(e.pointerId)
-    }
-    const list = listRef.current
-    if (list) {
-      const box = list.getBoundingClientRect()
-      if (e.clientY < box.top + SCROLL_EDGE) list.scrollTop -= SCROLL_STEP
-      else if (e.clientY > box.bottom - SCROLL_EDGE) list.scrollTop += SCROLL_STEP
-    }
-    const target = targetAt(e.clientY)
-    setDrop(target && dropMove(doc, draggedIds(current.id), target) ? target : null)
-  }
-
-  const endDrag = (e: ReactPointerEvent<HTMLLIElement>, apply: boolean) => {
-    const current = drag.current
-    if (!current || current.pointerId !== e.pointerId) return
-    drag.current = null
-    setDrop(null)
-    if (!current.active) return
-    // The click that follows the release is part of the drag.
-    suppressClick.current = true
-    const target = apply ? targetAt(e.clientY) : null
-    const ids = draggedIds(current.id)
-    const move = target && dropMove(doc, ids, target)
-    if (move) store().moveNodes(ids, move.parentId, move.index)
-  }
+  const drag = useRowDrag({
+    listRef,
+    axis: 'y',
+    blocked: renaming !== null,
+    onMove(id, e) {
+      const target = targetAt(e.clientY)
+      setDrop(target && dropMove(doc, page, draggedIds(id), target) ? target : null)
+    },
+    onEnd(id, e) {
+      setDrop(null)
+      if (!e) return
+      const target = targetAt(e.clientY)
+      const ids = draggedIds(id)
+      const move = target && dropMove(doc, page, ids, target)
+      if (move) store().moveNodes(ids, move.parentId, move.index)
+    },
+  })
 
   const onNameClick = (e: ReactMouseEvent, node: VectorNode) => {
-    if (suppressClick.current) {
-      suppressClick.current = false
-      return
-    }
+    if (drag.takeClick()) return
     // Timed by the clicks' own events, not when they are handled: the first click's re-render can
     // hold the second one back.
     const now = e.timeStamp
@@ -267,10 +228,10 @@ export function LayersPanel({ className = '' }: { className?: string }) {
                 aria-expanded={node.type === 'group' ? expanded : undefined}
                 data-layer-id={node.id}
                 data-expanded={expanded}
-                onPointerDown={(e) => onPointerDown(e, node.id)}
-                onPointerMove={onPointerMove}
-                onPointerUp={(e) => endDrag(e, true)}
-                onPointerCancel={(e) => endDrag(e, false)}
+                onPointerDown={(e) => drag.onPointerDown(e, node.id)}
+                onPointerMove={drag.onPointerMove}
+                onPointerUp={drag.onPointerUp}
+                onPointerCancel={drag.onPointerCancel}
                 className={`relative flex h-9 items-center gap-1 pr-1 select-none ${
                   isSelected ? 'bg-sky-100' : 'hover:bg-neutral-50'
                 } ${target === 'inside' ? 'ring-2 ring-sky-500 ring-inset' : ''}`}

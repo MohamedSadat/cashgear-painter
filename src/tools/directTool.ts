@@ -16,7 +16,7 @@ import {
   type AnchorRef,
   type EditorState,
 } from '../store/editorStore'
-import type { Anchor, PathNode } from '../types'
+import type { Anchor, Contour, PathNode } from '../types'
 import { doublePressDetector } from './selectTool'
 import type { ToolController } from './types'
 
@@ -34,16 +34,16 @@ const ARROWS: Record<string, Xy> = {
   ArrowDown: [0, 1],
 }
 
-type DocState = Pick<EditorState, 'doc' | 'selection'>
+type DocState = Pick<EditorState, 'doc' | 'selection' | 'currentPageId'>
 
 /**
  * The selected paths that show their anchors: the visible, unlocked ones, in or out of groups.
  * Each comes with its transform on the canvas, through its groups.
  */
-export function editablePaths({ doc, selection }: DocState): PathNode[] {
+export function editablePaths({ doc, selection, currentPageId }: DocState): PathNode[] {
   return selection.flatMap((id) => {
     const node = doc.nodes[id]
-    if (node?.type !== 'path' || !isPickable(doc, id)) return []
+    if (node?.type !== 'path' || !isPickable(doc, id, currentPageId)) return []
     return node.parentId === null
       ? [node]
       : [{ ...node, transform: absoluteTransform(doc.nodes, id) }]
@@ -54,13 +54,24 @@ export function editablePaths({ doc, selection }: DocState): PathNode[] {
 export function activeAnchorOf({
   doc,
   selection,
+  currentPageId,
   activeAnchor,
-}: DocState & Pick<EditorState, 'activeAnchor'>): { path: PathNode; index: number } | null {
+}: DocState & Pick<EditorState, 'activeAnchor'>): {
+  path: PathNode
+  contour: number
+  index: number
+} | null {
   if (!activeAnchor || !selection.includes(activeAnchor.id)) return null
   const path = doc.nodes[activeAnchor.id]
-  if (path?.type !== 'path' || !isPickable(doc, path.id)) return null
-  if (activeAnchor.index >= path.anchors.length) return null
-  return { path, index: activeAnchor.index }
+  if (path?.type !== 'path' || !isPickable(doc, path.id, currentPageId)) return null
+  const { contour, index } = activeAnchor
+  if (index >= (path.contours[contour]?.anchors.length ?? 0)) return null
+  return { path, contour, index }
+}
+
+/** The path's contours with one replaced by `change` of it. */
+function withContour(path: PathNode, contour: number, change: (c: Contour) => Contour): Contour[] {
+  return path.contours.map((c, i) => (i === contour ? change(c) : c))
 }
 
 /**
@@ -75,11 +86,14 @@ function replaceAnchor(
   const { doc } = store()
   const path = doc.nodes[ref.id]
   if (path?.type !== 'path' || path.locked) return
-  const anchor = path.anchors[ref.index]
+  const anchor = path.contours[ref.contour]?.anchors[ref.index]
   if (!anchor) return
   const placed = { ...path, transform: absoluteTransform(doc.nodes, path.id) }
-  const anchors = path.anchors.map((a, i) => (i === ref.index ? change(anchor, placed) : a))
-  store().updateNodes({ [ref.id]: { anchors } }, mergeKey)
+  const contours = withContour(path, ref.contour, (c) => ({
+    ...c,
+    anchors: c.anchors.map((a, i) => (i === ref.index ? change(anchor, placed) : a)),
+  }))
+  store().updateNodes({ [ref.id]: { contours } }, mergeKey)
 }
 
 /** Moves an anchor and its handles to a canvas point. */
@@ -106,20 +120,26 @@ export function moveHandleTo(ref: AnchorRef, side: HandleSide, [x, y]: Xy, break
 export function setActiveAnchorKind(kind: AnchorKind): void {
   const active = activeAnchorOf(store())
   if (!active) return
-  const { path, index } = active
-  replaceAnchor({ id: path.id, index }, () =>
-    anchorWithKind(path.anchors, path.closed, index, kind),
-  )
+  const { path, contour, index } = active
+  const { anchors, closed } = path.contours[contour]
+  replaceAnchor({ id: path.id, contour, index }, () => anchorWithKind(anchors, closed, index, kind))
 }
 
-/** Deletes the active anchor; a path left with fewer than 2 anchors goes too. One undo step. */
+/**
+ * Deletes the active anchor, as one undo step. A contour left with fewer than 2 anchors goes too,
+ * and so does a path left without contours.
+ */
 export function deleteActiveAnchor(): boolean {
   const active = activeAnchorOf(store())
   if (!active) return false
-  const { path, index } = active
-  const anchors = path.anchors.filter((_, i) => i !== index)
-  if (anchors.length < 2) store().deleteNodes([path.id])
-  else store().updateNodes({ [path.id]: { anchors } })
+  const { path, contour, index } = active
+  const anchors = path.contours[contour].anchors.filter((_, i) => i !== index)
+  const contours =
+    anchors.length < 2
+      ? path.contours.filter((_, i) => i !== contour)
+      : withContour(path, contour, (c) => ({ ...c, anchors }))
+  if (contours.length === 0) store().deleteNodes([path.id])
+  else store().updateNodes({ [path.id]: { contours } })
   store().setActiveAnchor(null)
   return true
 }
@@ -132,10 +152,12 @@ export function addAnchorNear(path: PathNode, point: Xy, reach: number): boolean
   const { nodes } = store().doc
   const near = nearestOnPath({ ...path, transform: absoluteTransform(nodes, path.id) }, point)
   if (!near || near.distance > reach) return false
-  store().updateNodes({
-    [path.id]: { anchors: insertAnchor(path.anchors, path.closed, near.segment, near.t) },
-  })
-  store().setActiveAnchor({ id: path.id, index: near.segment + 1 })
+  const contours = withContour(path, near.contour, (c) => ({
+    ...c,
+    anchors: insertAnchor(c.anchors, c.closed, near.segment, near.t),
+  }))
+  store().updateNodes({ [path.id]: { contours } })
+  store().setActiveAnchor({ id: path.id, contour: near.contour, index: near.segment + 1 })
   return true
 }
 
@@ -197,10 +219,11 @@ export const directTool: ToolController = {
     if (!active) store().nudge(selection, dx, dy)
     else {
       // Nudged on screen, so a turned path's anchor moves the way the arrow points.
-      const { path, index } = active
+      const { path, contour, index } = active
       const t = absoluteTransform(store().doc.nodes, path.id)
-      const [x, y] = applyTransform(t, path.anchors[index].x, path.anchors[index].y)
-      moveAnchorTo({ id: path.id, index }, [x + dx, y + dy], 'nudge')
+      const anchor = path.contours[contour].anchors[index]
+      const [x, y] = applyTransform(t, anchor.x, anchor.y)
+      moveAnchorTo({ id: path.id, contour, index }, [x + dx, y + dy], 'nudge')
     }
     return true
   },

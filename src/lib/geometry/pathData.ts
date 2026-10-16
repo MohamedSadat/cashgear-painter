@@ -1,5 +1,5 @@
 import { Bezier } from 'bezier-js'
-import type { Anchor, NodeOf, PathNode } from '../../types'
+import type { Anchor, Contour, NodeOf, PathNode } from '../../types'
 
 export type Xy = [number, number]
 /** A cubic Bézier segment: its start, the start's out handle, the end's in handle, its end. */
@@ -62,16 +62,25 @@ export function pathData(anchors: readonly Anchor[], closed: boolean): string {
   return parts.join(' ')
 }
 
-// Keyed by the anchors array: immer keeps it as the same object while a path is moved, turned or
-// restyled, so its data is built once, even across undo and redo.
-const dataCache = new WeakMap<readonly Anchor[], { closed: boolean; data: string }>()
+/** SVG path data for every contour of a path, one subpath each. */
+export function contoursData(contours: readonly Contour[]): string {
+  return contours
+    .map((c) => pathData(c.anchors, c.closed))
+    .filter((d) => d !== '')
+    .join(' ')
+}
 
-/** A path node's data, from the cache when its anchors haven't changed. */
-export function cachedPathData({ anchors, closed }: Pick<PathNode, 'anchors' | 'closed'>): string {
-  const cached = dataCache.get(anchors)
-  if (cached?.closed === closed) return cached.data
-  const data = pathData(anchors, closed)
-  dataCache.set(anchors, { closed, data })
+// Keyed by the contours array: immer keeps it as the same object while a path is moved, turned
+// or restyled, so its data is built once, even across undo and redo.
+const dataCache = new WeakMap<readonly Contour[], string>()
+
+/** A path node's data, from the cache when its contours haven't changed. */
+export function cachedPathData({ contours }: Pick<PathNode, 'contours'>): string {
+  let data = dataCache.get(contours)
+  if (data === undefined) {
+    data = contoursData(contours)
+    dataCache.set(contours, data)
+  }
   return data
 }
 
@@ -265,11 +274,8 @@ function ellipseAnchors(rx: number, ry: number): Anchor[] {
   ]
 }
 
-/** A rectangle, ellipse or line as path anchors in the shape's own coordinates. */
-export function shapeAnchors(node: NodeOf<'rect' | 'ellipse' | 'line'>): {
-  anchors: Anchor[]
-  closed: boolean
-} {
+/** A rectangle, ellipse or line as a path contour in the shape's own coordinates. */
+export function shapeAnchors(node: NodeOf<'rect' | 'ellipse' | 'line'>): Contour {
   switch (node.type) {
     case 'rect':
       return { anchors: rectAnchors(node.width, node.height, node.cornerRadius), closed: true }

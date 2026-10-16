@@ -3,6 +3,7 @@ import {
   type Anchor,
   type GroupNode,
   type NodeId,
+  type NodeOf,
   type Transform,
   type VectorNode,
 } from '../../types'
@@ -139,7 +140,13 @@ export function bakeTransform(node: VectorNode, next: Transform): Partial<Vector
       return { transform, points: [x1 * sx, y1 * sy, x2 * sx, y2 * sy] }
     }
     case 'path':
-      return { transform, anchors: node.anchors.map((a) => scaleAnchor(a, sx, sy)) }
+      return {
+        transform,
+        contours: node.contours.map((c) => ({
+          ...c,
+          anchors: c.anchors.map((a) => scaleAnchor(a, sx, sy)),
+        })),
+      }
     case 'text':
       return { transform, width: node.width * Math.abs(sx), fontSize: node.fontSize * Math.abs(sy) }
   }
@@ -191,6 +198,45 @@ export function bakeTransforms(
   }
   patch[node.id] = { transform: { ...next, scaleX: 1, scaleY: 1 } }
   scaleChildren(nodes, node, next.scaleX, next.scaleY, patch)
+  return patch
+}
+
+/**
+ * The changes that scale a page's content by `s` about its top-left corner and then move it by
+ * (dx, dy), as a page's Scale content does: every top-level node is baked as bakeTransforms bakes
+ * a resize, and outlines and corner radii scale too, so the drawing looks the same, only larger
+ * or smaller. Freehand strokes keep the scale in their transform, outline and all.
+ */
+export function scaleContent(
+  nodes: Nodes,
+  rootIds: readonly NodeId[],
+  s: number,
+  dx: number,
+  dy: number,
+): Record<NodeId, Partial<VectorNode>> {
+  const patch: Record<NodeId, Partial<VectorNode>> = {}
+  const frame: Transform = { x: dx, y: dy, rotation: 0, scaleX: s, scaleY: s }
+  const scaleLooks = (id: NodeId) => {
+    const node = nodes[id]
+    if (!node) return
+    if (node.type === 'group') {
+      node.childIds.forEach(scaleLooks)
+      return
+    }
+    const changes: Partial<VectorNode> = { ...patch[id] }
+    if (node.style.stroke !== null && node.type !== 'stroke' && node.type !== 'text') {
+      changes.style = { ...node.style, strokeWidth: node.style.strokeWidth * s }
+    }
+    if (node.type === 'rect')
+      (changes as Partial<NodeOf<'rect'>>).cornerRadius = node.cornerRadius * s
+    if (Object.keys(changes).length > 0) patch[id] = changes
+  }
+  for (const id of rootIds) {
+    const node = nodes[id]
+    if (!node) continue
+    Object.assign(patch, bakeTransforms(nodes, node, composeTransform(frame, node.transform)))
+    if (s !== 1) scaleLooks(id)
+  }
   return patch
 }
 

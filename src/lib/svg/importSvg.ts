@@ -1,16 +1,31 @@
 import svgpath from 'svgpath'
 import { nodeBounds } from '../geometry/bounds'
 import { KAPPA, corner, pathSegments, type Cubic, type Xy } from '../geometry/pathData'
-import { DEFAULT_SHAPE_STYLE, createGroupNode, createPathNode } from '../../store/editorStore'
+import { solid } from '../paint/paint'
 import {
-  CANVAS_HEIGHT,
-  CANVAS_WIDTH,
+  DEFAULT_SHAPE_STYLE,
+  createGroupNode,
+  createPathFromContours,
+} from '../../store/editorStore'
+import {
+  DEFAULT_PAGE_HEIGHT,
+  DEFAULT_PAGE_WIDTH,
   type Anchor,
+  type Contour as PathContour,
+  type FillRule,
   type NodeId,
   type PathNode,
   type VectorNode,
 } from '../../types'
 import { SVG_NS } from './exportSvg'
+
+/** The page an import lands on: its size in page units. */
+export interface ImportArea {
+  width: number
+  height: number
+}
+
+const DEFAULT_AREA: ImportArea = { width: DEFAULT_PAGE_WIDTH, height: DEFAULT_PAGE_HEIGHT }
 
 export const NOT_AN_SVG = "This file isn't an SVG image."
 
@@ -170,6 +185,7 @@ function propertiesOf(el: SvgElementLike): Properties {
 /** What an element passes on to its children: inherited paint, and the transforms above it. */
 interface Context {
   fill: string | null
+  fillRule: FillRule
   stroke: string | null
   strokeWidth: number
   color: string
@@ -181,6 +197,7 @@ interface Context {
 
 const INITIAL_CONTEXT: Context = {
   fill: '#000000',
+  fillRule: 'nonzero',
   stroke: null,
   strokeWidth: 1,
   color: '#000000',
@@ -203,11 +220,13 @@ function contextOf(
   const fill = parsePaint(prop('fill'), color)
   const stroke = parsePaint(prop('stroke'), color)
   const strokeWidth = parseLength(prop('stroke-width'))
+  const fillRule = prop('fill-rule')
   const visibility = prop('visibility')
   const transform = ownTransform ? el.getAttribute('transform')?.trim() : undefined
   return {
     color,
     fill: fill === undefined ? parent.fill : fill,
+    fillRule: fillRule === 'evenodd' || fillRule === 'nonzero' ? fillRule : parent.fillRule,
     stroke: stroke === undefined ? parent.stroke : stroke,
     strokeWidth: strokeWidth !== null && strokeWidth >= 0 ? strokeWidth : parent.strokeWidth,
     visible:
@@ -521,12 +540,12 @@ export function contourAnchors({ start, segments, closed }: Contour): Anchor[] |
 const round3 = (n: number) => Math.round(n * 1000) / 1000 || 0
 
 /**
- * Places the import on the artboard: when it is larger, scaled down to fit and centered; when it
- * lies even partly off the artboard, centered; otherwise where it is. The scale is baked into the
- * paths' anchors and outline widths, so the groups keep a scale of 1 and the drawing keeps its
- * look. Coordinates are rounded to thousandths.
+ * Places the import on the page: when it is larger, scaled down to fit and centered; when it lies
+ * even partly off the page, centered; otherwise where it is. The scale is baked into the paths'
+ * anchors and outline widths, so the groups keep a scale of 1 and the drawing keeps its look.
+ * Coordinates are rounded to thousandths.
  */
-function placeOnArtboard(nodes: Map<NodeId, VectorNode>, group: VectorNode): void {
+function placeOnPage(nodes: Map<NodeId, VectorNode>, group: VectorNode, area: ImportArea): void {
   const box = nodeBounds(group, Object.fromEntries(nodes))
   let s = 1
   let dx = 0
@@ -534,12 +553,12 @@ function placeOnArtboard(nodes: Map<NodeId, VectorNode>, group: VectorNode): voi
   if (box) {
     const w = box.maxX - box.minX
     const h = box.maxY - box.minY
-    s = Math.min(1, CANVAS_WIDTH / w, CANVAS_HEIGHT / h)
+    s = Math.min(1, area.width / w, area.height / h)
     const inside =
-      box.minX >= 0 && box.minY >= 0 && box.maxX <= CANVAS_WIDTH && box.maxY <= CANVAS_HEIGHT
+      box.minX >= 0 && box.minY >= 0 && box.maxX <= area.width && box.maxY <= area.height
     if (s < 1 || !inside) {
-      dx = CANVAS_WIDTH / 2 - (s * (box.minX + box.maxX)) / 2
-      dy = CANVAS_HEIGHT / 2 - (s * (box.minY + box.maxY)) / 2
+      dx = area.width / 2 - (s * (box.minX + box.maxX)) / 2
+      dy = area.height / 2 - (s * (box.minY + box.maxY)) / 2
     }
   }
   for (const [id, node] of nodes) {
@@ -550,29 +569,37 @@ function placeOnArtboard(nodes: Map<NodeId, VectorNode>, group: VectorNode): voi
       transform: { ...transform, x: round3(s * transform.x + dx), y: round3(s * transform.y + dy) },
       style:
         style.stroke === null ? style : { ...style, strokeWidth: round3(style.strokeWidth * s) },
-      anchors: node.anchors.map((a) => ({
-        ...a,
-        x: round3(a.x * s),
-        y: round3(a.y * s),
-        inX: round3(a.inX * s),
-        inY: round3(a.inY * s),
-        outX: round3(a.outX * s),
-        outY: round3(a.outY * s),
+      contours: node.contours.map((c) => ({
+        ...c,
+        anchors: c.anchors.map((a) => ({
+          ...a,
+          x: round3(a.x * s),
+          y: round3(a.y * s),
+          inX: round3(a.inX * s),
+          inY: round3(a.inY * s),
+          outX: round3(a.outX * s),
+          outY: round3(a.outY * s),
+        })),
       })),
     })
   }
 }
 
 /**
- * Turns a parsed SVG into nodes: every supported shape becomes a path node, one per subpath, with
- * its transforms baked into its anchors; <g> elements become groups, and so does a shape with
- * several subpaths. Everything lands in one new group named `name`, placed by placeOnArtboard.
+ * Turns a parsed SVG into nodes: every supported shape becomes a path node with a contour per
+ * subpath and the shape's fill rule, its transforms baked into its anchors; <g> elements become
+ * groups. Everything lands in one new group named `name`, placed on a page of `area`'s size by
+ * placeOnPage.
  * Fill, stroke, stroke-width, opacity, color, display and visibility are read from attributes and
  * inline styles. Text, images, <use>, <style>, gradients, masks and other unsupported elements are
  * counted as skipped; so is everything in <defs>, which only other elements use. A background
  * rect (isBackground) is left out without counting.
  */
-export function importSvgElement(root: SvgElementLike, name = 'Imported SVG'): SvgImport {
+export function importSvgElement(
+  root: SvgElementLike,
+  name = 'Imported SVG',
+  area: ImportArea = DEFAULT_AREA,
+): SvgImport {
   const nodes = new Map<NodeId, VectorNode>()
   let skipped = 0
 
@@ -591,7 +618,7 @@ export function importSvgElement(root: SvgElementLike, name = 'Imported SVG'): S
     return group
   }
 
-  /** The shape's subpaths as path nodes, in canvas units; none when it draws nothing. */
+  /** The shape as a path node of its subpaths, in canvas units; none when it draws nothing. */
   const shapeNodes = (el: SvgElementLike, ctx: Context): PathNode[] => {
     const d = shapeData(el)
     if (!d) return []
@@ -602,12 +629,13 @@ export function importSvgElement(root: SvgElementLike, name = 'Imported SVG'): S
     if (fill === null && stroke === null) return []
     // Without an outline, the width is the one a new shape's outline starts with.
     const strokeWidth = stroke === null ? DEFAULT_SHAPE_STYLE.strokeWidth : width
-    return contoursOf(d, ctx.transforms).flatMap((contour) => {
+    const contours = contoursOf(d, ctx.transforms).flatMap((contour): PathContour[] => {
       const anchors = contourAnchors(contour)
-      return anchors
-        ? [createPathNode(anchors, contour.closed, { fill, stroke, strokeWidth, opacity: 1 })]
-        : []
+      return anchors ? [{ anchors, closed: contour.closed }] : []
     })
+    if (contours.length === 0) return []
+    const style = { fill: fill === null ? null : solid(fill), stroke, strokeWidth, opacity: 1 }
+    return [createPathFromContours(contours, style, ctx.fillRule)]
   }
 
   /** The nodes an element makes, for its parent to adopt. */
@@ -640,7 +668,6 @@ export function importSvgElement(root: SvgElementLike, name = 'Imported SVG'): S
       return made
     }
     for (const node of made) nodes.set(node.id, node)
-    // The model holds one subpath per path, so a shape with several becomes a group of them.
     return [groupOf(made, opacity)]
   }
 
@@ -663,7 +690,7 @@ export function importSvgElement(root: SvgElementLike, name = 'Imported SVG'): S
 
   const group = groupOf(top, parseOpacity(rootProps('opacity')))
   group.name = name
-  placeOnArtboard(nodes, group)
+  placeOnPage(nodes, group, area)
 
   // Parents before their children, as the doc's tree walks them.
   const ordered: VectorNode[] = []
@@ -678,7 +705,7 @@ export function importSvgElement(root: SvgElementLike, name = 'Imported SVG'): S
 }
 
 /** Parses SVG text and imports it as importSvgElement does; throws NOT_AN_SVG when it isn't one. */
-export function importSvg(text: string, name?: string): SvgImport {
+export function importSvg(text: string, name?: string, area?: ImportArea): SvgImport {
   const parsed = new DOMParser().parseFromString(text, 'image/svg+xml')
   const root = parsed.documentElement
   if (
@@ -688,5 +715,5 @@ export function importSvg(text: string, name?: string): SvgImport {
   ) {
     throw new Error(NOT_AN_SVG)
   }
-  return importSvgElement(root, name)
+  return importSvgElement(root, name, area)
 }

@@ -1,8 +1,10 @@
 import { arrowHeadSize } from '../geometry/bounds'
-import { pathData } from '../geometry/pathData'
+import { cachedPathData } from '../geometry/pathData'
 import { TEXT_LINE_HEIGHT, firstBaseline, quoteFamilies, textLines } from '../geometry/textLayout'
-import { strokeToPath } from '../strokePath'
-import type { Doc, NodeOf, Style, TextNode, Transform, VectorNode } from '../../types'
+import { pageById } from '../pages'
+import { paintColor } from '../paint/paint'
+import { cachedStrokePath } from '../strokePath'
+import type { Doc, NodeOf, Paint, Style, TextNode, Transform, VectorNode } from '../../types'
 
 export const SVG_FILE_NAME = 'drawing.svg'
 export const SVG_NS = 'http://www.w3.org/2000/svg'
@@ -85,10 +87,13 @@ class Markers {
   }
 }
 
+/** A fill as an SVG paint; gradients are written as their first stop until M18. */
+const fillAttr = (fill: Paint | null) => (fill === null ? 'none' : paintColor(fill))
+
 /** Fill and outline as Konva paints them: no fill is fill="none", no outline no stroke at all. */
 function paint(style: Style): Attrs {
   return {
-    fill: style.fill ?? 'none',
+    fill: fillAttr(style.fill),
     stroke: style.stroke ?? undefined,
     'stroke-width': style.stroke === null ? undefined : style.strokeWidth,
   }
@@ -124,7 +129,7 @@ function textSvg(node: TextNode, common: Attrs, indent: string): string {
   if (spans.length === 0) return ''
   const open = `<text${attrs({
     ...common,
-    fill: node.style.fill ?? 'none',
+    fill: fillAttr(node.style.fill),
     'font-family': quoteFamilies(node.fontFamily).replaceAll('"', "'"),
     'font-size': node.fontSize,
     'font-weight': FONT_WEIGHTS[node.fontStyle],
@@ -184,7 +189,7 @@ function nodeSvg(
   switch (node.type) {
     case 'stroke':
       // The outline is a fill, as on the canvas.
-      return `${indent}<path${attrs({ ...common, d: strokeToPath(node), fill: node.style.fill ?? 'none' })}/>`
+      return `${indent}<path${attrs({ ...common, d: cachedStrokePath(node), fill: fillAttr(node.style.fill) })}/>`
     case 'rect': {
       // Konva keeps a corner radius within half the shorter side; SVG would clamp rx and ry apart.
       const r = Math.max(0, Math.min(node.cornerRadius, node.width / 2, node.height / 2))
@@ -206,8 +211,10 @@ function nodeSvg(
       const outlined = node.style.stroke !== null
       return `${indent}<path${attrs({
         ...common,
-        d: pathData(node.anchors, node.closed),
+        d: cachedPathData(node),
         ...paint(node.style),
+        // Nonzero is SVG's default, as it is canvas's.
+        'fill-rule': node.fillRule === 'evenodd' ? 'evenodd' : undefined,
         'stroke-linejoin': outlined ? 'miter' : undefined,
         'stroke-linecap': outlined ? 'round' : undefined,
         'stroke-miterlimit': outlined ? 10 : undefined,
@@ -219,13 +226,15 @@ function nodeSvg(
 }
 
 /**
- * The doc as a standalone SVG of the 1600 × 1000 artboard, built from the model rather than from
- * Konva: the background, then every visible node bottom to top, each placed by its transform.
- * Objects outside the artboard are kept, and clipped by the viewBox.
+ * A page of the doc (the first by default) as a standalone SVG at the page's size, built from the
+ * model rather than from Konva: the background, then every visible node bottom to top, each
+ * placed by its transform. Objects off the page are kept, and clipped by the viewBox.
  */
-export function exportSvg(doc: Doc): string {
+export function exportSvg(doc: Doc, pageId = doc.pages[0].id): string {
+  const page = pageById(doc, pageId) ?? doc.pages[0]
+  const { width, height } = page
   const markers = new Markers()
-  const body = doc.rootIds
+  const body = page.rootIds
     .map((id) => doc.nodes[id])
     .filter((node) => node !== undefined)
     .map((node) => nodeSvg(doc, node, 1, markers, '  '))
@@ -234,15 +243,15 @@ export function exportSvg(doc: Doc): string {
     '<?xml version="1.0" encoding="UTF-8"?>',
     `<svg${attrs({
       xmlns: SVG_NS,
-      viewBox: `0 0 ${doc.width} ${doc.height}`,
-      width: doc.width,
-      height: doc.height,
+      viewBox: `0 0 ${width} ${height}`,
+      width,
+      height,
     })}>`,
   ]
   if (markers.defs.length > 0) {
     lines.push('  <defs>', ...markers.defs.map((def) => `    ${def}`), '  </defs>')
   }
-  lines.push(`  <rect${attrs({ width: doc.width, height: doc.height, fill: doc.background })}/>`)
+  lines.push(`  <rect${attrs({ width, height, fill: paintColor(page.background) })}/>`)
   lines.push(...body, '</svg>', '')
   return lines.join('\n')
 }

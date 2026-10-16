@@ -1,7 +1,6 @@
 import { useEffect, useLayoutEffect, useState, type RefObject } from 'react'
 import { clampZoom, useEditorStore, zoomOf } from '../store/editorStore'
 import type { ToolId } from '../types'
-import { useFitScale } from './useFitScale'
 import { isTextEntry } from './useShortcuts'
 
 // A second finger starts a pinch only while the first has moved less than this, in screen pixels.
@@ -34,28 +33,35 @@ const distance = (a: [number, number], b: [number, number]) => Math.hypot(a[0] -
 
 /**
  * Zoom and pan for the canvas area `ref`, which the Stage fills. Measures the area into the store,
+ * which fits the current page to the box inside its padding,
  * zooms on Ctrl/Cmd + wheel (and trackpad pinch) around the pointer, pans on plain wheel, pinches
  * and pans with two fingers, and holds the hand tool while Space is down. `onPinchStart` must cancel
  * whatever the first finger started, since a pinch is not a stroke.
  */
 export function useViewport(ref: RefObject<HTMLElement | null>, onPinchStart: () => void): void {
-  const fit = useFitScale(ref)
-  const [size, setSize] = useState({ width: 0, height: 0 })
+  const [size, setSize] = useState({ width: 0, height: 0, boxWidth: 0, boxHeight: 0 })
 
   useEffect(() => {
     const el = ref.current
     if (!el) return
-    // The Stage covers the padding too; the fit scale only uses the content box inside it.
-    const observer = new ResizeObserver(() => {
-      setSize({ width: el.clientWidth, height: el.clientHeight })
+    // The Stage covers the padding too; the page fits the content box inside it. ResizeObserver
+    // also reports the first size as soon as it starts observing.
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect
+      setSize({
+        width: el.clientWidth,
+        height: el.clientHeight,
+        boxWidth: Math.max(0, width),
+        boxHeight: Math.max(0, height),
+      })
     })
     observer.observe(el)
     return () => observer.disconnect()
   }, [ref])
 
   useLayoutEffect(() => {
-    store().setViewport({ ...size, fit })
-  }, [size, fit])
+    store().setViewport(size)
+  }, [size])
 
   // Wheel: zoom with Ctrl/Cmd (trackpad pinches arrive as Ctrl + wheel), pan otherwise.
   useEffect(() => {

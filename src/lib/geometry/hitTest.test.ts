@@ -4,18 +4,21 @@ import {
   createEllipseNode,
   createGroupNode,
   createLineNode,
+  createPathFromContours,
   createPathNode,
   createRectNode,
   createStrokeNode,
   createTextNode,
 } from '../../store/editorStore'
-import type { Point, Style, VectorNode } from '../../types'
+import { solid } from '../paint/paint'
+import type { FillRule, Point, Style, VectorNode } from '../../types'
 import { arrowHeadSize, type Vec } from './bounds'
 import {
   distToSegment,
   nearestOnPath,
   nodeHitsSegment,
   pointInPolygon,
+  pointInPolygons,
   segmentsDistance,
 } from './hitTest'
 import { corner } from './pathData'
@@ -95,7 +98,7 @@ describe('pointInPolygon', () => {
 
 describe('nodeHitsSegment on shapes', () => {
   const outline: Style = { fill: null, stroke: '#000000', strokeWidth: 4, opacity: 1 }
-  const filled: Style = { ...outline, fill: '#ef4444' }
+  const filled: Style = { ...outline, fill: solid('#ef4444') }
   const box = { x: 0, y: 0, width: 200, height: 100 }
 
   it('touches an unfilled rectangle only on its outline', () => {
@@ -157,7 +160,7 @@ describe('nodeHitsSegment on shapes', () => {
 
 describe('paths', () => {
   const outline: Style = { fill: null, stroke: '#000000', strokeWidth: 4, opacity: 1 }
-  const filled: Style = { ...outline, fill: '#ef4444' }
+  const filled: Style = { ...outline, fill: solid('#ef4444') }
 
   /** An arch from (100, 100) up to (150, 25) and down to (200, 100), its handles 100 tall. */
   const arch = (style: Style) =>
@@ -197,9 +200,70 @@ describe('paths', () => {
   it('finds the nearest point of the outline, by segment and position along it', () => {
     const near = nearestOnPath(arch(outline), [150, 0])!
 
+    expect(near.contour).toBe(0)
     expect(near.segment).toBe(0)
     expect(near.t).toBeCloseTo(0.5, 2)
     expect(near.distance).toBeCloseTo(25, 1)
-    expect(nearestOnPath({ ...arch(outline), anchors: [] }, [0, 0])).toBeNull()
+    expect(nearestOnPath({ ...arch(outline), contours: [] }, [0, 0])).toBeNull()
+  })
+
+  /** Two squares, 0–100 and 25–75, the inner one turning `inner` way round. */
+  const donut = (rule: FillRule, inner: 'same' | 'reverse') => {
+    const square = (from: number, to: number) => [
+      corner(from, from),
+      corner(to, from),
+      corner(to, to),
+      corner(from, to),
+    ]
+    const hole = square(25, 75)
+    return createPathFromContours(
+      [
+        { anchors: square(0, 100), closed: true },
+        { anchors: inner === 'same' ? hole : hole.reverse(), closed: true },
+      ],
+      filled,
+      rule,
+    )
+  }
+
+  it('leaves the hole of a path with several contours unfilled, by its fill rule', () => {
+    // Even-odd: the inner square is a hole whichever way it turns.
+    expect(nodeHitsSegment(donut('evenodd', 'same'), [50, 50], [50, 50], 1)).toBe(false)
+    expect(nodeHitsSegment(donut('evenodd', 'same'), [12, 50], [12, 50], 1)).toBe(true)
+    // Nonzero: only an inner contour turning the other way cuts a hole.
+    expect(nodeHitsSegment(donut('nonzero', 'reverse'), [50, 50], [50, 50], 1)).toBe(false)
+    expect(nodeHitsSegment(donut('nonzero', 'same'), [50, 50], [50, 50], 1)).toBe(true)
+    // The hole's edge is ink.
+    expect(nodeHitsSegment(donut('evenodd', 'same'), [50, 27], [50, 27], 1)).toBe(true)
+  })
+
+  it('finds the nearest point on any contour', () => {
+    const near = nearestOnPath(donut('evenodd', 'same'), [50, 30])!
+
+    expect(near.contour).toBe(1)
+    expect(near.segment).toBe(0)
+    expect(near.distance).toBeCloseTo(5, 6)
+  })
+})
+
+describe('pointInPolygons', () => {
+  const square = (from: number, to: number): Vec[] => [
+    [from, from],
+    [to, from],
+    [to, to],
+    [from, to],
+  ]
+
+  it('fills by crossing parity under even-odd, and by winding under nonzero', () => {
+    const outer = square(0, 100)
+    const same = square(25, 75)
+    const reverse = [...same].reverse()
+
+    expect(pointInPolygons([50, 50], [outer, same], 'evenodd')).toBe(false)
+    expect(pointInPolygons([50, 50], [outer, reverse], 'evenodd')).toBe(false)
+    expect(pointInPolygons([50, 50], [outer, same], 'nonzero')).toBe(true)
+    expect(pointInPolygons([50, 50], [outer, reverse], 'nonzero')).toBe(false)
+    expect(pointInPolygons([10, 50], [outer, reverse], 'nonzero')).toBe(true)
+    expect(pointInPolygons([150, 50], [outer], 'nonzero')).toBe(false)
   })
 })

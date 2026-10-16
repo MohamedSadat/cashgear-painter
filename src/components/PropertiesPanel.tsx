@@ -3,11 +3,13 @@ import {
   AlignLeft,
   AlignRight,
   ArrowDown,
+  ArrowLeftRight,
   ArrowUp,
   Bold,
   BringToFront,
   Check,
   CopyPlus,
+  FileOutput,
   Group,
   Italic,
   MoveLeft,
@@ -18,15 +20,18 @@ import {
   Trash2,
   Ungroup,
 } from 'lucide-react'
-import type { ReactNode } from 'react'
+import { useCallback, useRef, useState, type ReactNode } from 'react'
 import type { AnchorKind } from '../lib/geometry/pathData'
 import { WEB_SAFE_FONTS } from '../lib/geometry/textLayout'
+import { PAGE_PRESETS, mmToPx, presetOf, pxToMm } from '../lib/pages'
+import { paintColor, samePaint, solid } from '../lib/paint/paint'
 import {
   MAX_FONT_SIZE,
   MAX_SIZE,
   MIN_FONT_SIZE,
   MIN_SIZE,
   canConvertToPath,
+  currentPageOf,
   useEditorStore,
   type EraserMode,
   type ZOrder,
@@ -36,7 +41,8 @@ import { finishPath } from '../tools/penTool'
 import { ungroupSelection } from '../tools/selectTool'
 import { lineStyleOf } from '../tools/shapeTools'
 import { startTextEdit } from '../tools/textTool'
-import type { NodeId, NodeOf, Style, TextNode, VectorNode } from '../types'
+import type { NodeId, NodeOf, Page, Paint, Style, TextNode, VectorNode } from '../types'
+import { MoveToPageMenu } from './MoveToPageMenu'
 import { IconButton } from './ToolRail'
 
 const SWATCHES = [
@@ -80,7 +86,10 @@ function restyle(nodes: VectorNode[], changes: Partial<Style>, mergeKey?: string
   const patch: Record<NodeId, Partial<VectorNode>> = {}
   for (const node of nodes) {
     const style: Style = { ...node.style, ...changes }
-    const same = (Object.keys(changes) as (keyof Style)[]).every((k) => node.style[k] === style[k])
+    // Fills compare by value: a picked swatch is a new paint object.
+    const same = (Object.keys(changes) as (keyof Style)[]).every((k) =>
+      k === 'fill' ? samePaint(node.style.fill, style.fill) : node.style[k] === style[k],
+    )
     if (!same) patch[node.id] = { style }
   }
   if (Object.keys(patch).length > 0) store().updateNodes(patch, mergeKey)
@@ -111,6 +120,10 @@ function Row({ label, mixed, children }: { label: string; mixed?: boolean; child
     </div>
   )
 }
+
+/** A fill as the color rows show it; gradients show their first stop until M18. */
+const colorOf = (fill: Paint | null) => (fill === null ? null : paintColor(fill))
+const paintOf = (color: string | null) => (color === null ? null : solid(color))
 
 const asHex = (value: Value<string | null>) =>
   typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value : '#000000'
@@ -291,7 +304,7 @@ const ANCHOR_KINDS: Choice<AnchorKind>[] = [
 function AnchorRow() {
   const kind = useEditorStore((s) => {
     const active = activeAnchorOf(s)
-    return active ? active.path.anchors[active.index].kind : null
+    return active ? active.path.contours[active.contour].anchors[active.index].kind : null
   })
   if (kind === null) return null
   return (
@@ -442,8 +455,156 @@ function SelectedTextRows({ texts }: { texts: TextNode[] }) {
   )
 }
 
+type Unit = 'px' | 'mm'
+
+const UNITS: Choice<Unit>[] = [
+  { value: 'px', label: 'px', title: 'Pixels at 96 per inch' },
+  { value: 'mm', label: 'mm', title: 'Millimetres' },
+]
+
+interface SizeInputProps {
+  label: string
+  value: number // whole units of the unit shown
+  onCommit(n: number): void
+}
+
+/** A page side, applied on Enter or when the field loses focus; Esc puts it back. */
+function SizeInput({ label, value, onCommit }: SizeInputProps) {
+  return (
+    <input
+      type="number"
+      inputMode="decimal"
+      aria-label={label}
+      defaultValue={value}
+      min={1}
+      step={1}
+      onBlur={(e) => {
+        const n = Number(e.currentTarget.value)
+        if (Number.isFinite(n) && n > 0 && n !== value) onCommit(n)
+        // A size out of range is clamped; the field shows what the page got.
+        e.currentTarget.value = String(value)
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') e.currentTarget.value = String(value)
+        if (e.key === 'Enter' || e.key === 'Escape') e.currentTarget.blur()
+      }}
+      className="h-8 w-16 min-w-0 rounded-md border border-neutral-300 bg-white px-1 text-sm text-neutral-800 tabular-nums"
+    />
+  )
+}
+
+/**
+ * The current page's size and background, shown when nothing is selected. Print sizes show in
+ * millimetres; Scale content resizes the drawing with the page instead of leaving it in place.
+ */
+function PageRows({ page }: { page: Page }) {
+  const match = presetOf(page.width, page.height)
+  const [unit, setUnit] = useState<Unit>(match?.preset.print ? 'mm' : 'px')
+  const [scale, setScale] = useState(false)
+  const resize = (width: number, height: number) =>
+    store().resizePage(page.id, width, height, scale)
+  // Whole millimetres, so A4 reads 210 × 297; the page itself holds whole pixels.
+  const shown = (px: number) => (unit === 'mm' ? Math.round(pxToMm(px)) : px)
+  const toPx = (n: number) => (unit === 'mm' ? mmToPx(n) : n)
+  return (
+    <>
+      <h3 className="mt-1 text-xs font-semibold text-neutral-800">Page</h3>
+      <Row label="Size">
+        <select
+          aria-label="Page size"
+          value={match ? match.preset.id : 'custom'}
+          onChange={(e) => {
+            const preset = PAGE_PRESETS.find((p) => p.id === e.target.value)
+            if (!preset) return
+            if (preset.print) setUnit('mm')
+            resize(preset.width, preset.height)
+          }}
+          className="h-8 min-w-0 flex-1 rounded-md border border-neutral-300 bg-white px-1 text-sm text-neutral-800"
+        >
+          {PAGE_PRESETS.map((preset) => (
+            <option key={preset.id} value={preset.id}>
+              {preset.label}
+            </option>
+          ))}
+          <option value="custom" disabled>
+            Custom
+          </option>
+        </select>
+      </Row>
+      <Row label="W × H">
+        <SizeInput
+          key={`w-${unit}-${page.width}`}
+          label="Page width"
+          value={shown(page.width)}
+          onCommit={(n) => resize(toPx(n), page.height)}
+        />
+        <span aria-hidden className="text-xs text-neutral-500">
+          ×
+        </span>
+        <SizeInput
+          key={`h-${unit}-${page.height}`}
+          label="Page height"
+          value={shown(page.height)}
+          onCommit={(n) => resize(page.width, toPx(n))}
+        />
+        <IconButton label="Swap width and height" onClick={() => resize(page.height, page.width)}>
+          <ArrowLeftRight size={18} />
+        </IconButton>
+      </Row>
+      <Row label="Units">
+        <Choices label="Units" options={UNITS} value={unit} onPick={(u) => setUnit(u)} />
+      </Row>
+      <label className="flex items-center gap-2 text-xs text-neutral-700">
+        <input
+          type="checkbox"
+          checked={scale}
+          onChange={(e) => setScale(e.target.checked)}
+          className="accent-sky-600"
+        />
+        Scale content with the page
+      </label>
+      <ColorRow
+        label="Background"
+        value={paintColor(page.background)}
+        allowNone={false}
+        onPick={(color, mergeKey) => {
+          if (color === null) return
+          store().updatePage(page.id, { background: solid(color) }, mergeKey && 'page-background')
+        }}
+      />
+    </>
+  )
+}
+
+/** Opens the menu that moves or copies the selection to another page, for touch screens. */
+function MoveToPageButton() {
+  const [menuAt, setMenuAt] = useState<{ x: number; y: number } | null>(null)
+  const anchorRef = useRef<HTMLSpanElement>(null)
+  const close = useCallback(() => setMenuAt(null), [])
+  return (
+    <span ref={anchorRef} className="contents">
+      <IconButton
+        label="Move to page"
+        title="Move or copy to another page (or right-click)"
+        onClick={() => {
+          if (menuAt) {
+            close()
+            return
+          }
+          const box = anchorRef.current?.firstElementChild?.getBoundingClientRect()
+          if (box) setMenuAt({ x: box.left, y: box.bottom + 4 })
+        }}
+      >
+        <FileOutput size={18} />
+      </IconButton>
+      {menuAt && <MoveToPageMenu at={menuAt} onClose={close} ignoreRef={anchorRef} />}
+    </span>
+  )
+}
+
 function SelectionProperties() {
   const doc = useEditorStore((s) => s.doc)
+  const page = useEditorStore(currentPageOf)
   const selection = useEditorStore((s) => s.selection)
   const direct = useEditorStore((s) => s.tool === 'direct')
   const nodes = selection.flatMap((id) => (id in doc.nodes ? [doc.nodes[id]] : []))
@@ -457,6 +618,8 @@ function SelectionProperties() {
             ? 'Tap or click a path to edit its anchors and handles. Double-click its outline to add an anchor.'
             : 'Tap or click an object to change its style. Drag across empty canvas to select several.'}
         </p>
+        {/* Keyed by page, so its units and Scale content start over on another page. */}
+        <PageRows key={page.id} page={page} />
       </>
     )
   }
@@ -519,6 +682,7 @@ function SelectionProperties() {
           >
             <CopyPlus size={18} />
           </IconButton>
+          <MoveToPageButton />
           <IconButton
             label="Delete"
             title="Delete (Del)"
@@ -544,10 +708,14 @@ function SelectionProperties() {
       {filled.length > 0 && (
         <ColorRow
           label={colorOnly ? 'Color' : 'Fill'}
-          value={shared(filled.map((n) => n.style.fill))}
+          value={shared(filled.map((n) => colorOf(n.style.fill)))}
           allowNone={filled.some(canClearColor)}
           onPick={(fill, mergeKey) =>
-            restyle(fill === null ? filled.filter(canClearColor) : filled, { fill }, mergeKey)
+            restyle(
+              fill === null ? filled.filter(canClearColor) : filled,
+              { fill: paintOf(fill) },
+              mergeKey,
+            )
           }
         />
       )}
@@ -720,7 +888,9 @@ const SHAPE_TITLES = {
  */
 function ShapeDefaults({ tool }: { tool: keyof typeof SHAPE_TITLES }) {
   const shapeStyle = useEditorStore((s) => s.shapeStyle)
-  const canFinish = useEditorStore((s) => s.draft?.type === 'path' && s.draft.anchors.length >= 2)
+  const canFinish = useEditorStore(
+    (s) => s.draft?.type === 'path' && (s.draft.contours[0]?.anchors.length ?? 0) >= 2,
+  )
   const isLine = tool === 'line'
   const style = isLine ? lineStyleOf(shapeStyle) : shapeStyle
   const { setShapeStyle } = store()
@@ -741,9 +911,9 @@ function ShapeDefaults({ tool }: { tool: keyof typeof SHAPE_TITLES }) {
       {!isLine && (
         <ColorRow
           label="Fill"
-          value={style.fill}
+          value={colorOf(style.fill)}
           allowNone
-          onPick={(fill) => setShapeStyle({ fill })}
+          onPick={(fill) => setShapeStyle({ fill: paintOf(fill) })}
         />
       )}
       <ColorRow

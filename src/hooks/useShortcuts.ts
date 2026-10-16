@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { openDrawing, saveDrawing } from '../lib/fileActions'
-import { useEditorStore } from '../store/editorStore'
+import { goToNeighbourPage } from '../lib/pageActions'
+import { currentPageOf, useEditorStore } from '../store/editorStore'
 import { toolFor } from '../tools'
 import type { ToolId } from '../types'
 
@@ -14,6 +15,9 @@ const NON_TEXT_INPUTS = new Set([
   'submit',
   'reset',
 ])
+
+// Keys a focused slider uses itself.
+const SLIDER_KEYS = /^(Arrow|Page(Up|Down)$|Home$|End$)/
 
 const TOOL_KEYS: Record<string, ToolId> = {
   v: 'select',
@@ -40,7 +44,7 @@ export function isTextEntry(target: EventTarget | null): boolean {
  * The active tool sees each key first (the select tool's are in selectTool.ts); Esc otherwise
  * cancels what the tool is doing. Then: Ctrl/Cmd+Z undo · Ctrl/Cmd+Shift+Z or Ctrl+Y redo ·
  * Ctrl/Cmd+A select all · Ctrl/Cmd+V paste · Ctrl/Cmd+0 fit · Ctrl/Cmd+1 100% ·
- * Ctrl/Cmd+S save · Ctrl/Cmd+O open · V select ·
+ * Ctrl/Cmd+S save · Ctrl/Cmd+O open · PageUp and PageDown the previous and next page · V select ·
  * A direct select · B brush · E eraser · R rectangle · O ellipse · L line · P pen · T text ·
  * H hand · [ and ] brush size. Space for the hand tool is in useViewport. None of them reach
  * the canvas while a text field, such as the text editor's textarea, has focus.
@@ -49,8 +53,8 @@ export function useShortcuts(): void {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (isTextEntry(e.target)) return
-      // A focused slider keeps its arrow keys.
-      if (e.target instanceof HTMLInputElement && e.key.startsWith('Arrow')) return
+      // A focused slider keeps its arrow keys, and its PageUp, PageDown, Home and End.
+      if (e.target instanceof HTMLInputElement && SLIDER_KEYS.test(e.key)) return
       const store = useEditorStore.getState()
       const key = e.key.toLowerCase()
 
@@ -83,7 +87,8 @@ export function useShortcuts(): void {
           e.preventDefault()
           const { doc } = store
           store.setTool('select')
-          store.select(doc.rootIds.filter((id) => !doc.nodes[id].hidden && !doc.nodes[id].locked))
+          const roots = currentPageOf(store).rootIds
+          store.select(roots.filter((id) => !doc.nodes[id].hidden && !doc.nodes[id].locked))
         } else if (key === 'v' && store.clipboard.length > 0) {
           e.preventDefault()
           store.setTool('select')
@@ -99,6 +104,12 @@ export function useShortcuts(): void {
         return
       }
       if (e.altKey) return
+
+      if (e.key === 'PageUp' || e.key === 'PageDown') {
+        e.preventDefault()
+        goToNeighbourPage(e.key === 'PageUp' ? -1 : 1)
+        return
+      }
 
       // Bigger steps for bigger brushes, so the whole 1–64 range is a few presses away.
       const { size } = store.brush

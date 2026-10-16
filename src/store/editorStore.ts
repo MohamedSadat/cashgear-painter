@@ -8,17 +8,31 @@ import {
   composeTransform,
   deltaInParent,
   relativeTransform,
+  scaleContent,
 } from '../lib/geometry/transform'
 import {
-  CANVAS_HEIGHT,
-  CANVAS_WIDTH,
+  clampPageSize,
+  nextPageName,
+  pageById,
+  pageOf,
+  rootPageMap,
+  touchedPages,
+} from '../lib/pages'
+import { samePaint, solid } from '../lib/paint/paint'
+import {
+  FIRST_PAGE_ID,
   IDENTITY_TRANSFORM,
   emptyDoc,
+  newPage,
   type Anchor,
+  type Contour,
   type Doc,
+  type FillRule,
   type GroupNode,
   type NodeId,
   type NodeOf,
+  type Page,
+  type Paint,
   type PathNode,
   type Point,
   type StrokeNode,
@@ -85,15 +99,31 @@ export interface Brush {
 export type EraserMode = 'object' | 'split'
 
 export interface View {
-  scale: number // multiplies the viewport's fit scale; 1 = the artboard fits
+  scale: number // multiplies the viewport's fit scale; 1 = the page fits
   x: number // Stage position, in screen pixels
   y: number
 }
 
+/** The canvas area as measured, and the scale at which the current page fits it. */
 export interface Viewport {
   width: number // Stage size, in screen pixels
   height: number
-  fit: number // scale at which the artboard fits the canvas area
+  boxWidth: number // the area inside the canvas's padding, which a fitted page fills
+  boxHeight: number
+  fit: number // derived from the box and the current page's size
+}
+
+/**
+ * A page's zoom and pan while another page shows: the canvas point in the middle of the canvas
+ * and the zoom relative to the fit, so a window resized in between keeps the same part in view.
+ * The size the page had then: after a resize, it is fitted instead.
+ */
+export interface SavedView {
+  scale: number
+  cx: number
+  cy: number
+  width: number
+  height: number
 }
 
 export interface Toast {
@@ -101,14 +131,22 @@ export interface Toast {
   message: string
 }
 
-/** An anchor of a path, by the path's id and the anchor's index. */
+/** An anchor of a path, by the path's id, the contour's index and the anchor's index in it. */
 export interface AnchorRef {
   id: NodeId
+  contour: number
   index: number
+}
+
+export interface PageChanges {
+  name?: string
+  background?: Paint
 }
 
 export interface EditorState {
   doc: Doc
+  currentPageId: string // the page on the canvas; not in history or autosave
+  views: Record<string, SavedView> // other pages' zoom and pan, for when they show again
   selection: NodeId[]
   past: Doc[] // undo stack (snapshots)
   future: Doc[] // redo stack
@@ -163,7 +201,15 @@ export interface EditorState {
   setEditingText(id: NodeId | null): void
   showToast(message: string): void
   dismissToast(id: number): void
-  setViewport(viewport: Viewport): void
+  setCurrentPage(id: string): void
+  addPage(): void
+  duplicatePage(id: string): void
+  deletePage(id: string): void
+  movePage(id: string, index: number): void
+  resizePage(id: string, width: number, height: number, scaleContent?: boolean): void
+  updatePage(id: string, changes: PageChanges, mergeKey?: string): void
+  moveToPage(ids: NodeId[], pageId: string, copy: boolean): void
+  setViewport(size: Omit<Viewport, 'fit'>): void
   setView(view: View): void
   zoomTo(zoom: number, anchor?: [x: number, y: number]): void
   panBy(dx: number, dy: number): void
@@ -189,7 +235,7 @@ export function createStrokeNode(
     name: 'Stroke',
     parentId: null,
     transform: IDENTITY_TRANSFORM,
-    style: { fill: color, stroke: null, strokeWidth: 0, opacity: 1 },
+    style: { fill: solid(color), stroke: null, strokeWidth: 0, opacity: 1 },
     hidden: false,
     locked: false,
     points,
@@ -252,20 +298,37 @@ export function createLineNode(
   }
 }
 
-/** A path through anchors given in canvas units, placed at the first anchor. */
+/**
+ * A path of one or more contours whose anchors are given in canvas units, placed at the first
+ * anchor of the first.
+ */
+export function createPathFromContours(
+  contours: Contour[],
+  style: Style,
+  fillRule: FillRule = 'nonzero',
+  id: NodeId = newNodeId(),
+): PathNode {
+  const first = contours[0]?.anchors[0]
+  const [x, y] = first ? [first.x, first.y] : [0, 0]
+  return {
+    ...newBase(id, 'Path', style, x, y),
+    type: 'path',
+    contours: contours.map((c) => ({
+      ...c,
+      anchors: c.anchors.map((a) => ({ ...a, x: a.x - x, y: a.y - y })),
+    })),
+    fillRule,
+  }
+}
+
+/** A path of one contour through anchors given in canvas units, placed at the first anchor. */
 export function createPathNode(
   anchors: Anchor[],
   closed: boolean,
   style: Style,
   id: NodeId = newNodeId(),
 ): PathNode {
-  const [x, y] = anchors.length > 0 ? [anchors[0].x, anchors[0].y] : [0, 0]
-  return {
-    ...newBase(id, 'Path', style, x, y),
-    type: 'path',
-    anchors: anchors.map((a) => ({ ...a, x: a.x - x, y: a.y - y })),
-    closed,
-  }
+  return createPathFromContours([{ anchors, closed }], style, 'nonzero', id)
 }
 
 /** A text box `width` units wide with its top-left corner at (x, y), in the text style. */
@@ -279,7 +342,7 @@ export function createTextNode(
 ): TextNode {
   const { fill, fontFamily, fontSize, fontStyle, align } = style
   return {
-    ...newBase(id, 'Text', { fill, stroke: null, strokeWidth: 0, opacity: 1 }, x, y),
+    ...newBase(id, 'Text', { fill: solid(fill), stroke: null, strokeWidth: 0, opacity: 1 }, x, y),
     type: 'text',
     text,
     fontFamily,
@@ -309,12 +372,15 @@ export function createGroupNode(
   }
 }
 
-/** Whether the node and every group it is in are visible and unlocked: it can be picked. */
-export function isPickable(doc: Doc, id: NodeId): boolean {
+/**
+ * Whether the node is on the page, and it and every group it is in are visible and unlocked: it
+ * can be picked.
+ */
+export function isPickable(doc: Doc, id: NodeId, pageId: string): boolean {
   let node: VectorNode | undefined = doc.nodes[id]
   while (node) {
     if (node.hidden || node.locked) return false
-    if (node.parentId === null) return true
+    if (node.parentId === null) return rootPageMap(doc).get(node.id) === pageId
     node = doc.nodes[node.parentId]
   }
   return false
@@ -330,7 +396,10 @@ export function isWithin(doc: Doc, id: NodeId, ancestor: NodeId): boolean {
   return false
 }
 
-/** Every node's place in a walk of the tree: bottom to top, each group before its children. */
+/**
+ * Every node's place in a walk of the tree: page by page, bottom to top, each group before its
+ * children.
+ */
 function treeOrder(doc: Doc): Map<NodeId, number> {
   const order = new Map<NodeId, number>()
   const visit = (id: NodeId) => {
@@ -339,7 +408,7 @@ function treeOrder(doc: Doc): Map<NodeId, number> {
     order.set(id, order.size)
     if (node.type === 'group') node.childIds.forEach(visit)
   }
-  doc.rootIds.forEach(visit)
+  for (const page of doc.pages) page.rootIds.forEach(visit)
   return order
 }
 
@@ -360,18 +429,32 @@ export function outermost(doc: Doc, ids: NodeId[]): NodeId[] {
     .sort((a, b) => order.get(a)! - order.get(b)!)
 }
 
-/** The z-order list a node with this parent sits in: the doc's roots, or a group's children. */
-function siblingsOf(doc: Draft<Doc>, parentId: NodeId | null): NodeId[] {
-  if (parentId === null) return doc.rootIds
+/** A page's top-level z-order list; a throwaway one for a page that doesn't exist. */
+function rootsOf(doc: Draft<Doc>, pageId: string): NodeId[] {
+  return doc.pages.find((page) => page.id === pageId)?.rootIds ?? []
+}
+
+/** The z-order list a node with this parent goes into: a page's roots, or a group's children. */
+function childList(doc: Draft<Doc>, parentId: NodeId | null, pageId: string): NodeId[] {
+  if (parentId === null) return rootsOf(doc, pageId)
   const parent = doc.nodes[parentId]
+  return parent?.type === 'group' ? parent.childIds : []
+}
+
+/** The z-order list the node sits in: its page's roots, or its group's children. */
+function siblingsOf(doc: Draft<Doc>, id: NodeId): NodeId[] {
+  const node = doc.nodes[id]
+  if (!node) return []
+  if (node.parentId === null) {
+    return doc.pages.find((page) => page.rootIds.includes(id))?.rootIds ?? []
+  }
+  const parent = doc.nodes[node.parentId]
   return parent?.type === 'group' ? parent.childIds : []
 }
 
 /** Takes a node out of its parent's z-order, leaving it in the node map. */
 function detach(doc: Draft<Doc>, id: NodeId): void {
-  const node = doc.nodes[id]
-  if (!node) return
-  const siblings = siblingsOf(doc, node.parentId)
+  const siblings = siblingsOf(doc, id)
   const index = siblings.indexOf(id)
   if (index >= 0) siblings.splice(index, 1)
 }
@@ -416,7 +499,8 @@ export function shapeToPath(node: ConvertibleNode): PathNode {
     hidden,
     locked,
     type: 'path',
-    ...shapeAnchors(node),
+    contours: [shapeAnchors(node)],
+    fillRule: 'nonzero',
   }
 }
 
@@ -426,11 +510,11 @@ function pushSnapshot(past: Doc[], doc: Doc): Doc[] {
 }
 
 /**
- * Selected ids that can still be picked in `doc`: they exist, and neither they nor their groups
- * are hidden or locked. The same array when nothing was dropped.
+ * Selected ids that can still be picked in `doc` on the page: they exist there, and neither they
+ * nor their groups are hidden or locked. The same array when nothing was dropped.
  */
-function pickable(selection: NodeId[], doc: Doc): NodeId[] {
-  const kept = selection.filter((id) => isPickable(doc, id))
+function pickable(selection: NodeId[], doc: Doc, pageId: string): NodeId[] {
+  const kept = selection.filter((id) => isPickable(doc, id, pageId))
   return kept.length === selection.length ? selection : kept
 }
 
@@ -464,7 +548,7 @@ function collectSubtrees(doc: Doc, ids: NodeId[]): VectorNode[] {
     if (inside) out.push(node)
     if (node.type === 'group') node.childIds.forEach((child) => visit(child, inside))
   }
-  doc.rootIds.forEach((id) => visit(id, false))
+  for (const page of doc.pages) page.rootIds.forEach((id) => visit(id, false))
   return out
 }
 
@@ -527,38 +611,162 @@ export function reorderIds(list: NodeId[], picked: ReadonlySet<NodeId>, where: Z
 const sameOrder = (a: NodeId[], b: NodeId[]) =>
   a.length === b.length && a.every((id, i) => id === b[i])
 
-/** The view that centers the whole artboard in the viewport. */
-function fittedView({ width, height, fit }: Viewport): View {
+/** The page on the canvas: the current one, or the first when the id is stale. */
+export function currentPageOf({ doc, currentPageId }: Pick<EditorState, 'doc' | 'currentPageId'>) {
+  return pageById(doc, currentPageId) ?? doc.pages[0]
+}
+
+/** The scale at which the page fits the viewport's box; 0 before the canvas is measured. */
+export function fitFor(
+  { boxWidth, boxHeight }: Pick<Viewport, 'boxWidth' | 'boxHeight'>,
+  page: Pick<Page, 'width' | 'height'>,
+): number {
+  if (boxWidth <= 0 || boxHeight <= 0) return 0
+  return Math.min(boxWidth / page.width, boxHeight / page.height)
+}
+
+/** The view that centers the whole page in the viewport. */
+function fittedView({ width, height, fit }: Viewport, page: Page): View {
   return {
     scale: 1,
-    x: (width - CANVAS_WIDTH * fit) / 2,
-    y: (height - CANVAS_HEIGHT * fit) / 2,
+    x: (width - page.width * fit) / 2,
+    y: (height - page.height * fit) / 2,
+  }
+}
+
+function saveView({ width, height, fit }: Viewport, view: View, page: Page): SavedView {
+  const zoom = fit * view.scale
+  return {
+    scale: view.scale,
+    cx: (width / 2 - view.x) / zoom,
+    cy: (height / 2 - view.y) / zoom,
+    width: page.width,
+    height: page.height,
+  }
+}
+
+function restoreView({ width, height, fit }: Viewport, saved: SavedView): View {
+  const zoom = fit * saved.scale
+  return { scale: saved.scale, x: width / 2 - saved.cx * zoom, y: height / 2 - saved.cy * zoom }
+}
+
+/**
+ * The page to show once the doc changes from `from` to `to`. `switchTo` names it outright. A page
+ * that went away hands over to the page before it in `from`, or else the one after, so undoing an
+ * added page goes back where it was added from. With `follow` (undo and redo), a change made on
+ * another page takes the canvas there, so it doesn't happen out of sight.
+ */
+function pageAfter(
+  currentPageId: string,
+  from: Doc,
+  to: Doc,
+  { switchTo, follow = false }: { switchTo?: string; follow?: boolean },
+): string {
+  if (switchTo !== undefined && pageById(to, switchTo)) return switchTo
+  if (pageById(to, currentPageId)) {
+    if (!follow) return currentPageId
+    const touched = touchedPages(from, to)
+    return touched.length > 0 && !touched.includes(currentPageId) ? touched[0] : currentPageId
+  }
+  const index = from.pages.findIndex((page) => page.id === currentPageId)
+  const before = from.pages.slice(0, Math.max(0, index)).reverse()
+  const after = index < 0 ? [] : from.pages.slice(index + 1)
+  return [...before, ...after].find((page) => pageById(to, page.id))?.id ?? to.pages[0].id
+}
+
+type PageState = Pick<
+  EditorState,
+  'currentPageId' | 'views' | 'viewport' | 'view' | 'selection' | 'activeAnchor'
+>
+
+/**
+ * The page-related UI state for showing page `pageId` of `to` in place of the current page of
+ * `state.doc`. Another page saves this one's view and brings back that one's, or fits it, and
+ * starts with nothing selected. The same page keeps its view and the selection still on it,
+ * unless its size changed: then it is fitted again.
+ */
+function showPage(state: EditorState, to: Doc, pageId: string): PageState {
+  const { doc, currentPageId, views, viewport, view, selection, activeAnchor } = state
+  const before = pageById(doc, currentPageId)
+  const page = pageById(to, pageId) ?? to.pages[0]
+  const fit = fitFor(viewport, page)
+  const fitted = fit === viewport.fit ? viewport : { ...viewport, fit }
+  if (page.id === currentPageId) {
+    const resized = !before || before.width !== page.width || before.height !== page.height
+    const kept = pickable(selection, to, page.id)
+    return {
+      currentPageId,
+      views,
+      viewport: fitted,
+      view: resized && fit > 0 ? fittedView(fitted, page) : view,
+      selection: kept,
+      activeAnchor: activeAnchor && kept.includes(activeAnchor.id) ? activeAnchor : null,
+    }
+  }
+  const saved = before && viewport.fit > 0 ? { [before.id]: saveView(viewport, view, before) } : {}
+  const restore = views[page.id]
+  let next = view
+  if (fit > 0) {
+    next =
+      restore && restore.width === page.width && restore.height === page.height
+        ? restoreView(fitted, restore)
+        : fittedView(fitted, page)
+  }
+  return {
+    currentPageId: page.id,
+    views: { ...views, ...saved },
+    viewport: fitted,
+    view: next,
+    selection: [],
+    activeAnchor: null,
   }
 }
 
 export const useEditorStore = create<EditorState>()((set, get) => {
   /**
-   * Applies one edit to the doc. Outside a gesture it is one history step; inside one, the step
-   * is recorded once at endGesture. An edit that changes nothing records nothing. `merge` folds
-   * the edit into the latest step instead.
+   * The page state for a doc that replaces the current one: the page `pageAfter` picks, and the
+   * selection pruned to what can still be picked there. Hiding or locking a node drops it from the
+   * selection, as deleting it does.
    */
-  function commit(recipe: (doc: Draft<Doc>) => void, merge = false): void {
-    const { doc, past, gestureStart, selection } = get()
-    const next = produce(doc, recipe)
-    if (next === doc) return
-    // Hiding or locking a node drops it from the selection, as deleting it does.
-    const kept = pickable(selection, next)
-    if (gestureStart || merge) set({ doc: next, selection: kept })
-    else set({ doc: next, past: pushSnapshot(past, doc), future: [], selection: kept })
+  function settle(
+    from: Doc,
+    to: Doc,
+    options: { switchTo?: string; follow?: boolean } = {},
+  ): PageState | Pick<EditorState, 'selection'> {
+    const state = get()
+    if (from.pages === to.pages && options.switchTo === undefined && !options.follow) {
+      return { selection: pickable(state.selection, to, state.currentPageId) }
+    }
+    return showPage(state, to, pageAfter(state.currentPageId, from, to, options))
   }
 
-  /** Adds copies of the nodes on top of their groups' or the doc's z-order, and selects them. */
+  /**
+   * Applies one edit to the doc. Outside a gesture it is one history step; inside one, the step
+   * is recorded once at endGesture. An edit that changes nothing records nothing. `merge` folds
+   * the edit into the latest step instead; `switchTo` shows that page afterwards.
+   */
+  function commit(
+    recipe: (doc: Draft<Doc>) => void,
+    { merge = false, switchTo }: { merge?: boolean; switchTo?: string } = {},
+  ): void {
+    const { doc, past, gestureStart } = get()
+    const next = produce(doc, recipe)
+    if (next === doc) return
+    const pageState = settle(doc, next, { switchTo })
+    if (gestureStart || merge) set({ doc: next, ...pageState })
+    else set({ doc: next, past: pushSnapshot(past, doc), future: [], ...pageState })
+  }
+
+  /** Adds copies of the nodes on top of their groups' or the page's z-order, and selects them. */
   function insertCopies(nodes: VectorNode[], offset: number): void {
-    const copies = withNewIds(get().doc, nodes, offset)
+    const { doc, currentPageId } = get()
+    const copies = withNewIds(doc, nodes, offset)
     if (copies.roots.length === 0) return
-    commit((doc) => {
-      for (const node of copies.nodes) doc.nodes[node.id] = node
-      for (const id of copies.roots) siblingsOf(doc, doc.nodes[id].parentId).push(id)
+    commit((draft) => {
+      for (const node of copies.nodes) draft.nodes[node.id] = node
+      for (const id of copies.roots) {
+        childList(draft, draft.nodes[id].parentId, currentPageId).push(id)
+      }
     })
     set({ selection: copies.roots })
   }
@@ -573,7 +781,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       lastMerge.key === key &&
       lastMerge.doc === get().doc &&
       now - lastMerge.at < MERGE_MS
-    commit(recipe, merge)
+    commit(recipe, { merge })
     lastMerge = { key, at: now, doc: get().doc }
   }
   // Pastes since the last copy, so repeated pastes step away from the original.
@@ -582,6 +790,8 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 
   return {
     doc: emptyDoc(),
+    currentPageId: FIRST_PAGE_ID,
+    views: {},
     selection: [],
     past: [],
     future: [],
@@ -591,7 +801,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     eraserMode: 'object',
     shapeStyle: DEFAULT_SHAPE_STYLE,
     view: { scale: 1, x: 0, y: 0 },
-    viewport: { width: 0, height: 0, fit: 0 },
+    viewport: { width: 0, height: 0, boxWidth: 0, boxHeight: 0, fit: 0 },
     draft: null,
     erasing: [],
     marquee: null,
@@ -605,8 +815,9 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     addNodes(nodes, parentId) {
       // Nodes inside an added group stay there: the group's childIds already place them.
       const batch = new Set(nodes.map((node) => node.id))
+      const { currentPageId } = get()
       commit((doc) => {
-        let order = doc.rootIds
+        let order = rootsOf(doc, currentPageId)
         if (parentId !== undefined) {
           const parent = doc.nodes[parentId]
           if (parent?.type !== 'group') return
@@ -628,12 +839,17 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     replaceDoc(next) {
       // An edit still open ends first, as its own step.
       get().endGesture()
-      const { doc, past } = get()
+      const state = get()
+      const { doc, past, currentPageId } = state
       if (next === doc) return
+      // The same page stays when the new doc has it, keeping its view; otherwise its first page.
+      const pageId = pageById(next, currentPageId) ? currentPageId : next.pages[0].id
       set({
         doc: next,
         past: pushSnapshot(past, doc),
         future: [],
+        ...showPage(state, next, pageId),
+        views: {},
         selection: [],
         activeAnchor: null,
         editingText: null,
@@ -668,7 +884,9 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 
         const keep = (id: NodeId) => !doomed.has(id)
         const parents = new Set<NodeId>()
-        if (!doc.rootIds.every(keep)) doc.rootIds = doc.rootIds.filter(keep)
+        for (const page of doc.pages) {
+          if (!page.rootIds.every(keep)) page.rootIds = page.rootIds.filter(keep)
+        }
         for (const node of Object.values(doc.nodes)) {
           if (node.type === 'group' && !doomed.has(node.id) && !node.childIds.every(keep)) {
             node.childIds = node.childIds.filter(keep)
@@ -700,7 +918,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
           node.points = runs[0]
           const copies = runs.slice(1).map((points) => ({ ...stroke, id: newNodeId(), points }))
           for (const copy of copies) draft.nodes[copy.id] = copy
-          const siblings = siblingsOf(draft, stroke.parentId)
+          const siblings = siblingsOf(draft, id)
           siblings.splice(siblings.indexOf(id) + 1, 0, ...copies.map((copy) => copy.id))
         }
         // A group never stays empty.
@@ -712,8 +930,10 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       const picked = new Set(ids)
       if (picked.size === 0) return
       commit((doc) => {
-        const next = reorderIds(doc.rootIds, picked, where)
-        if (!sameOrder(next, doc.rootIds)) doc.rootIds = next
+        for (const page of doc.pages) {
+          const next = reorderIds(page.rootIds, picked, where)
+          if (!sameOrder(next, page.rootIds)) page.rootIds = next
+        }
         for (const node of Object.values(doc.nodes)) {
           if (node.type !== 'group') continue
           const children = reorderIds(node.childIds, picked, where)
@@ -739,7 +959,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       const formerParents = picked.map((id) => doc.nodes[id].parentId)
       const group = createGroupNode(picked, parentId)
       commit((draft) => {
-        const siblings = siblingsOf(draft, parentId)
+        const siblings = siblingsOf(draft, front)
         siblings.splice(siblings.indexOf(front) + 1, 0, group.id)
         picked.forEach((id, i) => {
           detach(draft, id)
@@ -760,7 +980,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       const children = group.childIds.filter((child) => child in doc.nodes)
       const { opacity } = group.style
       commit((draft) => {
-        const siblings = siblingsOf(draft, group.parentId)
+        const siblings = siblingsOf(draft, id)
         siblings.splice(siblings.indexOf(id), 1, ...children)
         // The group's transform, opacity, visibility and lock pass to its children.
         for (const child of children) {
@@ -776,13 +996,13 @@ export const useEditorStore = create<EditorState>()((set, get) => {
         delete draft.nodes[id]
       })
       // Ungrouping one of several selected groups keeps the others selected.
-      const { selection, doc: next } = get()
+      const { selection, doc: next, currentPageId } = get()
       const rest = selection.filter((s) => s !== id)
-      set({ selection: pickable([...rest, ...children], next) })
+      set({ selection: pickable([...rest, ...children], next, currentPageId) })
     },
 
     moveNodes(ids, parentId, index) {
-      const { doc } = get()
+      const { doc, currentPageId } = get()
       if (parentId !== null && doc.nodes[parentId]?.type !== 'group') return
       // A group can't go inside itself.
       const moving = outermost(doc, ids).filter(
@@ -790,7 +1010,10 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       )
       if (moving.length === 0) return
       const frame = parentId === null ? IDENTITY_TRANSFORM : absoluteTransform(doc.nodes, parentId)
-      const target = parentId === null ? doc.rootIds : (doc.nodes[parentId] as GroupNode).childIds
+      const target =
+        parentId === null
+          ? (pageById(doc, currentPageId)?.rootIds ?? [])
+          : (doc.nodes[parentId] as GroupNode).childIds
       const rest = target.filter((id) => !moving.includes(id))
       const at = Math.max(0, Math.min(rest.length, Math.round(index)))
       const order = [...rest.slice(0, at), ...moving, ...rest.slice(at)]
@@ -807,8 +1030,11 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       })
       commit((draft) => {
         for (const { id } of moves) detach(draft, id)
-        if (parentId === null) draft.rootIds = order
-        else (draft.nodes[parentId] as Draft<GroupNode>).childIds = order
+        if (parentId !== null) (draft.nodes[parentId] as Draft<GroupNode>).childIds = order
+        else {
+          const page = draft.pages.find((p) => p.id === currentPageId)
+          if (page) page.rootIds = order
+        }
         for (const { id, transform } of moves) {
           const node = draft.nodes[id]
           node.parentId = parentId
@@ -889,48 +1115,55 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     },
 
     cancelGesture() {
-      const { gestureStart, selection } = get()
+      const { gestureStart, doc } = get()
       if (!gestureStart) return
-      set({ doc: gestureStart, gestureStart: null, selection: pickable(selection, gestureStart) })
+      set({ doc: gestureStart, gestureStart: null, ...settle(doc, gestureStart) })
     },
 
+    // An undo or redo of a change made on another page shows that page.
     undo() {
-      const { past, doc, future, gestureStart, selection } = get()
+      const { past, doc, future, gestureStart } = get()
       const previous = past.at(-1)
       if (!previous || gestureStart) return
       set({
         doc: previous,
         past: past.slice(0, -1),
         future: [...future, doc],
-        selection: pickable(selection, previous),
+        ...settle(doc, previous, { follow: true }),
       })
     },
 
     redo() {
-      const { past, doc, future, gestureStart, selection } = get()
+      const { past, doc, future, gestureStart } = get()
       const next = future.at(-1)
       if (!next || gestureStart) return
       set({
         doc: next,
         past: pushSnapshot(past, doc),
         future: future.slice(0, -1),
-        selection: pickable(selection, next),
+        ...settle(doc, next, { follow: true }),
       })
     },
 
+    // Clears the current page only.
     clear() {
-      if (get().doc.rootIds.length === 0) return
-      commit((doc) => {
-        doc.nodes = {}
-        doc.rootIds = []
+      const { doc, currentPageId } = get()
+      const page = pageById(doc, currentPageId)
+      if (!page || page.rootIds.length === 0) return
+      const doomed = collectSubtrees(doc, page.rootIds).map((node) => node.id)
+      commit((draft) => {
+        for (const id of doomed) delete draft.nodes[id]
+        const target = draft.pages.find((p) => p.id === currentPageId)
+        if (target) target.rootIds = []
       })
       set({ selection: [] })
     },
 
     select(ids, mode = 'replace') {
-      const { doc, selection, activeAnchor } = get()
-      // Hidden and locked nodes, and anything in a hidden or locked group, can't be selected.
-      const picked = [...new Set(ids)].filter((id) => isPickable(doc, id))
+      const { doc, selection, activeAnchor, currentPageId } = get()
+      // Hidden and locked nodes, anything in a hidden or locked group, and anything on another
+      // page can't be selected.
+      const picked = [...new Set(ids)].filter((id) => isPickable(doc, id, currentPageId))
       let next: NodeId[]
       if (mode === 'replace') next = picked
       else if (mode === 'add') next = [...new Set([...selection, ...picked])]
@@ -1019,17 +1252,168 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       if (get().toast?.id === id) set({ toast: null })
     },
 
-    setViewport(next) {
-      const { viewport, view } = get()
+    setCurrentPage(id) {
+      // An edit still open ends first, on the page it began on.
+      get().endGesture()
+      const state = get()
+      if (id === state.currentPageId || !pageById(state.doc, id)) return
+      set({ ...showPage(state, state.doc, id), marquee: null, erasing: [], penHover: null })
+    },
+
+    addPage() {
+      const { doc } = get()
+      const current = currentPageOf(get())
+      // The same size as the page it follows, as slides in a deck are.
+      const page = newPage(newNodeId(), nextPageName(doc.pages), current.width, current.height)
+      const index = doc.pages.indexOf(current) + 1
+      commit((draft) => void draft.pages.splice(index, 0, page), { switchTo: page.id })
+    },
+
+    duplicatePage(id) {
+      const { doc } = get()
+      const page = pageById(doc, id)
+      if (!page) return
+      // Copies keep their places: roots go to the top level of the new page, unmoved.
+      const copies = withNewIds(doc, collectSubtrees(doc, page.rootIds), 0)
+      const copy: Page = {
+        ...page,
+        id: newNodeId(),
+        name: `${page.name} copy`,
+        rootIds: copies.roots,
+      }
+      const index = doc.pages.indexOf(page) + 1
+      commit(
+        (draft) => {
+          for (const node of copies.nodes) draft.nodes[node.id] = node
+          draft.pages.splice(index, 0, copy)
+        },
+        { switchTo: copy.id },
+      )
+    },
+
+    deletePage(id) {
+      const { doc } = get()
+      const page = pageById(doc, id)
+      // A document always has a page.
+      if (!page || doc.pages.length === 1) return
+      const doomed = collectSubtrees(doc, page.rootIds).map((node) => node.id)
+      commit((draft) => {
+        for (const nodeId of doomed) delete draft.nodes[nodeId]
+        draft.pages.splice(
+          draft.pages.findIndex((p) => p.id === id),
+          1,
+        )
+      })
+      // A deleted page's view isn't needed again; undo fits it.
+      const views = { ...get().views }
+      delete views[id]
+      set({ views })
+    },
+
+    movePage(id, index) {
+      const { doc } = get()
+      const from = doc.pages.findIndex((page) => page.id === id)
+      if (from < 0) return
+      // Counted without the moved page.
+      const to = Math.max(0, Math.min(doc.pages.length - 1, Math.round(index)))
+      if (to === from) return
+      commit((draft) => {
+        const [page] = draft.pages.splice(from, 1)
+        draft.pages.splice(to, 0, page)
+      })
+    },
+
+    resizePage(id, width, height, scale = false) {
+      const { doc } = get()
+      const page = pageById(doc, id)
+      if (!page) return
+      const w = clampPageSize(width)
+      const h = clampPageSize(height)
+      if (w === page.width && h === page.height) return
+      // Scaled to fit the new size whole, and centered on it; otherwise anchored top-left.
+      const s = Math.min(w / page.width, h / page.height)
+      const patch = scale
+        ? scaleContent(
+            doc.nodes,
+            page.rootIds,
+            s,
+            (w - page.width * s) / 2,
+            (h - page.height * s) / 2,
+          )
+        : {}
+      commit((draft) => {
+        const target = draft.pages.find((p) => p.id === id)!
+        target.width = w
+        target.height = h
+        for (const [nodeId, changes] of Object.entries(patch)) {
+          const node = draft.nodes[nodeId]
+          if (node) Object.assign(node, changes)
+        }
+      })
+    },
+
+    updatePage(id, changes, mergeKey) {
+      const recipe = (draft: Draft<Doc>) => {
+        const page = draft.pages.find((p) => p.id === id)
+        if (!page) return
+        const name = changes.name?.trim()
+        if (name && name !== page.name) page.name = name
+        const { background } = changes
+        if (background && !samePaint(background, page.background)) page.background = background
+      }
+      if (mergeKey === undefined) commit(recipe)
+      else commitMerging(mergeKey, recipe)
+    },
+
+    moveToPage(ids, pageId, copy) {
+      const { doc, currentPageId, showToast } = get()
+      const target = pageById(doc, pageId)
+      if (!target || pageId === currentPageId) return
+      const roots = outermost(doc, ids).filter((id) => pageOf(doc, id) === currentPageId)
+      if (roots.length === 0) return
+      const picked = new Set(roots)
+      // As in copy: they leave their groups, keeping where they are on the canvas.
+      const nodes = collectSubtrees(doc, roots).map((node) =>
+        picked.has(node.id) && node.parentId !== null
+          ? { ...node, parentId: null, transform: absoluteTransform(doc.nodes, node.id) }
+          : node,
+      )
+      if (copy) {
+        const copies = withNewIds(doc, nodes, 0)
+        commit((draft) => {
+          for (const node of copies.nodes) draft.nodes[node.id] = node
+          rootsOf(draft, pageId).push(...copies.roots)
+        })
+      } else {
+        const formerParents = roots.map((id) => doc.nodes[id].parentId)
+        commit((draft) => {
+          for (const id of roots) detach(draft, id)
+          for (const node of nodes) if (picked.has(node.id)) draft.nodes[node.id] = node
+          rootsOf(draft, pageId).push(...roots)
+          // A group never stays empty.
+          dropEmptyGroups(draft, formerParents)
+        })
+      }
+      const count = `${roots.length} ${roots.length === 1 ? 'object' : 'objects'}`
+      showToast(`${copy ? 'Copied' : 'Moved'} ${count} to ${target.name}.`)
+    },
+
+    setViewport(size) {
+      const state = get()
+      const { viewport, view } = state
+      const next = { ...size, fit: fitFor(size, currentPageOf(state)) }
       if (
         next.width === viewport.width &&
         next.height === viewport.height &&
+        next.boxWidth === viewport.boxWidth &&
+        next.boxHeight === viewport.boxHeight &&
         next.fit === viewport.fit
       )
         return
       if (next.fit <= 0) set({ viewport: next })
-      else if (viewport.fit <= 0) set({ viewport: next, view: fittedView(next) })
-      else {
+      else if (viewport.fit <= 0) {
+        set({ viewport: next, view: fittedView(next, currentPageOf(state)) })
+      } else {
         // The canvas point in the middle stays in the middle, and the zoom stays relative to the fit.
         const before = zoomOf({ view, viewport })
         const after = next.fit * view.scale
@@ -1074,8 +1458,8 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     },
 
     fitView() {
-      const { viewport } = get()
-      if (viewport.fit > 0) set({ view: fittedView(viewport) })
+      const state = get()
+      if (state.viewport.fit > 0) set({ view: fittedView(state.viewport, currentPageOf(state)) })
     },
   }
 })

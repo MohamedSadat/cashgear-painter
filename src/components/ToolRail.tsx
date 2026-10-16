@@ -7,7 +7,7 @@ import {
   FolderOpen,
   Hand,
   ImageDown,
-  Menu,
+  Menu as MenuIcon,
   MousePointer2,
   PenTool,
   Redo2,
@@ -20,10 +20,11 @@ import {
   Undo2,
   type LucideIcon,
 } from 'lucide-react'
-import { Fragment, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
+import { Fragment, useCallback, useRef, useState, type ReactNode } from 'react'
 import { exportSvgFile, importSvgFile, openDrawing, saveDrawing } from '../lib/fileActions'
-import { useEditorStore, zoomOf } from '../store/editorStore'
+import { currentPageOf, useEditorStore, zoomOf } from '../store/editorStore'
 import type { ToolId } from '../types'
+import { Menu, type MenuItem } from './Menu'
 
 interface IconButtonProps {
   label: string
@@ -32,6 +33,7 @@ interface IconButtonProps {
   disabled?: boolean
   danger?: boolean
   narrow?: boolean // 32 px wide on phones instead of 36
+  compact?: boolean // 32 px square at every width, for narrow panels
   onClick(): void
   children: ReactNode
 }
@@ -43,6 +45,7 @@ export function IconButton({
   disabled,
   danger,
   narrow,
+  compact,
   onClick,
   children,
 }: IconButtonProps) {
@@ -60,7 +63,7 @@ export function IconButton({
       aria-pressed={pressed}
       disabled={disabled}
       onClick={onClick}
-      className={`flex h-9 ${narrow ? 'w-8 sm:w-9' : 'w-9'} shrink-0 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-35 ${tone} ${
+      className={`flex ${compact ? 'h-8 w-8' : narrow ? 'h-9 w-8 sm:w-9' : 'h-9 w-9'} shrink-0 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-35 ${tone} ${
         pressed === 'mixed' ? 'bg-neutral-100' : ''
       }`}
     >
@@ -101,25 +104,17 @@ const TOOL_GROUPS: ToolButton[][] = [
 
 const SEPARATOR = 'mx-0.5 h-6 w-px bg-neutral-200 sm:mx-0 sm:my-1 sm:h-px sm:w-6'
 
-interface FileItem {
-  label: string
-  shortcut?: string
-  icon: LucideIcon
-  run(): void | Promise<void>
-}
-
 /**
  * Open, save, import and export behind one button, so they fit the phone's second rail row. The
- * menu drops down on phones and opens to the right of the rail from 640 px up. Arrow keys move
- * between items; Esc, a pick or a press outside closes it.
+ * menu drops down on phones and opens to the right of the rail from 640 px up.
  */
 function FileMenu({ onExportPng }: { onExportPng(): void }) {
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
   const buttonRef = useRef<HTMLButtonElement>(null)
-  const menuRef = useRef<HTMLDivElement>(null)
+  const close = useCallback(() => setOpen(false), [])
 
-  const groups: FileItem[][] = [
+  const groups: MenuItem[][] = [
     [
       { label: 'Open…', shortcut: 'Ctrl+O', icon: FolderOpen, run: openDrawing },
       { label: 'Save', shortcut: 'Ctrl+S', icon: Save, run: saveDrawing },
@@ -130,34 +125,6 @@ function FileMenu({ onExportPng }: { onExportPng(): void }) {
       { label: 'Export PNG', icon: ImageDown, run: onExportPng },
     ],
   ]
-
-  useEffect(() => {
-    if (!open) return
-    menuRef.current?.querySelector<HTMLElement>('[role=menuitem]')?.focus()
-    const onPointerDown = (e: PointerEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) setOpen(false)
-    }
-    document.addEventListener('pointerdown', onPointerDown, true)
-    return () => document.removeEventListener('pointerdown', onPointerDown, true)
-  }, [open])
-
-  const onKeyDown = (e: KeyboardEvent) => {
-    const items = [...(menuRef.current?.querySelectorAll<HTMLElement>('[role=menuitem]') ?? [])]
-    const at = items.indexOf(document.activeElement as HTMLElement)
-    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-      const step = e.key === 'ArrowDown' ? 1 : -1
-      items[(at + step + items.length) % items.length]?.focus()
-    } else if (e.key === 'Escape') {
-      setOpen(false)
-      buttonRef.current?.focus()
-    } else if (e.key === 'Tab') {
-      setOpen(false)
-      return
-    } else return
-    // Not for the canvas shortcuts: Esc would also drop the selection.
-    e.preventDefault()
-    e.stopPropagation()
-  }
 
   return (
     <div ref={rootRef} className="relative">
@@ -173,41 +140,17 @@ function FileMenu({ onExportPng }: { onExportPng(): void }) {
           open ? 'bg-neutral-100' : ''
         }`}
       >
-        <Menu size={20} />
+        <MenuIcon size={20} />
       </button>
       {open && (
-        <div
-          ref={menuRef}
-          role="menu"
-          aria-label="File"
-          onKeyDown={onKeyDown}
-          className="absolute top-full right-0 z-50 mt-1 w-52 rounded-lg border border-neutral-200 bg-white py-1 shadow-lg sm:top-auto sm:right-auto sm:bottom-0 sm:left-full sm:mt-0 sm:ml-2"
-        >
-          {groups.map((group, i) => (
-            <Fragment key={group[0].label}>
-              {i > 0 && <div role="separator" className="my-1 h-px bg-neutral-200" />}
-              {group.map(({ label, shortcut, icon: Icon, run }) => (
-                <button
-                  key={label}
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    setOpen(false)
-                    // Synchronously inside the click, so a file picker may open.
-                    void run()
-                  }}
-                  className="flex h-10 w-full items-center gap-3 px-3 text-left text-sm text-neutral-800 hover:bg-neutral-100 focus:bg-neutral-100 focus:outline-none"
-                >
-                  <Icon size={18} className="text-neutral-500" />
-                  <span className="flex-1">{label}</span>
-                  {shortcut && (
-                    <span className="hidden text-xs text-neutral-400 sm:inline">{shortcut}</span>
-                  )}
-                </button>
-              ))}
-            </Fragment>
-          ))}
-        </div>
+        <Menu
+          label="File"
+          groups={groups}
+          onClose={close}
+          ignoreRef={rootRef}
+          returnFocusRef={buttonRef}
+          className="absolute top-full right-0 mt-1 sm:top-auto sm:right-auto sm:bottom-0 sm:left-full sm:mt-0 sm:ml-2"
+        />
       )}
     </div>
   )
@@ -225,7 +168,7 @@ export function ToolRail({ onExportPng }: ToolRailProps) {
   const tool = useEditorStore((s) => s.tool)
   const canUndo = useEditorStore((s) => s.past.length > 0)
   const canRedo = useEditorStore((s) => s.future.length > 0)
-  const canClear = useEditorStore((s) => s.doc.rootIds.length > 0)
+  const canClear = useEditorStore((s) => currentPageOf(s).rootIds.length > 0)
   const zoomPercent = useEditorStore((s) => Math.round(zoomOf(s) * 100))
   const { setTool, undo, redo, clear, fitView } = useEditorStore.getState()
 
@@ -270,11 +213,11 @@ export function ToolRail({ onExportPng }: ToolRailProps) {
           </IconButton>
         </div>
         <div aria-hidden className={SEPARATOR} />
-        {/* Shows the zoom and fits the artboard, so touch screens have a way back too. */}
+        {/* Shows the zoom and fits the page, so touch screens have a way back too. */}
         <button
           type="button"
-          aria-label="Fit artboard"
-          title="Fit artboard (Ctrl+0)"
+          aria-label="Fit page"
+          title="Fit page (Ctrl+0)"
           onClick={fitView}
           className="h-9 w-14 rounded-md text-sm text-neutral-600 tabular-nums hover:bg-neutral-100 sm:w-11 sm:text-xs"
         >

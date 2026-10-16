@@ -3,35 +3,14 @@ import { Arrow, Ellipse, Group, Path, Rect, Text } from 'react-konva'
 import { arrowHeadSize } from '../lib/geometry/bounds'
 import { cachedPathData } from '../lib/geometry/pathData'
 import { TEXT_LINE_HEIGHT } from '../lib/geometry/textLayout'
-import { strokeToPath } from '../lib/strokePath'
+import { fillColor } from '../lib/paint/paint'
+import { cachedStrokePath, strokeToPath } from '../lib/strokePath'
 import { useEditorStore, zoomOf } from '../store/editorStore'
-import type {
-  GroupNode,
-  NodeId,
-  Point,
-  ShapeNode,
-  StrokeNode,
-  TextNode,
-  VectorNode,
-} from '../types'
+import type { GroupNode, NodeId, ShapeNode, TextNode, VectorNode } from '../types'
 
 const DIMMED_OPACITY = 0.3
 // Thin strokes are easy to grab: the hit area reaches this many screen pixels around the ink.
 const HIT_STROKE_PX = 12
-
-// Keyed by the points array: immer keeps it as the same object while a stroke is moved, rotated
-// or restyled, so its outline is computed once, even across undo and redo.
-const pathCache = new WeakMap<Point[], { size: number; usesPressure: boolean; data: string }>()
-
-function cachedStrokePath(node: StrokeNode): string {
-  const cached = pathCache.get(node.points)
-  if (cached && cached.size === node.size && cached.usesPressure === node.usesPressure) {
-    return cached.data
-  }
-  const data = strokeToPath(node)
-  pathCache.set(node.points, { size: node.size, usesPressure: node.usesPressure, data })
-  return data
-}
 
 /** The Konva attributes every node shares: its id, transform, opacity and whether it is picked. */
 interface CommonProps {
@@ -62,14 +41,22 @@ function ShapeView({ node, common }: { node: ShapeNode; common: CommonProps }) {
   }
   // Konva's hit canvas fills every fill-enabled shape, so an unfilled one turns filling off to be
   // picked on its outline only.
-  const fill = { fill: style.fill ?? undefined, fillEnabled: style.fill !== null }
+  const fill = { fill: fillColor(style.fill), fillEnabled: style.fill !== null }
 
   switch (node.type) {
     case 'path':
       // Miter joins and round caps, so a converted rectangle keeps its corners and a converted
-      // line its round ends.
+      // line its round ends. The fill rule decides which contours cut holes, here and on the hit
+      // canvas alike.
       return (
-        <Path {...paint} {...fill} data={cachedPathData(node)} lineJoin="miter" lineCap="round" />
+        <Path
+          {...paint}
+          {...fill}
+          data={cachedPathData(node)}
+          fillRule={node.fillRule}
+          lineJoin="miter"
+          lineCap="round"
+        />
       )
     case 'rect':
     case 'ellipse': {
@@ -124,7 +111,7 @@ function TextView({ node, common }: { node: TextNode; common: CommonProps }) {
       width={node.width}
       wrap="word"
       lineHeight={TEXT_LINE_HEIGHT}
-      fill={node.style.fill ?? undefined}
+      fill={fillColor(node.style.fill)}
     />
   )
 }
@@ -182,7 +169,7 @@ export const NodeView = memo(function NodeView({
         <Path
           {...common}
           data={isDraft ? strokeToPath(node, false) : cachedStrokePath(node)}
-          fill={style.fill ?? undefined}
+          fill={fillColor(style.fill)}
           perfectDrawEnabled={false}
           // The outline is a fill, so the hit stroke has no visible twin; unscaled, it stays
           // HIT_STROKE_PX on screen at any zoom and any stroke scale.

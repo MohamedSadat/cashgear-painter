@@ -10,6 +10,7 @@ import {
   KAPPA,
   anchorWithKind,
   cachedPathData,
+  contoursData,
   corner,
   insertAnchor,
   pathData,
@@ -72,12 +73,21 @@ describe('pathData', () => {
     )
   })
 
-  it('caches the data by the anchors array, and notices closing', () => {
-    const anchors = [...arch]
-    const first = cachedPathData({ anchors, closed: false })
+  it('writes one subpath per contour, and caches the data by the contours array', () => {
+    const contours = [
+      { anchors: [...arch], closed: false },
+      { anchors: [anchor(0, 0), anchor(10, 0)], closed: true },
+    ]
+    const first = cachedPathData({ contours })
 
-    expect(cachedPathData({ anchors, closed: false })).toBe(first)
-    expect(cachedPathData({ anchors, closed: true })).toBe(`${first} C 100 0 0 0 0 0 Z`)
+    expect(first).toBe(`${pathData(arch, false)} M 0 0 C 0 0 10 0 10 0 C 10 0 0 0 0 0 Z`)
+    expect(contoursData(contours)).toBe(first)
+    expect(cachedPathData({ contours })).toBe(first)
+    // Closing a contour gives the path a new contours array.
+    const closed = [{ ...contours[0], closed: true }, contours[1]]
+    expect(cachedPathData({ contours: closed })).toBe(
+      `${pathData(arch, true)} M 0 0 C 0 0 10 0 10 0 C 10 0 0 0 0 0 Z`,
+    )
   })
 })
 

@@ -5,7 +5,7 @@ import { cachedPathData, handleOf, type HandleSide, type Xy } from '../lib/geome
 import { useEditorStore, zoomOf } from '../store/editorStore'
 import { activeAnchorOf, editablePaths, moveAnchorTo, moveHandleTo } from '../tools/directTool'
 import { CLOSE_RADIUS } from '../tools/penTool'
-import type { PathNode } from '../types'
+import type { Contour, PathNode } from '../types'
 import { ACCENT, ANCHOR_SIZE, HANDLE_GRIP } from './overlayStyle'
 
 const store = () => useEditorStore.getState()
@@ -20,15 +20,15 @@ const KNOB = { stroke: ACCENT, strokeWidth: 1, strokeScaleEnabled: false }
 
 const isZero = ([x, y]: Xy) => x === 0 && y === 0
 
-/** Whether the handle shapes a segment: an open path's first in and last out handles don't. */
-function shapesSegment(path: PathNode, index: number, side: HandleSide): boolean {
-  if (path.closed) return true
-  return side === 'in' ? index > 0 : index < path.anchors.length - 1
+/** Whether the handle shapes a segment: an open contour's first in and last out handles don't. */
+function shapesSegment(contour: Contour, index: number, side: HandleSide): boolean {
+  if (contour.closed) return true
+  return side === 'in' ? index > 0 : index < contour.anchors.length - 1
 }
 
 interface PathHandlesProps {
   path: PathNode
-  activeIndex: number | null
+  active: { contour: number; index: number } | null
   zoom: number
 }
 
@@ -37,7 +37,7 @@ interface PathHandlesProps {
  * its handles makes it the active anchor; dragging one is one undo step, and Alt-dragging a handle
  * breaks its link to the other one.
  */
-function PathHandles({ path, activeIndex, zoom }: PathHandlesProps) {
+function PathHandles({ path, active, zoom }: PathHandlesProps) {
   // The handle being dragged stays even while it has no length, so the drag goes on.
   const [dragging, setDragging] = useState<string | null>(null)
   const inGesture = useRef(false)
@@ -66,56 +66,60 @@ function PathHandles({ path, activeIndex, zoom }: PathHandlesProps) {
   const knobs: ReactNode[] = []
   const anchors: ReactNode[] = []
   const size = ANCHOR_SIZE / zoom
-  path.anchors.forEach((anchor, index) => {
-    const ref = { id: path.id, index }
-    const at = applyTransform(t, anchor.x, anchor.y)
-    for (const side of SIDES) {
-      const key = `${side}-${index}`
-      const handle = handleOf(anchor, side)
-      if ((isZero(handle) || !shapesSegment(path, index, side)) && dragging !== key) continue
-      const [hx, hy] = applyTransform(t, anchor.x + handle[0], anchor.y + handle[1])
-      arms.push(<Line key={key} points={[at[0], at[1], hx, hy]} {...THIN} />)
-      knobs.push(
-        <Circle
-          key={key}
+  // Named by contour and index, such as anchor-0-2 and handle-out-0-2.
+  path.contours.forEach((contour, c) =>
+    contour.anchors.forEach((anchor, index) => {
+      const ref = { id: path.id, contour: c, index }
+      const at = applyTransform(t, anchor.x, anchor.y)
+      const isActive = active?.contour === c && active.index === index
+      for (const side of SIDES) {
+        const key = `${side}-${c}-${index}`
+        const handle = handleOf(anchor, side)
+        if ((isZero(handle) || !shapesSegment(contour, index, side)) && dragging !== key) continue
+        const [hx, hy] = applyTransform(t, anchor.x + handle[0], anchor.y + handle[1])
+        arms.push(<Line key={key} points={[at[0], at[1], hx, hy]} {...THIN} />)
+        knobs.push(
+          <Circle
+            key={key}
+            {...KNOB}
+            name={`handle-${key}`}
+            x={hx}
+            y={hy}
+            radius={HANDLE_RADIUS / zoom}
+            fill="#ffffff"
+            hitStrokeWidth={HANDLE_GRIP}
+            listening={listening}
+            draggable
+            onPointerDown={() => store().setActiveAnchor(ref)}
+            onDragStart={() => startDrag(key)}
+            onDragMove={(e) => moveHandleTo(ref, side, [e.target.x(), e.target.y()], e.evt.altKey)}
+            onDragEnd={endDrag}
+          />,
+        )
+      }
+      anchors.push(
+        <Rect
+          key={`${c}-${index}`}
           {...KNOB}
-          name={`handle-${side}-${index}`}
-          x={hx}
-          y={hy}
-          radius={HANDLE_RADIUS / zoom}
-          fill="#ffffff"
+          name={`anchor-${c}-${index}`}
+          x={at[0]}
+          y={at[1]}
+          width={size}
+          height={size}
+          offsetX={size / 2}
+          offsetY={size / 2}
+          fill={isActive ? ACCENT : '#ffffff'}
           hitStrokeWidth={HANDLE_GRIP}
           listening={listening}
           draggable
           onPointerDown={() => store().setActiveAnchor(ref)}
-          onDragStart={() => startDrag(key)}
-          onDragMove={(e) => moveHandleTo(ref, side, [e.target.x(), e.target.y()], e.evt.altKey)}
+          onDragStart={() => startDrag(`anchor-${c}-${index}`)}
+          onDragMove={(e) => moveAnchorTo(ref, [e.target.x(), e.target.y()])}
           onDragEnd={endDrag}
         />,
       )
-    }
-    anchors.push(
-      <Rect
-        key={index}
-        {...KNOB}
-        name={`anchor-${index}`}
-        x={at[0]}
-        y={at[1]}
-        width={size}
-        height={size}
-        offsetX={size / 2}
-        offsetY={size / 2}
-        fill={index === activeIndex ? ACCENT : '#ffffff'}
-        hitStrokeWidth={HANDLE_GRIP}
-        listening={listening}
-        draggable
-        onPointerDown={() => store().setActiveAnchor(ref)}
-        onDragStart={() => startDrag(`anchor-${index}`)}
-        onDragMove={(e) => moveAnchorTo(ref, [e.target.x(), e.target.y()])}
-        onDragEnd={endDrag}
-      />,
-    )
-  })
+    }),
+  )
 
   return (
     <>
@@ -137,13 +141,16 @@ const xy = ([x, y]: Xy) => `${x} ${y}`
 function PenPreview({ draft, hover, zoom }: { draft: PathNode; hover: Xy | null; zoom: number }) {
   const t = draft.transform
   const toCanvas = (x: number, y: number) => applyTransform(t, x, y)
-  const points = draft.anchors.map((a) => toCanvas(a.x, a.y))
-  const first = draft.anchors[0]
-  const last = draft.anchors[draft.anchors.length - 1]
+  // The pen draws one contour.
+  const anchors = draft.contours[0]?.anchors ?? []
+  if (anchors.length === 0) return null
+  const points = anchors.map((a) => toCanvas(a.x, a.y))
+  const first = anchors[0]
+  const last = anchors[anchors.length - 1]
   const lastAt = points[points.length - 1]
   const closing =
     hover !== null &&
-    draft.anchors.length >= 2 &&
+    anchors.length >= 2 &&
     Math.hypot(hover[0] - points[0][0], hover[1] - points[0][1]) * zoom <= CLOSE_RADIUS
 
   let band: ReactNode = null
@@ -207,17 +214,18 @@ export function PathEditOverlay() {
   const draft = useEditorStore((s) => s.draft)
   const penHover = useEditorStore((s) => s.penHover)
   const zoom = useEditorStore(zoomOf)
+  const currentPageId = useEditorStore((s) => s.currentPageId)
 
   if (tool === 'pen') {
     return draft?.type === 'path' ? <PenPreview draft={draft} hover={penHover} zoom={zoom} /> : null
   }
   if (tool !== 'direct') return null
-  const active = activeAnchorOf({ doc, selection, activeAnchor })
-  return editablePaths({ doc, selection }).map((path) => (
+  const active = activeAnchorOf({ doc, selection, currentPageId, activeAnchor })
+  return editablePaths({ doc, selection, currentPageId }).map((path) => (
     <PathHandles
       key={path.id}
       path={path}
-      activeIndex={active?.path.id === path.id ? active.index : null}
+      active={active?.path.id === path.id ? active : null}
       zoom={zoom}
     />
   ))

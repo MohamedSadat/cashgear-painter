@@ -164,4 +164,9 @@ export const penTool: ToolController = {
     if (press?.kind === 'anchor' && press.added) removeLastAnchor(pen)
     if (pen && store().tool !== 'pen') finish(false, false)
   },
+
+  // A page switch or a file action ends the path open, keeping every anchor so far.
+  onSettle() {
+    if (pen) finish(false, false)
+  },
 }

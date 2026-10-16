@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { solid } from '../lib/paint/paint'
 import {
   IDENTITY_TRANSFORM,
   emptyDoc,
@@ -51,7 +52,15 @@ function draw(x = 0, id?: string): StrokeNode {
   return node
 }
 
-const ids = () => store().doc.rootIds
+const ids = () => store().doc.pages[0].rootIds
+
+/** A measured canvas area whose box fits the 1600 × 1000 first page at `fit`. */
+const measured = (width: number, height: number, fit: number) => ({
+  width,
+  height,
+  boxWidth: 1600 * fit,
+  boxHeight: 1000 * fit,
+})
 const node = (id: string) => store().doc.nodes[id] as StrokeNode
 
 beforeEach(() => {
@@ -352,7 +361,7 @@ describe('settings', () => {
 
 describe('view', () => {
   // The artboard fits at half size, 800 × 500, with 100 px to spare on every side.
-  const viewport = { width: 1000, height: 700, fit: 0.5 }
+  const viewport = measured(1000, 700, 0.5)
 
   /** The canvas point under a screen point of the Stage. */
   function canvasAt([sx, sy]: [number, number]): [number, number] {
@@ -418,13 +427,13 @@ describe('view', () => {
 
   it('keeps the middle and the zoom relative to the fit when the canvas area resizes', () => {
     store().setViewport(viewport)
-    store().setViewport({ width: 400, height: 900, fit: 0.2 })
+    store().setViewport(measured(400, 900, 0.2))
     // Still fitted: 320 × 200, centered.
     expect(store().view).toEqual({ scale: 1, x: 40, y: 350 })
 
     store().zoomTo(2, [100, 400])
     const middle = canvasAt([200, 450])
-    store().setViewport({ width: 800, height: 500, fit: 0.4 })
+    store().setViewport(measured(800, 500, 0.4))
 
     expect(store().view.scale).toBeCloseTo(10, 9)
     expectPoint(canvasAt([400, 250]), middle)
@@ -433,7 +442,7 @@ describe('view', () => {
   it('ignores zoom and fit until the canvas area is measured', () => {
     store().zoomTo(4)
     store().fitView()
-    store().setViewport({ width: 0, height: 0, fit: 0 })
+    store().setViewport(measured(0, 0, 0))
 
     expect(store().view).toEqual({ scale: 1, x: 0, y: 0 })
   })
@@ -580,9 +589,9 @@ describe('merged updates', () => {
 
 describe('shape style and new shapes', () => {
   it('keeps the style for new shapes outside history, with clamped width and opacity', () => {
-    store().setShapeStyle({ fill: '#ef4444', strokeWidth: 500, opacity: 2 })
+    store().setShapeStyle({ fill: solid('#ef4444'), strokeWidth: 500, opacity: 2 })
     expect(store().shapeStyle).toEqual({
-      fill: '#ef4444',
+      fill: solid('#ef4444'),
       stroke: '#000000',
       strokeWidth: MAX_SIZE,
       opacity: 1,
@@ -717,14 +726,14 @@ describe('paths', () => {
       type: 'path',
       name: 'Path',
       transform: { ...IDENTITY_TRANSFORM, x: 10, y: 20 },
-      anchors: [corner(0, 0), corner(100, 50)],
-      closed: false,
+      contours: [{ anchors: [corner(0, 0), corner(100, 50)], closed: false }],
+      fillRule: 'nonzero',
     })
   })
 
   it('converts shapes to paths in place, as one undo step', () => {
     const rect = { ...createRectNode(box, DEFAULT_SHAPE_STYLE), name: 'Door' }
-    const ellipse = createEllipseNode(box, { ...DEFAULT_SHAPE_STYLE, fill: '#ef4444' })
+    const ellipse = createEllipseNode(box, { ...DEFAULT_SHAPE_STYLE, fill: solid('#ef4444') })
     const line = { ...createLineNode([0, 0], [50, 0], DEFAULT_SHAPE_STYLE), arrowEnd: true }
     const locked = { ...createRectNode(box, DEFAULT_SHAPE_STYLE), locked: true }
     const freehand = stroke()
@@ -735,17 +744,20 @@ describe('paths', () => {
     store().convertToPath([rect.id, ellipse.id, line.id, locked.id, freehand.id])
 
     expect(store().past.at(-1)).toBe(before)
-    expect(ids()).toEqual(before.rootIds)
+    expect(ids()).toEqual(before.pages[0].rootIds)
     expect(store().selection).toEqual([rect.id, ellipse.id])
     expect(store().doc.nodes[rect.id]).toEqual(shapeToPath(rect))
-    expect(store().doc.nodes[rect.id]).toMatchObject({ name: 'Door', closed: true })
+    expect(store().doc.nodes[rect.id]).toMatchObject({ name: 'Door', contours: [{ closed: true }] })
     expect(store().doc.nodes[ellipse.id]).toMatchObject({
       type: 'path',
       name: 'Path',
       transform: ellipse.transform,
       style: ellipse.style,
     })
-    expect(store().doc.nodes[line.id]).toMatchObject({ type: 'path', closed: false })
+    expect(store().doc.nodes[line.id]).toMatchObject({
+      type: 'path',
+      contours: [{ closed: false }],
+    })
     expect(store().doc.nodes[line.id]).not.toHaveProperty('arrowEnd')
     expect(store().doc.nodes[locked.id]).toBe(locked)
     expect(store().doc.nodes[freehand.id]).toBe(freehand)
@@ -761,10 +773,10 @@ describe('paths', () => {
     const other = draw()
     store().addNodes([path])
     store().select([path.id])
-    store().setActiveAnchor({ id: path.id, index: 1 })
+    store().setActiveAnchor({ id: path.id, contour: 0, index: 1 })
 
     store().select([other.id], 'add')
-    expect(store().activeAnchor).toEqual({ id: path.id, index: 1 })
+    expect(store().activeAnchor).toEqual({ id: path.id, contour: 0, index: 1 })
     store().select([other.id])
     expect(store().activeAnchor).toBeNull()
   })
@@ -968,7 +980,7 @@ describe('text', () => {
       name: 'Text',
       parentId: null,
       transform: { ...IDENTITY_TRANSFORM, x: 10, y: 20 },
-      style: { fill: '#ef4444', stroke: null, strokeWidth: 0, opacity: 1 },
+      style: { fill: solid('#ef4444'), stroke: null, strokeWidth: 0, opacity: 1 },
       hidden: false,
       locked: false,
       text: 'Hi',
@@ -1007,7 +1019,12 @@ describe('files', () => {
   it('opens a doc in place of the drawing as one undo step, dropping the selection', () => {
     const a = draw(0)
     store().select([a.id])
-    const opened = { ...emptyDoc(), rootIds: ['b'], nodes: { b: stroke(5, 'b') } }
+    const blank = emptyDoc()
+    const opened = {
+      ...blank,
+      pages: [{ ...blank.pages[0], rootIds: ['b'] }],
+      nodes: { b: stroke(5, 'b') },
+    }
 
     store().replaceDoc(opened)
 
@@ -1119,5 +1136,220 @@ describe('splitStrokes', () => {
     expect(ids()).toEqual([a.id])
     expect(store().past).toHaveLength(2)
     expect(store().past.at(-1)).toBe(before)
+  })
+})
+
+describe('pages', () => {
+  const pages = () => store().doc.pages
+  const current = () => store().currentPageId
+  const rootsOn = (index: number) => pages()[index].rootIds
+
+  it('adds a page after the current one, the same size, and shows it, as one undo step', () => {
+    store().resizePage('page-1', 794, 1123)
+    const before = store().doc
+
+    store().addPage()
+
+    expect(pages()).toHaveLength(2)
+    expect(pages()[1]).toMatchObject({ name: 'Page 2', width: 794, height: 1123, rootIds: [] })
+    expect(current()).toBe(pages()[1].id)
+    expect(store().past.at(-1)).toBe(before)
+    store().undo()
+    expect(store().doc).toBe(before)
+    expect(current()).toBe('page-1')
+  })
+
+  it('draws, selects and clears on the current page only', () => {
+    const a = draw(0)
+    store().addPage()
+    const b = draw(10)
+
+    expect(rootsOn(0)).toEqual([a.id])
+    expect(rootsOn(1)).toEqual([b.id])
+    store().select([a.id, b.id])
+    expect(store().selection).toEqual([b.id])
+    store().clear()
+    expect(rootsOn(0)).toEqual([a.id])
+    expect(rootsOn(1)).toEqual([])
+    expect(store().doc.nodes[a.id]).toBe(a)
+  })
+
+  it('duplicates a page with copies of its objects under new ids, and shows the copy', () => {
+    const a = draw(0)
+    store().addNodes([createGroupNode(['x'], null, 'g'), { ...stroke(5, 'x'), parentId: 'g' }])
+    const before = store().doc
+
+    store().duplicatePage('page-1')
+
+    expect(pages().map((page) => page.name)).toEqual(['Page 1', 'Page 1 copy'])
+    const [copyA, copyG] = rootsOn(1)
+    expect(current()).toBe(pages()[1].id)
+    expect(copyA).not.toBe(a.id)
+    expect(store().doc.nodes[copyA]).toEqual({ ...a, id: copyA })
+    const group = store().doc.nodes[copyG] as GroupNode
+    expect(group.childIds).toHaveLength(1)
+    expect(store().doc.nodes[group.childIds[0]].parentId).toBe(copyG)
+    expect(store().past.at(-1)).toBe(before)
+  })
+
+  it('deletes a page and what is on it, shows its neighbour, and never deletes the last page', () => {
+    store().addPage()
+    const second = current()
+    const b = draw(10)
+    const before = store().doc
+
+    store().deletePage(second)
+
+    expect(pages().map((page) => page.id)).toEqual(['page-1'])
+    expect(store().doc.nodes[b.id]).toBeUndefined()
+    expect(current()).toBe('page-1')
+    store().deletePage('page-1')
+    expect(pages()).toHaveLength(1)
+
+    // Undo brings the page back, and shows it.
+    store().undo()
+    expect(store().doc).toBe(before)
+    expect(current()).toBe(second)
+  })
+
+  it('reorders pages as one step, and records nothing when a page stays put', () => {
+    store().addPage()
+    store().addPage()
+    const [first, second, third] = pages().map((page) => page.id)
+    const steps = store().past.length
+
+    store().movePage(first, 2)
+    expect(pages().map((page) => page.id)).toEqual([second, third, first])
+    store().movePage(first, 2)
+    expect(store().past).toHaveLength(steps + 1)
+    // Reordering touches no page's content, so the current page stays.
+    expect(current()).toBe(third)
+  })
+
+  it('resizes a page anchored top-left, or scales its content to fit, centered', () => {
+    const rect = {
+      ...createRectNode({ x: 100, y: 100, width: 200, height: 100 }, DEFAULT_SHAPE_STYLE, 'r'),
+      cornerRadius: 10,
+    }
+    store().addNodes([rect])
+
+    store().resizePage('page-1', 800, 1000)
+    expect(pages()[0]).toMatchObject({ width: 800, height: 1000 })
+    expect(store().doc.nodes.r).toBe(rect)
+
+    store().resizePage('page-1', 1600, 1000)
+    // From 1600 × 1000 to 800 × 1000: half the size, centered vertically.
+    store().resizePage('page-1', 800, 1000, true)
+    expect(store().doc.nodes.r).toMatchObject({
+      transform: { x: 50, y: 300, rotation: 0, scaleX: 1, scaleY: 1 },
+      width: 100,
+      height: 50,
+      cornerRadius: 5,
+      style: { ...DEFAULT_SHAPE_STYLE, strokeWidth: 2 },
+    })
+    expect(store().past).toHaveLength(4)
+
+    store().resizePage('page-1', 1, 99999)
+    expect(pages()[0]).toMatchObject({ width: 16, height: 8000 })
+  })
+
+  it('names and recolors a page, merging quick color picks into one step', () => {
+    store().updatePage('page-1', { name: '  Cover ' })
+    store().updatePage('page-1', { name: '   ' })
+    expect(pages()[0].name).toBe('Cover')
+
+    store().updatePage('page-1', { background: solid('#ff0000') }, 'background')
+    store().updatePage('page-1', { background: solid('#00ff00') }, 'background')
+    expect(pages()[0].background).toEqual(solid('#00ff00'))
+    expect(store().past).toHaveLength(2)
+    // The same color again records nothing.
+    store().updatePage('page-1', { background: solid('#00ff00') })
+    expect(store().past).toHaveLength(2)
+  })
+
+  it('moves or copies objects to another page where they are on the canvas, one step each', () => {
+    const group = {
+      ...createGroupNode(['c'], null, 'g'),
+      transform: { ...IDENTITY_TRANSFORM, x: 100 },
+    }
+    const child = { ...stroke(0, 'c'), parentId: 'g', transform: { ...IDENTITY_TRANSFORM, x: 10 } }
+    store().addNodes([group, child, stroke(50, 'other')])
+    store().addPage()
+    const second = current()
+    store().setCurrentPage('page-1')
+
+    store().moveToPage(['other'], second, true)
+    const copied = rootsOn(1)[0]
+    expect(copied).not.toBe('other')
+    expect(store().doc.nodes[copied]).toEqual({ ...store().doc.nodes.other, id: copied })
+    expect(store().toast?.message).toBe('Copied 1 object to Page 2.')
+
+    store().moveToPage(['c'], second, false)
+    expect(rootsOn(0)).toEqual(['other'])
+    expect(rootsOn(1)).toEqual([copied, 'c'])
+    expect(store().doc.nodes.c).toMatchObject({ parentId: null, transform: { x: 110 } })
+    // The group it emptied went with it.
+    expect(store().doc.nodes.g).toBeUndefined()
+    expect(store().toast?.message).toBe('Moved 1 object to Page 2.')
+    expect(current()).toBe('page-1')
+
+    store().undo()
+    expect(store().doc.nodes.c.parentId).toBe('g')
+    expect(current()).toBe('page-1')
+  })
+
+  it('shows the page an undone or redone change was made on', () => {
+    draw(0)
+    store().addPage()
+    const second = current()
+    draw(10)
+    store().setCurrentPage('page-1')
+
+    store().undo()
+    expect(current()).toBe(second)
+    expect(rootsOn(1)).toEqual([])
+    // Undoing the added page goes back to the page it was added from.
+    store().undo()
+    expect(current()).toBe('page-1')
+    store().redo()
+    expect(current()).toBe(second)
+  })
+
+  it('remembers the zoom and pan of each page, and fits a page whose size changed', () => {
+    store().setViewport({ width: 1000, height: 700, boxWidth: 800, boxHeight: 500 })
+    store().zoomTo(2, [300, 200])
+    const zoomed = store().view
+
+    store().addPage()
+    expect(store().view).toEqual({ scale: 1, x: 100, y: 100 })
+    // A square page in an 800 × 500 box fits at 0.5.
+    store().resizePage(current(), 1000, 1000)
+    expect(store().viewport.fit).toBe(0.5)
+    expect(store().view).toEqual({ scale: 1, x: 250, y: 100 })
+
+    store().setCurrentPage('page-1')
+    expect(store().viewport.fit).toBe(0.5)
+    expect(store().view.scale).toBeCloseTo(zoomed.scale, 9)
+    expect(store().view.x).toBeCloseTo(zoomed.x, 9)
+    expect(store().view.y).toBeCloseTo(zoomed.y, 9)
+    // Views stay out of history.
+    expect(store().past).toHaveLength(2)
+  })
+
+  it('ends an open gesture before showing another page, and drops the selection', () => {
+    const a = draw(0)
+    store().addPage()
+    const second = current()
+    store().setCurrentPage('page-1')
+    store().select([a.id])
+    store().beginGesture()
+    store().updateNodes({ [a.id]: { size: 20 } })
+
+    store().setCurrentPage(second)
+
+    expect(store().gestureStart).toBeNull()
+    expect(store().selection).toEqual([])
+    store().undo()
+    expect(node(a.id).size).toBe(8)
   })
 })

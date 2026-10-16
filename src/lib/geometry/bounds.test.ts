@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { solid } from '../paint/paint'
 import {
   DEFAULT_TEXT_STYLE,
   createEllipseNode,
@@ -23,7 +24,7 @@ import {
 import { corner, type Cubic, type Xy } from './pathData'
 
 const outlined: Style = { fill: null, stroke: '#000000', strokeWidth: 4, opacity: 1 }
-const filledOnly: Style = { fill: '#ef4444', stroke: null, strokeWidth: 4, opacity: 1 }
+const filledOnly: Style = { fill: solid('#ef4444'), stroke: null, strokeWidth: 4, opacity: 1 }
 const box = { x: 100, y: 200, width: 300, height: 100 }
 
 const at = (node: VectorNode, transform: Partial<Transform>): VectorNode => ({
@@ -173,7 +174,7 @@ describe('nodeBounds', () => {
       maxX: 102,
       maxY: 177,
     })
-    expect(nodeBounds({ ...arch, anchors: [] })).toBeNull()
+    expect(nodeBounds({ ...arch, contours: [] })).toBeNull()
   })
 
   it('boxes a text by its width and lines, through its transform', () => {

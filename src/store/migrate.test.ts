@@ -1,7 +1,14 @@
-import { describe, expect, it } from 'vitest'
-import { STORAGE_KEY, type KeyValueStore } from '../lib/persistence'
-import { IDENTITY_TRANSFORM, emptyDoc, type Point, type StrokeNode } from '../types'
-import { V1_STORAGE_KEY, loadStartupDoc, loadV1Strokes, migrateV1, type V1Stroke } from './migrate'
+import { describe, expect, it, vi } from 'vitest'
+import {
+  STORAGE_KEY,
+  V2_STORAGE_KEY,
+  loadStartupDoc,
+  sanitizeDoc,
+  type KeyValueStore,
+} from '../lib/persistence'
+import { solid } from '../lib/paint/paint'
+import { IDENTITY_TRANSFORM, emptyDoc, type Doc, type Point, type StrokeNode } from '../types'
+import { V1_STORAGE_KEY, loadV1Strokes, migrateV1, migrateV2, type V1Stroke } from './migrate'
 
 function memoryStorage(): Storage {
   const data = new Map<string, string>()
@@ -50,8 +57,77 @@ const v1Eraser = (id: string): V1Stroke =>
     ],
   })
 
-const strokes = (doc: ReturnType<typeof migrateV1>) =>
-  doc.rootIds.map((id) => doc.nodes[id] as StrokeNode)
+const roots = (doc: Doc) => doc.pages[0].rootIds
+const strokes = (doc: Doc) => roots(doc).map((id) => doc.nodes[id] as StrokeNode)
+
+/** A v2 drawing as v2 saved it: a stroke, a filled rectangle, an open path and a group. */
+function v2Drawing() {
+  const base = {
+    parentId: null,
+    transform: IDENTITY_TRANSFORM,
+    hidden: false,
+    locked: false,
+  }
+  const corner = (x: number, y: number) => ({
+    x,
+    y,
+    inX: 0,
+    inY: 0,
+    outX: 0,
+    outY: 0,
+    kind: 'corner',
+  })
+  return {
+    version: 2,
+    width: 1600,
+    height: 1000,
+    background: '#fef3c7',
+    rootIds: ['s', 'r', 'g'],
+    nodes: {
+      s: {
+        ...base,
+        id: 's',
+        type: 'stroke',
+        name: 'Stroke',
+        style: { fill: solid('#ef4444'), stroke: null, strokeWidth: 0, opacity: 1 },
+        points: [
+          [0, 0, 0.5],
+          [10, 10, 0.5],
+        ],
+        size: 8,
+        usesPressure: false,
+      },
+      r: {
+        ...base,
+        id: 'r',
+        type: 'rect',
+        name: 'Rectangle',
+        style: { fill: '#3b82f6', stroke: '#000000', strokeWidth: 4, opacity: 1 },
+        width: 100,
+        height: 50,
+        cornerRadius: 0,
+      },
+      g: {
+        ...base,
+        id: 'g',
+        type: 'group',
+        name: 'Group',
+        style: { fill: null, stroke: null, strokeWidth: 0, opacity: 1 },
+        childIds: ['p'],
+      },
+      p: {
+        ...base,
+        id: 'p',
+        parentId: 'g',
+        type: 'path',
+        name: 'Path',
+        style: { fill: null, stroke: '#000000', strokeWidth: 4, opacity: 1 },
+        anchors: [corner(0, 0), corner(100, 0)],
+        closed: false,
+      },
+    },
+  }
+}
 
 describe('loadV1Strokes', () => {
   it('reads valid strokes and skips malformed ones', () => {
@@ -87,21 +163,21 @@ describe('migrateV1', () => {
 
     const doc = migrateV1([a, b])
 
-    expect(doc.rootIds).toEqual(['a', 'b'])
+    expect(roots(doc)).toEqual(['a', 'b'])
     expect(doc.nodes.a).toEqual({
       id: 'a',
       type: 'stroke',
       name: 'Stroke',
       parentId: null,
       transform: IDENTITY_TRANSFORM,
-      style: { fill: '#ef4444', stroke: null, strokeWidth: 0, opacity: 1 },
+      style: { fill: solid('#ef4444'), stroke: null, strokeWidth: 0, opacity: 1 },
       hidden: false,
       locked: false,
       points: a.points,
       size: 12,
       usesPressure: true,
     })
-    expect(strokes(doc)[1].style.fill).toBe('#3b82f6')
+    expect(strokes(doc)[1].style.fill).toEqual(solid('#3b82f6'))
   })
 
   it('migrates no strokes to an empty doc', () => {
@@ -117,7 +193,7 @@ describe('migrateV1', () => {
     ])
     const [left, right, untouched, after] = strokes(doc)
 
-    expect(doc.rootIds).toHaveLength(4)
+    expect(roots(doc)).toHaveLength(4)
     expect(left.points.at(-1)![0]).toBeLessThan(50)
     expect(right.points[0][0]).toBeGreaterThan(50)
     expect(left.id).not.toBe('a')
@@ -142,7 +218,7 @@ describe('migrateV1', () => {
 
     const doc = migrateV1([covered, dot, v1Eraser('e')])
 
-    expect(doc.rootIds).toEqual(['d'])
+    expect(roots(doc)).toEqual(['d'])
     expect((doc.nodes.d as StrokeNode).points).toEqual([[300, 300, 0.5]])
   })
 
@@ -152,22 +228,77 @@ describe('migrateV1', () => {
 
     const doc = migrateV1([v1Stroke('a'), v1Eraser('e1'), second])
 
-    expect(doc.rootIds).toHaveLength(3)
+    expect(roots(doc)).toHaveLength(3)
+  })
+})
+
+describe('migrateV2', () => {
+  it('turns the artboard into page 1, fills into solid paints and anchors into one contour', () => {
+    const v2 = v2Drawing()
+    const doc = sanitizeDoc(migrateV2(v2))
+
+    expect(doc.version).toBe(3)
+    expect(doc.pages).toEqual([
+      {
+        id: 'page-1',
+        name: 'Page 1',
+        width: 1600,
+        height: 1000,
+        background: solid('#fef3c7'),
+        rootIds: ['s', 'r', 'g'],
+      },
+    ])
+    expect(doc.nodes.s.style.fill).toEqual(solid('#ef4444'))
+    expect(doc.nodes.r.style).toEqual({
+      fill: solid('#3b82f6'),
+      stroke: '#000000',
+      strokeWidth: 4,
+      opacity: 1,
+    })
+    expect(doc.nodes.p).toMatchObject({
+      parentId: 'g',
+      contours: [{ anchors: v2.nodes.p.anchors, closed: false }],
+      fillRule: 'nonzero',
+    })
+    expect(doc.nodes.p).not.toHaveProperty('anchors')
+    expect(doc.nodes.g).toMatchObject({ childIds: ['p'] })
+    expect(doc.assets).toEqual({})
+  })
+
+  it('leaves anything that is not a v2 doc for sanitizeDoc to refuse', () => {
+    const v3 = emptyDoc()
+    expect(migrateV2(v3)).toBe(v3)
+    expect(migrateV2('garbage')).toBe('garbage')
+    expect(sanitizeDoc(migrateV2({ version: 2, nodes: {}, rootIds: 'x' }))).toEqual(emptyDoc())
   })
 })
 
 describe('loadStartupDoc', () => {
-  it('opens the v2 autosave when there is one', async () => {
+  it('opens the v3 autosave when there is one', async () => {
     const kv = memoryStore()
     const storage = memoryStorage()
-    const saved = migrateV1([v1Stroke('saved')])
-    kv.data.set(STORAGE_KEY, saved)
+    kv.data.set(STORAGE_KEY, migrateV1([v1Stroke('saved')]))
+    kv.data.set(V2_STORAGE_KEY, v2Drawing())
     storage.setItem(V1_STORAGE_KEY, JSON.stringify([v1Stroke('old')]))
 
-    expect((await loadStartupDoc(kv, storage)).rootIds).toEqual(['saved'])
+    expect(roots(await loadStartupDoc(kv, storage))).toEqual(['saved'])
   })
 
-  it('migrates v1 once, saves it as v2 and keeps the v1 key', async () => {
+  it('migrates the v2 autosave once, saves it as v3 and keeps the v2 key', async () => {
+    const kv = memoryStore()
+    const storage = memoryStorage()
+    kv.data.set(V2_STORAGE_KEY, v2Drawing())
+    storage.setItem(V1_STORAGE_KEY, JSON.stringify([v1Stroke('old')]))
+
+    const doc = await loadStartupDoc(kv, storage)
+
+    expect(roots(doc)).toEqual(['s', 'r', 'g'])
+    expect(kv.data.get(STORAGE_KEY)).toEqual(doc)
+    expect(kv.data.get(V2_STORAGE_KEY)).toEqual(v2Drawing())
+    expect(await loadStartupDoc(kv, storage)).toEqual(doc)
+  })
+
+  it('migrates v1 once, saves it as v3 and keeps the v1 key', async () => {
     const kv = memoryStore()
     const storage = memoryStorage()
     const v1 = JSON.stringify([v1Stroke('a'), v1Eraser('e')])
@@ -175,12 +306,12 @@ describe('loadStartupDoc', () => {
 
     const doc = await loadStartupDoc(kv, storage)
 
-    expect(doc.rootIds).toHaveLength(2)
-    expect((kv.data.get(STORAGE_KEY) as typeof doc).rootIds).toEqual(doc.rootIds)
+    expect(roots(doc)).toHaveLength(2)
+    expect(roots(kv.data.get(STORAGE_KEY) as Doc)).toEqual(roots(doc))
     expect(storage.getItem(V1_STORAGE_KEY)).toBe(v1)
 
-    // The next start reads the saved v2 doc, with the same ids.
-    expect((await loadStartupDoc(kv, storage)).rootIds).toEqual(doc.rootIds)
+    // The next start reads the saved v3 doc, with the same ids.
+    expect(roots(await loadStartupDoc(kv, storage))).toEqual(roots(doc))
   })
 
   it('opens an empty doc without saving when there is nothing to migrate', async () => {
@@ -190,12 +321,26 @@ describe('loadStartupDoc', () => {
     expect(kv.data.size).toBe(0)
   })
 
-  it('opens unreadable v2 data as an empty doc instead of migrating again', async () => {
+  it('opens unreadable v3 data as an empty doc instead of migrating again', async () => {
     const kv = memoryStore()
     const storage = memoryStorage()
     kv.data.set(STORAGE_KEY, 'garbage')
+    kv.data.set(V2_STORAGE_KEY, v2Drawing())
     storage.setItem(V1_STORAGE_KEY, JSON.stringify([v1Stroke('old')]))
 
     expect(await loadStartupDoc(kv, storage)).toEqual(emptyDoc())
+  })
+
+  it('opens an empty doc and saves nothing when storage can not be read', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const kv = memoryStore()
+    kv.data.set(V2_STORAGE_KEY, v2Drawing())
+    const { set } = kv
+    kv.get = () => Promise.reject(new DOMException('Blocked', 'SecurityError'))
+    kv.set = vi.fn(set)
+
+    expect(await loadStartupDoc(kv, memoryStorage())).toEqual(emptyDoc())
+    expect(kv.set).not.toHaveBeenCalled()
+    vi.restoreAllMocks()
   })
 })

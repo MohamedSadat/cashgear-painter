@@ -1,5 +1,5 @@
-import { useEditorStore } from '../store/editorStore'
-import { toolFor } from '../tools'
+import { currentPageOf, useEditorStore } from '../store/editorStore'
+import { settleTool } from '../tools'
 import { chooseFile, downloadText } from './files'
 import { DOC_FILE_NAME, docToJson, parseDocFile } from './persistence'
 import { SVG_FILE_NAME, exportSvg } from './svg/exportSvg'
@@ -9,11 +9,6 @@ const store = () => useEditorStore.getState()
 
 const errorMessage = (error: unknown, fallback: string) =>
   error instanceof Error && error.message ? error.message : fallback
-
-/** Ends what the active tool is drawing, such as a pen path, as a tool switch would. */
-function settleTool() {
-  toolFor(store().tool)?.onCancel?.()
-}
 
 /** Downloads the drawing as drawing.painter.json. */
 export function saveDrawing(): void {
@@ -38,16 +33,18 @@ export async function openDrawing(): Promise<void> {
   }
 }
 
-/** Downloads the drawing as drawing.svg. */
+/** Downloads the current page as drawing.svg, at the page's size. */
 export function exportSvgFile(): void {
   settleTool()
-  downloadText(exportSvg(store().doc), SVG_FILE_NAME, 'image/svg+xml')
+  const state = store()
+  downloadText(exportSvg(state.doc, currentPageOf(state).id), SVG_FILE_NAME, 'image/svg+xml')
 }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
 /**
- * Adds an SVG file's shapes as one group on top, one undo step, named after the file. The group
+ * Adds an SVG file's shapes to the current page as one group on top, one undo step, named after
+ * the file. The group
  * is selected and the select tool takes over, as after drawing a shape. A toast says how many
  * elements were skipped.
  */
@@ -56,7 +53,8 @@ export async function importSvgFile(): Promise<void> {
   if (!file) return
   try {
     const name = file.name.replace(/\.svg$/i, '') || 'Imported SVG'
-    const { nodes, groupId, skipped } = importSvg(await file.text(), name)
+    const page = currentPageOf(store())
+    const { nodes, groupId, skipped } = importSvg(await file.text(), name, page)
     const unsupported = `Skipped ${plural(skipped, 'unsupported element')} (text, images, gradients and the like).`
     if (!groupId) {
       store().showToast(skipped > 0 ? `Nothing to import. ${unsupported}` : 'Nothing to import.')

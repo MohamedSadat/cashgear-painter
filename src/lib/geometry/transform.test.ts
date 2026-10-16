@@ -17,6 +17,7 @@ import {
   isAxisAligned,
   normalizeRotation,
   relativeTransform,
+  scaleContent,
   scaleAlong,
   snapAngle,
 } from './transform'
@@ -26,7 +27,7 @@ const base: BaseNode = {
   name: 'Node',
   parentId: null,
   transform: IDENTITY_TRANSFORM,
-  style: { fill: '#000000', stroke: null, strokeWidth: 1, opacity: 1 },
+  style: { fill: { kind: 'solid', color: '#000000' }, stroke: null, strokeWidth: 1, opacity: 1 },
   hidden: false,
   locked: false,
 }
@@ -99,12 +100,22 @@ describe('bakeTransform', () => {
       arrowEnd: true,
     }
     const anchor: Anchor = { x: 1, y: 2, inX: -3, inY: 0, outX: 3, outY: 1, kind: 'smooth' }
-    const path: NodeOf<'path'> = { ...base, type: 'path', anchors: [anchor], closed: false }
+    const path: NodeOf<'path'> = {
+      ...base,
+      type: 'path',
+      contours: [{ anchors: [anchor], closed: false }],
+      fillRule: 'nonzero',
+    }
 
     expect(bakeTransform(line, resized)).toEqual({ transform: baked, points: [0, 0, 20, -15] })
     expect(bakeTransform(path, resized)).toEqual({
       transform: baked,
-      anchors: [{ x: 2, y: 6, inX: -6, inY: 0, outX: 6, outY: 3, kind: 'smooth' }],
+      contours: [
+        {
+          anchors: [{ x: 2, y: 6, inX: -6, inY: 0, outX: 6, outY: 3, kind: 'smooth' }],
+          closed: false,
+        },
+      ],
     })
   })
 
@@ -222,5 +233,67 @@ describe('bakeTransforms', () => {
         'g',
       ),
     ).toBe(false)
+  })
+})
+
+describe('scaleContent', () => {
+  it('scales a page’s objects about its corner and moves them, outlines and fonts included', () => {
+    const outlined = { ...base.style, stroke: '#000000', strokeWidth: 4 }
+    const rect: NodeOf<'rect'> = {
+      ...base,
+      id: 'r',
+      parentId: 'g',
+      style: outlined,
+      transform: { ...IDENTITY_TRANSFORM, x: 10, y: 20 },
+      type: 'rect',
+      width: 100,
+      height: 50,
+      cornerRadius: 8,
+    }
+    const group: NodeOf<'group'> = {
+      ...base,
+      id: 'g',
+      type: 'group',
+      transform: { ...IDENTITY_TRANSFORM, x: 100, y: 100 },
+      childIds: ['r'],
+    }
+    const stroke = {
+      ...createStrokeNode([[0, 0, 0.5]], { color: '#000000', size: 8, usesPressure: false }, 's'),
+    }
+    const text: NodeOf<'text'> = {
+      ...base,
+      id: 't',
+      type: 'text',
+      transform: { ...IDENTITY_TRANSFORM, x: 40, y: 0 },
+      text: 'Hi',
+      fontFamily: 'Arial',
+      fontSize: 20,
+      fontStyle: 'normal',
+      align: 'left',
+      width: 200,
+    }
+    const nodes = { g: group, r: rect, s: stroke, t: text }
+
+    const patch = scaleContent(nodes, ['g', 's', 't'], 0.5, 10, 0)
+
+    // The group moves and keeps a scale of 1; its child scales inside it.
+    expect(patch.g).toEqual({ transform: { ...group.transform, x: 60, y: 50 } })
+    expect(patch.r).toEqual({
+      transform: { ...rect.transform, x: 5, y: 10 },
+      width: 50,
+      height: 25,
+      cornerRadius: 4,
+      style: { ...outlined, strokeWidth: 2 },
+    })
+    // A freehand stroke keeps its scale; text bakes it into width and size.
+    expect(patch.s).toEqual({
+      transform: { ...IDENTITY_TRANSFORM, x: 10, scaleX: 0.5, scaleY: 0.5 },
+    })
+    expect(patch.t).toEqual({
+      transform: { ...text.transform, x: 30 },
+      width: 100,
+      fontSize: 10,
+    })
+    expect(scaleContent(nodes, ['t'], 1, 0, 0)).toEqual({})
   })
 })

@@ -1,6 +1,7 @@
 import { eraseSplitPlaced, type EraserPath } from '../lib/geometry/eraseSplit'
 import { nodeHitsSegment } from '../lib/geometry/hitTest'
 import { absoluteTransform, sameTransform } from '../lib/geometry/transform'
+import { pageSubtree } from '../lib/pages'
 import { isPickable, useEditorStore, type EraserMode } from '../store/editorStore'
 import type { Doc, NodeId, Point, VectorNode } from '../types'
 import type { ToolController } from './types'
@@ -31,11 +32,13 @@ function onCanvas(doc: Doc, node: VectorNode): VectorNode {
  * including those inside groups, which it erases one by one rather than the whole group.
  */
 function sweep(a: [number, number], b: [number, number]) {
-  const { doc, brush } = store()
+  const { doc, brush, currentPageId } = store()
   const radius = brush.size / 2
   let found = false
-  for (const node of Object.values(doc.nodes)) {
-    if (node.type === 'group' || hits.has(node.id) || !isPickable(doc, node.id)) continue
+  for (const node of pageSubtree(doc, currentPageId)) {
+    if (node.type === 'group' || hits.has(node.id) || !isPickable(doc, node.id, currentPageId)) {
+      continue
+    }
     if (nodeHitsSegment(onCanvas(doc, node), a, b, radius)) {
       hits.add(node.id)
       found = true
@@ -50,7 +53,7 @@ function sweep(a: [number, number], b: [number, number]) {
  * Other objects are left alone.
  */
 function cut(a: [number, number], b: [number, number]) {
-  const { doc, brush } = store()
+  const { doc, brush, currentPageId } = store()
   const radius = brush.size / 2
   const eraser: EraserPath = {
     points: [
@@ -61,8 +64,8 @@ function cut(a: [number, number], b: [number, number]) {
   }
   const cuts: Record<NodeId, Point[][]> = {}
   let found = false
-  for (const node of Object.values(doc.nodes)) {
-    if (node.type !== 'stroke' || !isPickable(doc, node.id)) continue
+  for (const node of pageSubtree(doc, currentPageId)) {
+    if (node.type !== 'stroke' || !isPickable(doc, node.id, currentPageId)) continue
     const placed = onCanvas(doc, node)
     if (!nodeHitsSegment(placed, a, b, radius)) continue
     const runs = eraseSplitPlaced(node.points, node.size, placed.transform, eraser)

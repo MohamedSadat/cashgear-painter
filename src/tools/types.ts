@@ -25,4 +25,7 @@ export interface ToolController {
   onHover?(e: ToolEvent | null): void
   onKey?(e: KeyboardEvent): boolean // true = handled
   onCancel?(): void // Esc or tool switch
+  // Ends what the tool is drawing and keeps it, before a page switch or a file action; without
+  // it, onCancel does.
+  onSettle?(): void
 }

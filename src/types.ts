@@ -9,9 +9,25 @@ export interface Transform {
   scaleY: number
 }
 
+export type AssetId = string // SHA-256 hex of the image bytes
+export type FillRule = 'nonzero' | 'evenodd'
+
+export interface Stop {
+  offset: number // 0..1
+  color: string
+  opacity: number
+}
+
+/** How a fill is painted. Gradient points are in units of the node's box (0..1). */
+export type Paint =
+  | { kind: 'solid'; color: string }
+  | { kind: 'linear'; stops: Stop[]; start: [number, number]; end: [number, number] }
+  // radius in units of the box's longer side
+  | { kind: 'radial'; stops: Stop[]; center: [number, number]; radius: number }
+
 export interface Style {
-  fill: string | null // hex; null = no fill
-  stroke: string | null
+  fill: Paint | null // null = no fill
+  stroke: string | null // hex; stays solid in v3
   strokeWidth: number // canvas units, never scaled by transforms
   opacity: number // 0..1
 }
@@ -36,6 +52,12 @@ export interface Anchor {
   kind: 'corner' | 'smooth' | 'symmetric'
 }
 
+/** One subpath of a path: its anchors, and whether it closes back to the first. */
+export interface Contour {
+  anchors: Anchor[]
+  closed: boolean
+}
+
 export type VectorNode =
   | (BaseNode & { type: 'stroke'; points: Point[]; size: number; usesPressure: boolean })
   | (BaseNode & { type: 'rect'; width: number; height: number; cornerRadius: number })
@@ -46,7 +68,7 @@ export type VectorNode =
       arrowStart: boolean
       arrowEnd: boolean
     })
-  | (BaseNode & { type: 'path'; anchors: Anchor[]; closed: boolean })
+  | (BaseNode & { type: 'path'; contours: Contour[]; fillRule: FillRule })
   | (BaseNode & {
       type: 'text'
       text: string
@@ -67,17 +89,34 @@ export type GroupNode = NodeOf<'group'>
 /** Nodes drawn as geometry with an optional outline: rectangles, ellipses, lines and paths. */
 export type ShapeNode = NodeOf<'rect' | 'ellipse' | 'line' | 'path'>
 
-/** The drawing surface in logical canvas units; the Stage is scaled to fit its container. */
-export const CANVAS_WIDTH = 1600
-export const CANVAS_HEIGHT = 1000
+/** A new drawing's page, in CSS pixels at 96 dpi: v1 and v2's fixed artboard. */
+export const DEFAULT_PAGE_WIDTH = 1600
+export const DEFAULT_PAGE_HEIGHT = 1000
+// A new drawing's first page and a migrated v2 drawing's only page share this id.
+export const FIRST_PAGE_ID = 'page-1'
+
+export interface Page {
+  id: string
+  name: string
+  width: number // px at 96 dpi
+  height: number
+  background: Paint
+  rootIds: NodeId[] // z-order, bottom to top; groups order their own childIds
+}
+
+export interface AssetMeta {
+  id: AssetId
+  mime: 'image/png' | 'image/jpeg' | 'image/webp'
+  width: number
+  height: number
+  bytes: number
+}
 
 export interface Doc {
-  version: 2
-  width: typeof CANVAS_WIDTH // the artboard, as in v1
-  height: typeof CANVAS_HEIGHT
-  background: string // '#ffffff'
-  nodes: Record<NodeId, VectorNode>
-  rootIds: NodeId[] // z-order, bottom to top; groups order their own childIds
+  version: 3
+  pages: Page[]
+  nodes: Record<NodeId, VectorNode> // every node of every page
+  assets: Record<AssetId, AssetMeta> // blobs live in IndexedDB, not here
 }
 
 export type ToolId =
@@ -85,13 +124,16 @@ export type ToolId =
 
 export const IDENTITY_TRANSFORM: Transform = { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1 }
 
+/** An empty page with a white background. */
+export function newPage(
+  id: string,
+  name: string,
+  width = DEFAULT_PAGE_WIDTH,
+  height = DEFAULT_PAGE_HEIGHT,
+): Page {
+  return { id, name, width, height, background: { kind: 'solid', color: '#ffffff' }, rootIds: [] }
+}
+
 export function emptyDoc(): Doc {
-  return {
-    version: 2,
-    width: CANVAS_WIDTH,
-    height: CANVAS_HEIGHT,
-    background: '#ffffff',
-    nodes: {},
-    rootIds: [],
-  }
+  return { version: 3, pages: [newPage(FIRST_PAGE_ID, 'Page 1')], nodes: {}, assets: {} }
 }

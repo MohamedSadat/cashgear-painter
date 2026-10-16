@@ -5,6 +5,7 @@ import {
   createEllipseNode,
   createGroupNode,
   createLineNode,
+  createPathFromContours,
   createPathNode,
   createRectNode,
   createStrokeNode,
@@ -13,8 +14,9 @@ import {
 import { arrowHeadSize } from '../geometry/bounds'
 import { corner } from '../geometry/pathData'
 import { firstBaseline } from '../geometry/textLayout'
+import { solid } from '../paint/paint'
 import { strokeToPath } from '../strokePath'
-import { emptyDoc, type Doc, type VectorNode } from '../../types'
+import { emptyDoc, newPage, type Doc, type VectorNode } from '../../types'
 import { exportSvg, transformAttr } from './exportSvg'
 
 /** A doc holding the nodes; nodes with a parent go into that group's childIds by the caller. */
@@ -22,7 +24,7 @@ function docOf(...nodes: VectorNode[]): Doc {
   const doc = emptyDoc()
   for (const node of nodes) {
     doc.nodes[node.id] = node
-    if (node.parentId === null) doc.rootIds.push(node.id)
+    if (node.parentId === null) doc.pages[0].rootIds.push(node.id)
   }
   return doc
 }
@@ -34,7 +36,7 @@ const elements = (svg: string, tag: string) =>
 const box = { x: 100, y: 50, width: 200, height: 80 }
 
 describe('exportSvg', () => {
-  it('writes the artboard and its background, and nothing else for an empty doc', () => {
+  it('writes the page and its background, and nothing else for an empty doc', () => {
     const svg = exportSvg(emptyDoc())
     expect(svg).toContain(
       '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" width="1600" height="1000">',
@@ -55,7 +57,7 @@ describe('exportSvg', () => {
   })
 
   it('writes each shape with its geometry, paint and opacity', () => {
-    const rect = createRectNode(box, { ...DEFAULT_SHAPE_STYLE, fill: '#ef4444' }, 'r')
+    const rect = createRectNode(box, { ...DEFAULT_SHAPE_STYLE, fill: solid('#ef4444') }, 'r')
     const ellipse = createEllipseNode(box, { ...DEFAULT_SHAPE_STYLE, opacity: 0.5 }, 'e')
     const path = createPathNode(
       [corner(0, 0), { ...corner(100, 0), inX: -20, inY: 30 }],
@@ -73,6 +75,42 @@ describe('exportSvg', () => {
     // Konva's miter limit is 10; SVG's default is 4.
     expect(elements(svg, 'path')[0].trim()).toBe(
       '<path d="M 0 0 C 0 0 80 30 100 0 C 100 0 0 0 0 0 Z" fill="none" stroke="#22c55e" stroke-width="6" stroke-linejoin="miter" stroke-linecap="round" stroke-miterlimit="10"/>',
+    )
+  })
+
+  it('writes the page asked for, at its own size and background', () => {
+    const doc = docOf(createRectNode(box, DEFAULT_SHAPE_STYLE, 'r'))
+    const a4 = { ...newPage('a4', 'A4', 794, 1123), background: solid('#fef3c7') }
+    doc.pages.push({ ...a4, rootIds: [] })
+
+    const svg = exportSvg(doc, 'a4')
+    expect(svg).toContain('viewBox="0 0 794 1123" width="794" height="1123"')
+    expect(elements(svg, 'rect')).toEqual(['  <rect width="794" height="1123" fill="#fef3c7"/>'])
+    // The first page by default.
+    expect(elements(exportSvg(doc), 'rect')).toHaveLength(2)
+  })
+
+  it('writes the fill rule of a path with holes', () => {
+    const square = (from: number, to: number) => [
+      corner(from, from),
+      corner(to, from),
+      corner(to, to),
+      corner(from, to),
+    ]
+    const donut = createPathFromContours(
+      [
+        { anchors: square(0, 100), closed: true },
+        { anchors: square(25, 75), closed: true },
+      ],
+      { ...DEFAULT_SHAPE_STYLE, fill: solid('#ef4444'), stroke: null },
+      'evenodd',
+      'd',
+    )
+    const [path] = elements(exportSvg(docOf(donut)), 'path')
+    expect(path).toContain('fill-rule="evenodd"')
+    expect(path.match(/M /g)).toHaveLength(2)
+    expect(elements(exportSvg(docOf({ ...donut, fillRule: 'nonzero' })), 'path')[0]).not.toContain(
+      'fill-rule',
     )
   })
 

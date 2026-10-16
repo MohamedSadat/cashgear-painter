@@ -1,15 +1,18 @@
 import type Konva from 'konva'
 import type { KonvaEventObject } from 'konva/lib/Node'
-import { useCallback, useEffect, useMemo, useRef, type Ref } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type Ref } from 'react'
 import { Layer, Rect, Stage } from 'react-konva'
 import { useViewport } from '../hooks/useViewport'
 import { OVERLAY_LAYER_NAME } from '../lib/exportPng'
-import { useEditorStore } from '../store/editorStore'
+import { paintColor } from '../lib/paint/paint'
+import { currentPageOf, useEditorStore } from '../store/editorStore'
 import { toolFor } from '../tools'
+import { pickTarget } from '../tools/selectTool'
 import { finishTextEdit } from '../tools/textTool'
 import type { ToolEvent } from '../tools/types'
-import { CANVAS_HEIGHT, CANVAS_WIDTH, type NodeId } from '../types'
+import type { NodeId } from '../types'
 import { BrushCursor } from './BrushCursor'
+import { MoveToPageMenu } from './MoveToPageMenu'
 import { NodeView } from './NodeView'
 import { PathEditOverlay } from './PathEditOverlay'
 import { SelectionOverlay } from './SelectionOverlay'
@@ -52,7 +55,8 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
   const cursorRef = useRef<Konva.Group>(null)
   const activePointerId = useRef<number | null>(null)
   const lastEvent = useRef<ToolEvent | null>(null)
-  const doc = useEditorStore((s) => s.doc)
+  const nodes = useEditorStore((s) => s.doc.nodes)
+  const page = useEditorStore(currentPageOf)
   const draft = useEditorStore((s) => s.draft)
   const erasing = useEditorStore((s) => s.erasing)
   const tool = useEditorStore((s) => s.tool)
@@ -61,6 +65,8 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
   const viewport = useEditorStore((s) => s.viewport)
   const erasingIds = useMemo(() => new Set(erasing), [erasing])
   const zoom = viewport.fit * view.scale
+  const [menuAt, setMenuAt] = useState<{ x: number; y: number } | null>(null)
+  const closeMenu = useCallback(() => setMenuAt(null), [])
 
   // A pinch is not a stroke: drop whatever the first finger started.
   const cancelGesture = useCallback(() => {
@@ -166,6 +172,20 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
     if (e) activeTool()?.onUp(e)
   }
 
+  // A right-click picks what is under the pointer, as a click would, and offers to move or copy
+  // the selection to another page. Not during a gesture: a long press on a touch screen can send
+  // one mid-stroke.
+  const handleContextMenu = ({ evt, target }: KonvaEventObject<PointerEvent | MouseEvent>) => {
+    evt.preventDefault()
+    if (activePointerId.current !== null) return
+    const state = useEditorStore.getState()
+    const hit = target.getLayer() === contentLayerRef.current ? target.id() || null : null
+    const picked = hit === null ? null : pickTarget(state.doc, hit, state.selection)
+    if (picked !== null && !state.selection.includes(picked)) state.select([picked])
+    if (useEditorStore.getState().selection.length === 0) return
+    setMenuAt({ x: evt.clientX, y: evt.clientY })
+  }
+
   return (
     // The padding only shapes the fit; the Stage fills the whole area, padding included.
     // A browser keeping the text editor's caret in view may scroll this box; the view does the
@@ -193,6 +213,7 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
+            onContextMenu={handleContextMenu}
           >
             <Layer listening={false}>
               {/* The pasteboard covers the visible area, so it is sized in canvas units here. */}
@@ -203,29 +224,30 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
                 height={viewport.height / zoom}
                 fill={PASTEBOARD_COLOR}
               />
-              {/* A 1-screen-pixel edge and a soft shadow, both outside the artboard and the PNG. */}
+              {/* A 1-screen-pixel edge and a soft shadow, both outside the page and the PNG. */}
               <Rect
                 x={-1 / zoom}
                 y={-1 / zoom}
-                width={CANVAS_WIDTH + 2 / zoom}
-                height={CANVAS_HEIGHT + 2 / zoom}
+                width={page.width + 2 / zoom}
+                height={page.height + 2 / zoom}
                 fill={ARTBOARD_EDGE_COLOR}
                 shadowColor="#000000"
                 shadowOpacity={0.15}
                 shadowBlur={8 / zoom}
                 shadowOffsetY={2 / zoom}
               />
+              {/* The page; still named artboard, as the e2e tests find it. */}
               <Rect
                 name="artboard"
-                width={CANVAS_WIDTH}
-                height={CANVAS_HEIGHT}
-                fill={doc.background}
+                width={page.width}
+                height={page.height}
+                fill={paintColor(page.background)}
               />
             </Layer>
             {/* The draft is the last child, so the stroke being drawn is on top. */}
             <Layer ref={contentLayerRef} listening={toolFor(tool)?.picksNodes ?? false}>
-              {doc.rootIds.map((id) => (
-                <NodeView key={id} node={doc.nodes[id]} dimmed={erasingIds.has(id)} />
+              {page.rootIds.map((id) => (
+                <NodeView key={id} node={nodes[id]} dimmed={erasingIds.has(id)} />
               ))}
               {draft && <NodeView key={draft.id} node={draft} isDraft />}
             </Layer>
@@ -236,6 +258,7 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
             </Layer>
           </Stage>
           <TextEditor />
+          {menuAt && <MoveToPageMenu at={menuAt} onClose={closeMenu} />}
         </div>
       )}
     </div>
