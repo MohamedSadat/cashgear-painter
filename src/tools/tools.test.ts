@@ -1172,6 +1172,46 @@ describe('selectTool align and distribute from the keyboard', () => {
   })
 })
 
+describe('selectTool boolean operations from the keyboard', () => {
+  const plain = { ...DEFAULT_SHAPE_STYLE, stroke: null, fill: solid('#000000') }
+  const press = (key: string, mods: Partial<KeyboardEvent> = {}) =>
+    selectTool.onKey?.(
+      keyEvent(key, { altKey: true, ctrlKey: true, code: `Key${key.toUpperCase()}`, ...mods }),
+    )
+
+  it('unites, subtracts, intersects and excludes on Ctrl/Cmd + Alt + U, S, I and X', async () => {
+    for (const [key, contours] of [
+      ['u', 1],
+      ['s', 2],
+      ['i', 1],
+      ['x', 2],
+    ] as const) {
+      useEditorStore.setState(initialState, true)
+      const a = createRectNode({ x: 0, y: 0, width: 200, height: 200 }, plain)
+      const b = createRectNode({ x: 50, y: 50, width: 100, height: 100 }, plain)
+      store().addNodes([a, b])
+      store().select([a.id, b.id])
+      // Cmd on a Mac; on Windows, Ctrl + Alt may type another character, as AltGr does.
+      expect(press(key, key === 's' ? { ctrlKey: false, metaKey: true } : { key: 'ß' })).toBe(true)
+      await vi.waitFor(() => expect(store().doc.nodes[b.id]).toBeUndefined())
+      const result = store().doc.nodes[a.id]
+      expect(result.type === 'path' && result.contours.length).toBe(contours)
+    }
+  })
+
+  it("says what to select when the selection can't be combined", () => {
+    const a = createRectNode({ x: 0, y: 0, width: 100, height: 100 }, plain)
+    store().addNodes([a])
+    store().select([a.id])
+    const doc = store().doc
+    expect(press('u')).toBe(true)
+    expect(store().toast?.message).toMatch(/Select 2 or more/)
+    expect(store().doc).toBe(doc)
+    // Other Ctrl + Alt keys stay with the browser.
+    expect(press('q')).toBe(false)
+  })
+})
+
 describe('textTool', () => {
   // At zoom 1, canvas units are screen pixels.
   beforeEach(() => {

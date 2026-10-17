@@ -18,6 +18,7 @@
     "immer": "11.1.21",
     "konva": "10.9.0",
     "lucide-react": "1.57.0",
+    "paper": "0.12.18",
     "perfect-freehand": "1.2.3",
     "react": "19.3.1",
     "react-dom": "19.3.1",

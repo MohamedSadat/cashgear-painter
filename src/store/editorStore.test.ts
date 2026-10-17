@@ -21,6 +21,8 @@ import {
   MIN_SIZE,
   MIN_ZOOM,
   PASTE_OFFSET,
+  canCombine,
+  canSimplify,
   createEllipseNode,
   createGroupNode,
   createLineNode,
@@ -1446,5 +1448,109 @@ describe('align and distribute', () => {
     expect(store().past).toHaveLength(steps + 1)
     store().undo()
     expect(store().doc.nodes[b.id]).toEqual(b)
+  })
+})
+
+describe('boolean operations', () => {
+  const filled = { ...DEFAULT_SHAPE_STYLE, stroke: null, fill: solid('#ef4444') }
+  const rect = (x: number, y: number, w = 100, h = 100) =>
+    createRectNode({ x, y, width: w, height: h }, filled)
+  const circle = (cx: number, cy: number, r: number) =>
+    createEllipseNode({ x: cx - r, y: cy - r, width: 2 * r, height: 2 * r }, filled)
+
+  it('combines only 2 or more unlocked shapes, paths and freehand strokes', () => {
+    const a = rect(0, 0)
+    const b = circle(50, 50, 20)
+    const t = createTextNode(0, 0, 100, DEFAULT_TEXT_STYLE, 'Hi')
+    const s = stroke(0)
+    store().addNodes([a, b, t, s, { ...rect(0, 0), id: 'locked', locked: true }])
+    const doc = () => store().doc
+    expect(canCombine(doc(), [a.id, b.id])).toBe(true)
+    expect(canCombine(doc(), [a.id, s.id])).toBe(true)
+    expect(canCombine(doc(), [a.id])).toBe(false)
+    expect(canCombine(doc(), [a.id, a.id])).toBe(false)
+    expect(canCombine(doc(), [a.id, t.id])).toBe(false)
+    expect(canCombine(doc(), [a.id, 'locked'])).toBe(false)
+    store().group([a.id, b.id])
+    expect(canCombine(doc(), [store().selection[0], s.id])).toBe(false)
+    expect(canSimplify(doc(), [s.id])).toBe(false)
+  })
+
+  it("replaces the inputs with one path at the bottom one's place, as one undo step", async () => {
+    const below = rect(500, 500)
+    const a = rect(0, 0, 200, 100)
+    const middle = rect(600, 600)
+    const b = circle(100, 50, 30)
+    store().addNodes([below, a, middle, b])
+    store().select([b.id, a.id])
+    const steps = store().past.length
+
+    expect(await store().booleanOp(store().selection, 'subtract')).toBe(true)
+
+    const result = store().doc.nodes[a.id]
+    expect(result.type).toBe('path')
+    expect(result.type === 'path' && result.contours).toHaveLength(2)
+    expect(store().doc.nodes[b.id]).toBeUndefined()
+    expect(ids()).toEqual([below.id, a.id, middle.id])
+    expect(store().selection).toEqual([a.id])
+    expect(store().past).toHaveLength(steps + 1)
+
+    store().undo()
+    expect(store().doc.nodes[a.id]).toEqual(a)
+    expect(store().doc.nodes[b.id]).toEqual(b)
+    expect(ids()).toEqual([below.id, a.id, middle.id, b.id])
+  })
+
+  it("puts the result in the bottom input's group and drops groups it empties", async () => {
+    const a = rect(0, 0)
+    const b = rect(50, 50)
+    const c = rect(300, 0)
+    store().addNodes([a, b, c])
+    store().group([a.id, b.id])
+    const [outer] = store().selection
+    store().group([c.id])
+    const [inner] = store().selection
+    // The layers panel can pick nodes from different groups.
+    expect(await store().booleanOp([c.id, a.id], 'union')).toBe(true)
+    const nodes = store().doc.nodes
+    expect(nodes[a.id].parentId).toBe(outer)
+    expect(nodes[inner]).toBeUndefined()
+    expect((nodes[outer] as GroupNode).childIds).toEqual([a.id, b.id])
+    expect(ids()).toEqual([outer])
+  })
+
+  it("changes nothing and says why when nothing is left or the shapes don't qualify", async () => {
+    const a = rect(0, 0)
+    const b = rect(500, 500)
+    store().addNodes([a, b])
+    const doc = store().doc
+    expect(await store().booleanOp([a.id, b.id], 'intersect')).toBe(false)
+    expect(store().doc).toBe(doc)
+    expect(store().toast?.message).toMatch(/overlap/)
+    expect(await store().booleanOp([a.id], 'union')).toBe(false)
+    expect(store().doc).toBe(doc)
+  })
+
+  it('simplifies paths as one undo step', async () => {
+    const points: Point[] = []
+    for (let x = 0; x <= 600; x += 10) points.push(point(x, 100 + 20 * Math.sin(x / 40)))
+    const s = createStrokeNode(points, { color: '#000000', size: 20, usesPressure: false })
+    const r = rect(-20, 50)
+    store().addNodes([s, r])
+    await store().booleanOp([s.id, r.id], 'union')
+    const before = store().doc.nodes[s.id]
+    if (before.type !== 'path') throw new Error('not a path')
+    const steps = store().past.length
+
+    expect(await store().simplify([s.id])).toBe(true)
+    const after = store().doc.nodes[s.id]
+    if (after.type !== 'path') throw new Error('not a path')
+    const count = (p: typeof after) => p.contours.reduce((n, c) => n + c.anchors.length, 0)
+    expect(count(after)).toBeLessThan(count(before) / 2)
+    expect(store().past).toHaveLength(steps + 1)
+    expect(store().toast?.message).toMatch(/^Simplified from \d+ anchors to \d+\.$/)
+    // Once simple, it stays as it is.
+    expect(await store().simplify([s.id])).toBe(false)
+    expect(store().past).toHaveLength(steps + 1)
   })
 })

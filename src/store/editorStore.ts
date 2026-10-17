@@ -7,6 +7,7 @@ import {
   type Axis,
   type Patch,
 } from '../lib/align/align'
+import type { BooleanKind } from '../lib/boolean/booleanOp'
 import { isIdentity } from '../lib/geometry/bounds'
 import { shapeAnchors } from '../lib/geometry/pathData'
 import { WEB_SAFE_FONTS } from '../lib/geometry/textLayout'
@@ -59,6 +60,20 @@ export const MAX_ZOOM = 32
 // one undo step.
 export const MERGE_MS = 500
 export const PASTE_OFFSET = 10 // canvas units between a copy and its duplicate or paste
+
+// Paper.js and the boolean pipeline, loaded on first use so they never weigh on startup.
+const loadBoolean = () => import('../lib/boolean/booleanOp')
+
+const BOOLEAN_FAILED_TO_LOAD =
+  "Boolean operations couldn't load. Check the connection and try again."
+const BOOLEAN_FAILED = "Those shapes couldn't be combined, so nothing changed."
+// Why nothing is left of an operation.
+const NOTHING_LEFT: Record<BooleanKind, string> = {
+  union: 'Nothing is left of the shapes, so nothing changed.',
+  subtract: 'Nothing is left of the bottom shape, so nothing changed.',
+  intersect: "The shapes don't all overlap, so nothing changed.",
+  exclude: 'Nothing is left of the shapes, so nothing changed.',
+}
 
 /** The style new rectangles, ellipses and lines start with: a black outline and no fill. */
 export const DEFAULT_SHAPE_STYLE: Style = {
@@ -196,6 +211,8 @@ export interface EditorState {
   copy(ids: NodeId[]): void
   paste(): void
   convertToPath(ids: NodeId[]): void
+  booleanOp(ids: NodeId[], kind: BooleanKind): Promise<boolean>
+  simplify(ids: NodeId[]): Promise<boolean>
   align(ids: NodeId[], where: AlignEdge): void
   distribute(ids: NodeId[], axis: Axis): void
   beginGesture(): void
@@ -525,6 +542,38 @@ export function shapeToPath(node: ConvertibleNode): PathNode {
     fillRule: 'nonzero',
   }
 }
+
+// What a boolean operation takes: its result is a path either way.
+const COMBINABLE: ReadonlySet<VectorNode['type']> = new Set([
+  'rect',
+  'ellipse',
+  'line',
+  'path',
+  'stroke',
+])
+
+/**
+ * Whether a boolean operation can combine the nodes: 2 or more unlocked rectangles, ellipses,
+ * lines, paths or freehand strokes, and nothing else. Text and groups rule it out.
+ */
+export function canCombine(doc: Doc, ids: NodeId[]): boolean {
+  const unique = new Set(ids)
+  return (
+    unique.size >= 2 &&
+    [...unique].every((id) => {
+      const node = doc.nodes[id]
+      return node !== undefined && !node.locked && COMBINABLE.has(node.type)
+    })
+  )
+}
+
+/** Whether Simplify has something to work on: an unlocked path among the nodes. */
+export function canSimplify(doc: Doc, ids: NodeId[]): boolean {
+  return ids.some((id) => doc.nodes[id]?.type === 'path' && !doc.nodes[id].locked)
+}
+
+const anchorCount = (node: PathNode) =>
+  node.contours.reduce((n, contour) => n + contour.anchors.length, 0)
 
 function pushSnapshot(past: Doc[], doc: Doc): Doc[] {
   const next = [...past, doc]
@@ -1138,6 +1187,87 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       commit((draft) => {
         for (const path of paths) draft.nodes[path.id] = path
       })
+    },
+
+    // Asynchronous: Paper loads on first use. What is combined is read once it has, so an edit
+    // made meanwhile isn't lost.
+    async booleanOp(ids, kind) {
+      if (!canCombine(get().doc, ids)) return false
+      let lib: Awaited<ReturnType<typeof loadBoolean>>
+      try {
+        lib = await loadBoolean()
+      } catch {
+        get().showToast(BOOLEAN_FAILED_TO_LOAD)
+        return false
+      }
+      const { doc, showToast } = get()
+      if (!canCombine(doc, ids)) return false
+      // Bottom to top.
+      const picked = outermost(doc, ids)
+      let result: PathNode | null
+      try {
+        result = lib.combine(doc.nodes, picked, kind)
+      } catch {
+        showToast(BOOLEAN_FAILED)
+        return false
+      }
+      if (!result) {
+        showToast(NOTHING_LEFT[kind])
+        return false
+      }
+      // The result takes the bottom-most node's place; the others go.
+      const path = result
+      const rest = picked.slice(1)
+      const formerParents = rest.map((id) => doc.nodes[id].parentId)
+      commit((draft) => {
+        draft.nodes[path.id] = path
+        for (const id of rest) {
+          detach(draft, id)
+          delete draft.nodes[id]
+        }
+        // A group never stays empty.
+        dropEmptyGroups(draft, formerParents)
+      })
+      const state = get()
+      set({ selection: pickable([path.id], state.doc, state.currentPageId), activeAnchor: null })
+      return true
+    },
+
+    async simplify(ids) {
+      if (!canSimplify(get().doc, ids)) return false
+      let lib: Awaited<ReturnType<typeof loadBoolean>>
+      try {
+        lib = await loadBoolean()
+      } catch {
+        get().showToast(BOOLEAN_FAILED_TO_LOAD)
+        return false
+      }
+      const { doc, showToast } = get()
+      const patch: Record<NodeId, Partial<VectorNode>> = {}
+      let before = 0
+      let after = 0
+      for (const id of new Set(ids)) {
+        const node = doc.nodes[id]
+        if (node?.type !== 'path' || node.locked) continue
+        let simpler: PathNode | null
+        try {
+          simpler = lib.simplifyPath(node)
+        } catch {
+          simpler = null
+        }
+        if (!simpler) continue
+        patch[id] = { contours: simpler.contours, style: simpler.style }
+        before += anchorCount(node)
+        after += anchorCount(simpler)
+      }
+      if (Object.keys(patch).length === 0) {
+        showToast("The path can't get any simpler.")
+        return false
+      }
+      get().updateNodes(patch)
+      set({ activeAnchor: null })
+      showToast(`Simplified from ${before} anchors to ${after}.`)
+      return true
     },
 
     align(ids, where) {

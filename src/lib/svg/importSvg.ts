@@ -1,6 +1,6 @@
 import svgpath from 'svgpath'
 import { cubicBox, fillBox, nodeBounds, pointsBox, unionBoxes } from '../geometry/bounds'
-import { KAPPA, corner, pathSegments, type Cubic, type Xy } from '../geometry/pathData'
+import { KAPPA, corner, near, withKinds, type Cubic, type Xy } from '../geometry/pathData'
 import { radiusUnit, solid, toBoxUnits } from '../paint/paint'
 import {
   DEFAULT_SHAPE_STYLE,
@@ -569,50 +569,7 @@ export function contoursOf(d: string, transforms: readonly string[] = []): Conto
   return contours
 }
 
-const EPSILON = 1e-6
-// Tangents this close to parallel (as the sine of their angle) make a smooth anchor.
-const ALIGNED = 1e-3
-
-const near = (a: Xy, b: Xy) => Math.abs(a[0] - b[0]) <= EPSILON && Math.abs(a[1] - b[1]) <= EPSILON
 const isDot = ([p0, p1, p2, p3]: Cubic) => near(p0, p1) && near(p0, p2) && near(p0, p3)
-
-/** The direction a segment arrives in: from its last control point that isn't on its end. */
-function arrival([p0, p1, p2, p3]: Cubic): Xy {
-  const from = !near(p2, p3) ? p2 : !near(p1, p3) ? p1 : p0
-  return [p3[0] - from[0], p3[1] - from[1]]
-}
-
-/** The direction a segment leaves in: toward its first control point that isn't on its start. */
-function departure([p0, p1, p2, p3]: Cubic): Xy {
-  const to = !near(p1, p0) ? p1 : !near(p2, p0) ? p2 : p3
-  return [to[0] - p0[0], to[1] - p0[1]]
-}
-
-/**
- * The anchors with kinds that match their curves: smooth where the path goes on in the same
- * direction (a curve leaving a straight side counts), symmetric when the two handles are also
- * equally long, and a corner elsewhere, including an open path's ends.
- */
-function withKinds(anchors: Anchor[], closed: boolean): Anchor[] {
-  const segments = pathSegments(anchors, closed)
-  const n = anchors.length
-  return anchors.map((anchor, i) => {
-    const before = closed || i > 0 ? segments[(i - 1 + n) % n] : undefined
-    const after = closed || i < n - 1 ? segments[i] : undefined
-    if (!before || !after) return anchor
-    const u = arrival(before)
-    const v = departure(after)
-    const lu = Math.hypot(...u)
-    const lv = Math.hypot(...v)
-    if (lu === 0 || lv === 0) return anchor
-    const sine = (u[0] * v[1] - u[1] * v[0]) / (lu * lv)
-    if (Math.abs(sine) > ALIGNED || u[0] * v[0] + u[1] * v[1] <= 0) return anchor
-    const inLength = Math.hypot(anchor.inX, anchor.inY)
-    const outLength = Math.hypot(anchor.outX, anchor.outY)
-    const even = Math.abs(inLength - outLength) <= ALIGNED * Math.max(inLength, outLength)
-    return { ...anchor, kind: inLength > 0 && even ? 'symmetric' : 'smooth' }
-  })
-}
 
 /**
  * A subpath as path anchors in canvas units; null when it draws nothing. Segments of no length

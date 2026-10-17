@@ -1,18 +1,21 @@
 import type Konva from 'konva'
+import { Waypoints } from 'lucide-react'
 import type { KonvaEventObject } from 'konva/lib/Node'
 import { useCallback, useEffect, useMemo, useRef, useState, type Ref } from 'react'
 import { Layer, Rect, Stage } from 'react-konva'
 import { useViewport } from '../hooks/useViewport'
 import { OVERLAY_LAYER_NAME } from '../lib/exportPng'
 import { pageKonvaFill } from '../lib/paint/toKonva'
-import { currentPageOf, useEditorStore } from '../store/editorStore'
+import { canCombine, canSimplify, currentPageOf, useEditorStore } from '../store/editorStore'
 import { toolFor } from '../tools'
-import { pickTarget } from '../tools/selectTool'
+import { combineSelection, pickTarget, simplifySelection } from '../tools/selectTool'
 import { finishTextEdit } from '../tools/textTool'
 import type { ToolEvent } from '../tools/types'
-import type { NodeId } from '../types'
+import type { Doc, NodeId } from '../types'
+import { BOOLEAN_COMMANDS } from './booleanCommands'
 import { BrushCursor } from './BrushCursor'
 import { GradientOverlay } from './GradientOverlay'
+import type { MenuItem } from './Menu'
 import { MoveToPageMenu } from './MoveToPageMenu'
 import { NodeView } from './NodeView'
 import { PathEditOverlay } from './PathEditOverlay'
@@ -28,6 +31,28 @@ const PASTEBOARD_COLOR = '#e5e5e5'
 const ARTBOARD_EDGE_COLOR = '#d4d4d4'
 
 const activeTool = () => toolFor(useEditorStore.getState().tool)
+
+/** The canvas menu's items above Move and Copy to page: the boolean operations and Simplify. */
+function editGroups(doc: Doc, selection: NodeId[]): MenuItem[][] {
+  const combinable = canCombine(doc, selection)
+  return [
+    BOOLEAN_COMMANDS.map(({ kind, label, keys, icon }) => ({
+      label,
+      shortcut: keys,
+      icon,
+      disabled: !combinable,
+      run: () => combineSelection(kind),
+    })),
+    [
+      {
+        label: 'Simplify path',
+        icon: Waypoints,
+        disabled: !canSimplify(doc, selection),
+        run: simplifySelection,
+      },
+    ],
+  ]
+}
 
 /** A pointer event in canvas units, ready for the active tool. */
 function readToolEvent(
@@ -67,8 +92,8 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
   const viewport = useEditorStore((s) => s.viewport)
   const erasingIds = useMemo(() => new Set(erasing), [erasing])
   const zoom = viewport.fit * view.scale
-  const [menuAt, setMenuAt] = useState<{ x: number; y: number } | null>(null)
-  const closeMenu = useCallback(() => setMenuAt(null), [])
+  const [menu, setMenu] = useState<{ x: number; y: number; edits: MenuItem[][] } | null>(null)
+  const closeMenu = useCallback(() => setMenu(null), [])
 
   // A pinch is not a stroke: drop whatever the first finger started.
   const cancelGesture = useCallback(() => {
@@ -174,8 +199,8 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
     if (e) activeTool()?.onUp(e)
   }
 
-  // A right-click picks what is under the pointer, as a click would, and offers to move or copy
-  // the selection to another page. Not during a gesture: a long press on a touch screen can send
+  // A right-click picks what is under the pointer, as a click would, and offers the boolean
+  // operations, Simplify, and moving or copying the selection to another page. Not during a gesture: a long press on a touch screen can send
   // one mid-stroke.
   const handleContextMenu = ({ evt, target }: KonvaEventObject<PointerEvent | MouseEvent>) => {
     evt.preventDefault()
@@ -184,8 +209,9 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
     const hit = target.getLayer() === contentLayerRef.current ? target.id() || null : null
     const picked = hit === null ? null : pickTarget(state.doc, hit, state.selection)
     if (picked !== null && !state.selection.includes(picked)) state.select([picked])
-    if (useEditorStore.getState().selection.length === 0) return
-    setMenuAt({ x: evt.clientX, y: evt.clientY })
+    const { doc, selection } = useEditorStore.getState()
+    if (selection.length === 0) return
+    setMenu({ x: evt.clientX, y: evt.clientY, edits: editGroups(doc, selection) })
   }
 
   return (
@@ -263,7 +289,9 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
             </Layer>
           </Stage>
           <TextEditor />
-          {menuAt && <MoveToPageMenu at={menuAt} onClose={closeMenu} />}
+          {menu && (
+            <MoveToPageMenu at={menu} label="Selection" before={menu.edits} onClose={closeMenu} />
+          )}
         </div>
       )}
     </div>

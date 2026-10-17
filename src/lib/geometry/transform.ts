@@ -74,6 +74,41 @@ export function scaleAlong(sx: number, sy: number, rotation: number): [number, n
   return [clean(Math.hypot(sx * cos, sy * sin)), clean(Math.hypot(sx * sin, sy * cos))]
 }
 
+/** An affine map as SVG's matrix(a b c d e f): x' = a x + c y + e, y' = b x + d y + f. */
+export type Affine = [a: number, b: number, c: number, d: number, e: number, f: number]
+
+/** The transform as an affine map, in Konva's order: scale, then rotate, then translate. */
+export function affineOf(t: Transform): Affine {
+  const cos = Math.cos(t.rotation * DEG)
+  const sin = t.rotation === 0 ? 0 : Math.sin(t.rotation * DEG)
+  return [t.scaleX * cos, t.scaleX * sin, -t.scaleY * sin, t.scaleY * cos, t.x, t.y]
+}
+
+/** `m` after `n`: the map that applies n, then m. */
+export function multiplyAffine(m: Affine, n: Affine): Affine {
+  const [a, b, c, d, e, f] = m
+  const [na, nb, nc, nd, ne, nf] = n
+  return [
+    a * na + c * nb,
+    b * na + d * nb,
+    a * nc + c * nd,
+    b * nc + d * nd,
+    a * ne + c * nf + e,
+    b * ne + d * nf + f,
+  ]
+}
+
+/** The map that undoes `m`; null when it flattens the plane. */
+export function invertAffine([a, b, c, d, e, f]: Affine): Affine | null {
+  const det = a * d - b * c
+  if (!(Math.abs(det) > 1e-12)) return null
+  return [d / det, -b / det, -c / det, a / det, (c * f - d * e) / det, (b * e - a * f) / det]
+}
+
+export function applyAffine([a, b, c, d, e, f]: Affine, x: number, y: number): [number, number] {
+  return [a * x + c * y + e, b * x + d * y + f]
+}
+
 /** The transform `child` has on the canvas when its parent has the transform `parent`. */
 export function composeTransform(parent: Transform, child: Transform): Transform {
   const [x, y] = applyTransform(parent, child.x, child.y)

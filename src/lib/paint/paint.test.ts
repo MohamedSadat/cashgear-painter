@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { affineOf, applyAffine } from '../geometry/transform'
 import type { Paint } from '../../types'
 import {
   fillColor,
@@ -6,6 +7,7 @@ import {
   gradientFrom,
   isPaint,
   lastStop,
+  mapGradient,
   paintColor,
   placeGradient,
   radiusUnit,
@@ -167,5 +169,58 @@ describe('gradient geometry', () => {
   it('has no layout for a gradient without extent, which paints its last stop', () => {
     expect(placeGradient({ ...linear, end: linear.start }, box)).toBeNull()
     expect(placeGradient({ ...radial, radius: 0 }, box)).toBeNull()
+  })
+})
+
+describe('mapGradient', () => {
+  type Xy = [number, number]
+  const from = { minX: 0, minY: 0, maxX: 100, maxY: 50 }
+  const to = { minX: -40, minY: 10, maxX: 200, maxY: 150 }
+  // Turned, moved and stretched more one way than the other.
+  const map = affineOf({ x: 30, y: -20, rotation: 30, scaleX: 2, scaleY: 0.5 })
+
+  /** How far along a linear gradient a point is: 0 at its start, 1 at its end. */
+  function along(paint: Paint, box: typeof from, [x, y]: Xy) {
+    const placed = placeGradient(paint as Extract<Paint, { kind: 'linear' }>, box)
+    if (placed?.kind !== 'linear') throw new Error('not a linear gradient')
+    const [sx, sy] = placed.start
+    const [dx, dy] = [placed.end[0] - sx, placed.end[1] - sy]
+    return ((x - sx) * dx + (y - sy) * dy) / (dx * dx + dy * dy)
+  }
+
+  it('lays a linear gradient out for another box so it paints the same points', () => {
+    const paint: Paint = { ...linear, start: [0.2, 0.1], end: [0.8, 0.9] } as Paint
+    const mapped = mapGradient(paint as Extract<Paint, { kind: 'linear' }>, from, to, map)
+    expect(mapped.stops).toBe(paint.kind === 'linear' && paint.stops)
+    for (const p of [
+      [0, 0],
+      [50, 25],
+      [100, 50],
+      [13, 40],
+    ] as Xy[]) {
+      expect(along(mapped, to, applyAffine(map, ...p))).toBeCloseTo(along(paint, from, p), 4)
+    }
+  })
+
+  it('moves a radial gradient center and scales its radius by the map', () => {
+    const uniform = affineOf({ x: 10, y: 20, rotation: 45, scaleX: 2, scaleY: 2 })
+    const mapped = mapGradient(radial as Extract<Paint, { kind: 'radial' }>, from, to, uniform)
+    const placed = placeGradient(mapped, to)
+    if (placed?.kind !== 'radial') throw new Error('not a radial gradient')
+    const [cx, cy] = applyAffine(uniform, 50, 25)
+    expect(placed.center[0]).toBeCloseTo(cx, 3)
+    expect(placed.center[1]).toBeCloseTo(cy, 3)
+    // Half the longer side (50), twice as large.
+    expect(placed.radius).toBeCloseTo(100, 3)
+  })
+
+  it('leaves a gradient without extent, or a map that flattens, alone', () => {
+    const flat: Paint = { ...linear, start: [0.5, 0.5], end: [0.5, 0.5] } as Paint
+    const gradient = flat as Extract<Paint, { kind: 'linear' }>
+    expect(mapGradient(gradient, from, to, map)).toBe(flat)
+    const squash = [1, 0, 0, 0, 0, 0] as const
+    expect(mapGradient(linear as Extract<Paint, { kind: 'linear' }>, from, to, [...squash])).toBe(
+      linear,
+    )
   })
 })

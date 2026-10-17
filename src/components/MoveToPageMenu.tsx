@@ -8,17 +8,26 @@ interface MoveToPageMenuProps {
   at: { x: number; y: number } // the menu's top-left corner, in window pixels
   onClose(): void
   ignoreRef?: RefObject<HTMLElement | null>
+  label?: string
+  before?: MenuItem[][] // groups above the page items, such as the canvas menu's edits
 }
 
 /**
  * Moves or copies the selection to another page, where it is on this one: opened by a right-click
- * on the canvas, or by the properties panel's button on touch screens.
+ * on the canvas, below the canvas menu's other items, or by the properties panel's button on
+ * touch screens.
  */
-export function MoveToPageMenu({ at, onClose, ignoreRef }: MoveToPageMenuProps) {
+export function MoveToPageMenu({
+  at,
+  onClose,
+  ignoreRef,
+  label = 'Move to page',
+  before = [],
+}: MoveToPageMenuProps) {
   const pages = useEditorStore((s) => s.doc.pages)
   const currentPageId = useEditorStore((s) => s.currentPageId)
   const others = pages.filter((page) => page.id !== currentPageId)
-  const groups: MenuItem[][] =
+  const pageGroups: MenuItem[][] =
     others.length === 0
       ? [[{ label: 'No other pages', disabled: true, run() {} }]]
       : [
@@ -35,8 +44,8 @@ export function MoveToPageMenu({ at, onClose, ignoreRef }: MoveToPageMenuProps) 
         ]
   return (
     <Menu
-      label="Move to page"
-      groups={groups}
+      label={label}
+      groups={[...before, ...pageGroups]}
       onClose={onClose}
       ignoreRef={ignoreRef}
       keepInView

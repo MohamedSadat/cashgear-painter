@@ -27,6 +27,7 @@ import {
   Spline,
   Trash2,
   Ungroup,
+  Waypoints,
   type LucideIcon,
 } from 'lucide-react'
 import { useCallback, useRef, useState, type ReactNode } from 'react'
@@ -40,7 +41,9 @@ import {
   MAX_SIZE,
   MIN_FONT_SIZE,
   MIN_SIZE,
+  canCombine,
   canConvertToPath,
+  canSimplify,
   currentPageOf,
   outermost,
   useEditorStore,
@@ -49,10 +52,16 @@ import {
 } from '../store/editorStore'
 import { activeAnchorOf, deleteActiveAnchor, setActiveAnchorKind } from '../tools/directTool'
 import { finishPath } from '../tools/penTool'
-import { ungroupSelection } from '../tools/selectTool'
+import {
+  COMBINE_HINT,
+  combineSelection,
+  simplifySelection,
+  ungroupSelection,
+} from '../tools/selectTool'
 import { lineStyleOf } from '../tools/shapeTools'
 import { startTextEdit } from '../tools/textTool'
 import type { NodeId, NodeOf, Page, Paint, Style, TextNode, VectorNode } from '../types'
+import { BOOLEAN_COMMANDS } from './booleanCommands'
 import { FillRow, type FillTarget } from './FillEditor'
 import { MoveToPageMenu } from './MoveToPageMenu'
 import { ColorRow, Choices, Row, SliderRow, type Choice } from './PanelRows'
@@ -199,6 +208,34 @@ function AlignRows({ count }: { count: number }) {
         ))}
       </Row>
     </>
+  )
+}
+
+/**
+ * The boolean operations, for 2 or more objects; disabled unless they are all shapes, paths or
+ * freehand strokes.
+ */
+function CombineRow() {
+  const enabled = useEditorStore((s) => canCombine(s.doc, s.selection))
+  return (
+    <Row label="Combine">
+      {BOOLEAN_COMMANDS.map(({ kind, label, description, keys, icon: Icon }) => (
+        <IconButton
+          key={kind}
+          label={label}
+          title={
+            enabled
+              ? `${label}: ${description} (${keys})`
+              : `${label}: ${COMBINE_HINT.toLowerCase()}`
+          }
+          disabled={!enabled}
+          compact
+          onClick={() => combineSelection(kind)}
+        >
+          <Icon size={18} />
+        </IconButton>
+      ))}
+    </Row>
   )
 }
 
@@ -581,6 +618,15 @@ function SelectionProperties() {
               <Spline size={18} />
             </IconButton>
           )}
+          {canSimplify(doc, selection) && (
+            <IconButton
+              label="Simplify path"
+              title="Simplify path: fewer anchors, within 2.5 px of its shape (or right-click)"
+              onClick={simplifySelection}
+            >
+              <Waypoints size={18} />
+            </IconButton>
+          )}
           <IconButton
             label="Duplicate"
             title="Duplicate (Ctrl+D)"
@@ -612,6 +658,7 @@ function SelectionProperties() {
 
       <TransformFields />
       <AlignRows count={outermost(doc, selection).length} />
+      {nodes.length >= 2 && <CombineRow />}
       {direct && <AnchorRow />}
       {filled.length > 0 && (
         <FillRow

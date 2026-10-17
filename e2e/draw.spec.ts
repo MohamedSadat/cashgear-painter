@@ -2615,3 +2615,101 @@ test('gradients on a rectangle, a circle, a path and text match on the canvas, i
   const again = await exportPixels(page, [])
   expect((await svgAgainstPng(page, svg, again.png)).far).toBeLessThan(200)
 })
+
+/** The canvas box of a shape on the content layer, by its place bottom to top. */
+function shapeBox(page: Page, index: number) {
+  return page.evaluate((index) => {
+    const layer = (window as unknown as { Konva: typeof Konva }).Konva.stages[0].getLayers()[1]
+    return layer.getChildren()[index].getClientRect({ relativeTo: layer })
+  }, index)
+}
+
+/** Whether the page has loaded the lazy chunk that holds Paper.js and the boolean pipeline. */
+const paperLoaded = (page: Page) =>
+  page.evaluate(() =>
+    performance.getEntriesByType('resource').some((entry) => entry.name.includes('booleanOp')),
+  )
+
+test('a circle subtracted from a rectangle leaves a node-editable hole, a union takes in a freehand stroke, and Simplify thins it, one undo step each', async ({
+  page,
+}) => {
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const redo = page.getByRole('button', { name: 'Redo' })
+  // Canvas (400, 300) inside the rectangle, (640, 460) the circle's middle, (1200, 300) outside.
+  const pixels = [exportPixel([0.25, 0.3]), exportPixel([0.4, 0.46]), exportPixel([0.75, 0.3])]
+
+  // A blue rectangle from canvas (320, 200) to (960, 700), and a circle of radius 160 inside it.
+  await page.keyboard.press('r')
+  await drawLine(page, [0.2, 0.2], [0.6, 0.7])
+  await page.getByRole('button', { name: 'Fill #3b82f6' }).click()
+  await page.keyboard.press('o')
+  await drawLine(page, [0.3, 0.3], [0.5, 0.62])
+  expect(await paperLoaded(page)).toBe(false)
+
+  // Ctrl + Alt + S subtracts the circle; Paper loads only now.
+  await page.keyboard.press('Control+a')
+  await expect(page.getByRole('group', { name: 'Combine' })).toBeVisible()
+  await page.keyboard.press('Control+Alt+s')
+  await expect.poll(() => shownShapes(page)).toEqual(['Path'])
+  expect(await paperLoaded(page)).toBe(true)
+  expect((await exportPixels(page, pixels)).values).toEqual([BLUE, WHITE, WHITE])
+  await expect
+    .poll(async () =>
+      (await savedNodes(page)).map((node) => {
+        const n = node as { type?: string; contours?: unknown[] }
+        return [n.type, n.contours?.length]
+      }),
+    )
+    .toEqual([['path', 2]])
+
+  // Both contours are node-editable: the rectangle's 4 anchors and the hole's 4.
+  await page.keyboard.press('a')
+  await expect.poll(() => anchorCount(page)).toBe(8)
+  await page.keyboard.press('v')
+
+  // One undo step, and back.
+  await undo.click()
+  expect(await shownShapes(page)).toEqual(['Rect', 'Ellipse'])
+  await redo.click()
+  expect(await shownShapes(page)).toEqual(['Path'])
+
+  // A freehand stroke from inside the rectangle out past its right side, at canvas y 650.
+  await page.keyboard.press('b')
+  await drawLine(page, [0.5, 0.65], [0.9, 0.65])
+  expect(await shownShapes(page)).toEqual(['Path', 'Path'])
+  expect((await shapeBox(page, 0)).x + (await shapeBox(page, 0)).width).toBeLessThan(970)
+
+  // Union from the canvas's right-click menu: the path takes the stroke in, in its own style.
+  await page.keyboard.press('Control+a')
+  const box = await artboardBox(page)
+  await page.mouse.click(...onArtboard(box, [0.25, 0.3]), { button: 'right' })
+  await expect(page.getByRole('menuitem', { name: 'Simplify path' })).toBeEnabled()
+  await page.getByRole('menuitem', { name: 'Union' }).click()
+  await expect.poll(() => shownShapes(page)).toEqual(['Path'])
+  const united = await shapeBox(page, 0)
+  expect(united.x + united.width).toBeGreaterThan(1430)
+  expect((await exportPixels(page, [exportPixel([0.85, 0.65])])).values[0]).not.toEqual(WHITE)
+  await undo.click()
+  expect(await shownShapes(page)).toEqual(['Path', 'Path'])
+  await redo.click()
+  expect(await shownShapes(page)).toEqual(['Path'])
+
+  // Simplify, from the panel's button: the stroke's anchors thin out, as one undo step.
+  await page.keyboard.press('a')
+  const before = await anchorCount(page)
+  await page.getByRole('button', { name: 'Simplify path' }).click()
+  await expect(page.getByRole('status')).toContainText(`Simplified from ${before} anchors to`)
+  const after = await anchorCount(page)
+  expect(after).toBeLessThan(before)
+  expect((await shapeBox(page, 0)).width).toBeCloseTo(united.width, -1)
+  await undo.click()
+  expect(await anchorCount(page)).toBe(before)
+
+  // A text can't be combined: the Combine buttons are disabled.
+  await page.keyboard.press('t')
+  await page.mouse.click(...onArtboard(box, [0.8, 0.2]))
+  await page.keyboard.type('Hi')
+  await page.keyboard.press('Control+Enter')
+  await page.keyboard.press('Control+a')
+  await expect(page.getByRole('button', { name: 'Union' })).toBeDisabled()
+})

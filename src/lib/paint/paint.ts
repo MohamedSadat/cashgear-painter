@@ -1,3 +1,4 @@
+import type { Affine } from '../geometry/transform'
 import type { Paint, Stop } from '../../types'
 
 export type Xy = [number, number]
@@ -167,6 +168,43 @@ export function placeGradient(paint: Gradient, box: PaintBox): PlacedGradient | 
   const radius = paint.radius * radiusUnit(box)
   if (!(radius > 1e-9)) return null
   return { kind: 'radial', stops, center: fromBoxUnits(box, paint.center), radius }
+}
+
+const round6 = (n: number) => Math.round(n * 1e6) / 1e6 || 0
+
+/**
+ * The gradient stored against box `to` so that it paints the same points it painted stored against
+ * box `from`, where `map` takes `from`'s coordinates to `to`'s: for a fill passing from one node
+ * to another, such as a boolean result. A linear gradient maps exactly under any map: its start
+ * is mapped, and the direction its colors change along goes through the inverse transpose. A
+ * radial one keeps its center and scales its radius by √|det|, which is exact unless the map
+ * stretches one way more than the other, which a circle can't follow. Unchanged when it has no
+ * extent or the map flattens the plane.
+ */
+export function mapGradient(
+  paint: Gradient,
+  from: PaintBox,
+  to: PaintBox,
+  [a, b, c, d, e, f]: Affine,
+): Gradient {
+  const placed = placeGradient(paint, from)
+  const det = a * d - b * c
+  if (!placed || !(Math.abs(det) > 1e-12)) return paint
+  const map = ([x, y]: Xy): Xy => [a * x + c * y + e, b * x + d * y + f]
+  const inBox = (point: Xy): Xy => {
+    const [u, v] = toBoxUnits(to, point)
+    return [round6(u), round6(v)]
+  }
+  if (paint.kind === 'radial' && placed.kind === 'radial') {
+    const radius = (placed.radius * Math.sqrt(Math.abs(det))) / radiusUnit(to)
+    return { ...paint, center: inBox(map(placed.center)), radius: round6(radius) }
+  }
+  if (paint.kind !== 'linear' || placed.kind !== 'linear') return paint
+  const v: Xy = [placed.end[0] - placed.start[0], placed.end[1] - placed.start[1]]
+  const u: Xy = [(d * v[0] - b * v[1]) / det, (a * v[1] - c * v[0]) / det]
+  const k = (v[0] * v[0] + v[1] * v[1]) / (u[0] * u[0] + u[1] * u[1])
+  const [sx, sy] = map(placed.start)
+  return { ...paint, start: inBox([sx, sy]), end: inBox([sx + u[0] * k, sy + u[1] * k]) }
 }
 
 /** The stop a gradient without extent is painted with: its last one along it. */

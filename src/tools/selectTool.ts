@@ -1,10 +1,19 @@
 import type { AlignEdge, Axis } from '../lib/align/align'
+import type { BooleanKind } from '../lib/boolean/booleanOp'
 import { canvasBounds, nodeBounds, unionBoxes, type Box } from '../lib/geometry/bounds'
 import { deltaInParent } from '../lib/geometry/transform'
 import { beginSnap, currentThreshold } from '../lib/snap/session'
 import { shiftBox, snapMove, toSnapBox, type SnapTargets } from '../lib/snap/snap'
 import { inkBox } from '../lib/snap/targets'
-import { currentPageOf, outermost, useEditorStore, zoomOf, type Rect } from '../store/editorStore'
+import {
+  canCombine,
+  canSimplify,
+  currentPageOf,
+  outermost,
+  useEditorStore,
+  zoomOf,
+  type Rect,
+} from '../store/editorStore'
 import type { Doc, NodeId, Transform, VectorNode } from '../types'
 import { startTextEdit } from './textTool'
 import type { ToolController, ToolEvent } from './types'
@@ -57,6 +66,31 @@ const ALIGN_KEYS: Record<string, AlignEdge> = {
   s: 'bottom',
 }
 const DISTRIBUTE_KEYS: Record<string, Axis> = { h: 'x', v: 'y' }
+// Ctrl or Cmd + Alt + a letter combines the selection.
+const BOOLEAN_KEYS: Record<string, BooleanKind> = {
+  u: 'union',
+  s: 'subtract',
+  i: 'intersect',
+  x: 'exclude',
+}
+
+export const COMBINE_HINT = 'Select 2 or more shapes, paths or freehand strokes to combine them.'
+
+/**
+ * Combines the selection by a boolean operation, as one undo step; says what to select when it
+ * can't. Paper loads on first use, so the result may come a moment later.
+ */
+export function combineSelection(kind: BooleanKind): void {
+  const { doc, selection, booleanOp, showToast } = store()
+  if (canCombine(doc, selection)) void booleanOp(selection, kind)
+  else showToast(COMBINE_HINT)
+}
+
+/** Simplifies the selected paths, as one undo step. */
+export function simplifySelection(): void {
+  const { doc, selection, simplify } = store()
+  if (canSimplify(doc, selection)) void simplify(selection)
+}
 
 /**
  * The letter on the key: by the character it types, or by its position where Alt makes it type
@@ -65,6 +99,14 @@ const DISTRIBUTE_KEYS: Record<string, Axis> = { h: 'x', v: 'y' }
 function letterOf(e: KeyboardEvent): string | null {
   if (/^[a-z]$/i.test(e.key)) return e.key.toLowerCase()
   return /^Key[A-Z]$/.test(e.code) ? e.code.slice(3).toLowerCase() : null
+}
+
+/** Combines the selection for a Ctrl/Cmd + Alt shortcut; true when the key is one of them. */
+function combineByKey(e: KeyboardEvent): boolean {
+  const letter = letterOf(e)
+  if (e.shiftKey || letter === null || !Object.hasOwn(BOOLEAN_KEYS, letter)) return false
+  combineSelection(BOOLEAN_KEYS[letter])
+  return true
 }
 
 /** Aligns or distributes the selection for an Alt shortcut; true when the key is one of them. */
@@ -233,7 +275,8 @@ export function ungroupSelection(): void {
  * and clicks then pick within it until one lands outside. Double-clicking a path switches to
  * direct select to edit its anchors, and double-clicking a text edits it. Alt + A, H or D aligns
  * the selection's left edges, centers or right edges, Alt + W, V or S its tops, middles or
- * bottoms, and Alt + Shift + H or V distributes it.
+ * bottoms, and Alt + Shift + H or V distributes it. Ctrl/Cmd + Alt + U, S, I or X unites,
+ * subtracts, intersects or excludes it.
  */
 export const selectTool: ToolController = {
   cursor: 'default',
@@ -330,7 +373,7 @@ export const selectTool: ToolController = {
     }
     const { doc, selection } = store()
     if (drag || selection.length === 0) return false
-    if (e.altKey) return !(e.ctrlKey || e.metaKey) && arrangeByKey(e, selection)
+    if (e.altKey) return e.ctrlKey || e.metaKey ? combineByKey(e) : arrangeByKey(e, selection)
 
     if (!(e.ctrlKey || e.metaKey)) {
       if (e.key === 'Delete' || e.key === 'Backspace') {
