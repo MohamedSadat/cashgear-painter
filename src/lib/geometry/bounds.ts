@@ -1,5 +1,6 @@
 import type {
   GroupNode,
+  ImageNode,
   NodeId,
   PathNode,
   ShapeNode,
@@ -215,6 +216,11 @@ export function textBox(node: TextNode): Box {
   return { minX: 0, minY: 0, maxX: node.width, maxY: textHeight(node) }
 }
 
+/** An image's box in its own coordinates: the part of the image it shows. */
+export function imageBox(node: ImageNode): Box {
+  return { minX: 0, minY: 0, maxX: node.width, maxY: node.height }
+}
+
 const pathFillCache = new WeakMap<PathNode['contours'], Box | null>()
 
 /** A path's curves boxed in its own coordinates; cached by its contours array. */
@@ -237,7 +243,7 @@ function localPathBox(node: PathNode): Box | null {
  * outline. Gradient points are stored in units of this box, so they follow the node through
  * moves and resizes. A rectangle's is its size, an ellipse's its radii about its center, a
  * path's its curves' extrema, a freehand stroke's its drawn outline and a text's its width by its
- * lines. Lines and groups have no fill.
+ * lines. Lines, groups and images have no fill.
  */
 export function fillBox(node: VectorNode): Box | null {
   switch (node.type) {
@@ -253,6 +259,7 @@ export function fillBox(node: VectorNode): Box | null {
       return textBox(node)
     case 'line':
     case 'group':
+    case 'image':
       return null
   }
 }
@@ -336,6 +343,8 @@ export function nodeBounds(node: VectorNode, nodes?: Nodes): Box | null {
     }
   } else if (node.type === 'text') {
     box = transformedBox(node.transform, textBox(node))
+  } else if (node.type === 'image') {
+    box = transformedBox(node.transform, imageBox(node))
   } else {
     box = shapeBounds(node)
   }

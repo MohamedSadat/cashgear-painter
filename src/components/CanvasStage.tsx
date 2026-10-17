@@ -1,19 +1,22 @@
 import type Konva from 'konva'
-import { Waypoints } from 'lucide-react'
+import { Crop, Expand, Waypoints } from 'lucide-react'
 import type { KonvaEventObject } from 'konva/lib/Node'
 import { useCallback, useEffect, useMemo, useRef, useState, type Ref } from 'react'
 import { Layer, Rect, Stage } from 'react-konva'
+import { DROP_TARGET_ATTR } from '../hooks/useFileInput'
 import { useViewport } from '../hooks/useViewport'
 import { OVERLAY_LAYER_NAME } from '../lib/exportPng'
 import { pageKonvaFill } from '../lib/paint/toKonva'
 import { canCombine, canSimplify, currentPageOf, useEditorStore } from '../store/editorStore'
 import { toolFor } from '../tools'
+import { applyCrop, canCrop, startCrop } from '../tools/imageCrop'
 import { combineSelection, pickTarget, simplifySelection } from '../tools/selectTool'
 import { finishTextEdit } from '../tools/textTool'
 import type { ToolEvent } from '../tools/types'
 import type { Doc, NodeId } from '../types'
 import { BOOLEAN_COMMANDS } from './booleanCommands'
 import { BrushCursor } from './BrushCursor'
+import { CropOverlay } from './CropOverlay'
 import { GradientOverlay } from './GradientOverlay'
 import type { MenuItem } from './Menu'
 import { MoveToPageMenu } from './MoveToPageMenu'
@@ -32,10 +35,35 @@ const ARTBOARD_EDGE_COLOR = '#d4d4d4'
 
 const activeTool = () => toolFor(useEditorStore.getState().tool)
 
-/** The canvas menu's items above Move and Copy to page: the boolean operations and Simplify. */
-function editGroups(doc: Doc, selection: NodeId[]): MenuItem[][] {
+/**
+ * The canvas menu's items above Move and Copy to page: the boolean operations and Simplify, and
+ * for one image its crop.
+ */
+function editGroups(doc: Doc, selection: NodeId[], pageId: string): MenuItem[][] {
   const combinable = canCombine(doc, selection)
+  const single = selection.length === 1 ? doc.nodes[selection[0]] : undefined
+  const imageGroup: MenuItem[][] =
+    single?.type === 'image'
+      ? [
+          [
+            {
+              label: 'Crop image',
+              shortcut: 'Enter',
+              icon: Crop,
+              disabled: !canCrop(doc, single.id, pageId),
+              run: () => startCrop(single.id),
+            },
+            {
+              label: 'Reset crop',
+              icon: Expand,
+              disabled: single.crop === null || single.locked,
+              run: () => useEditorStore.getState().resetCrop([single.id]),
+            },
+          ],
+        ]
+      : []
   return [
+    ...imageGroup,
     BOOLEAN_COMMANDS.map(({ kind, label, keys, icon }) => ({
       label,
       shortcut: keys,
@@ -165,8 +193,15 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
       return
     }
     const content = contentLayerRef.current
-    // A press on the overlay (the Transformer's handles) is the overlay's own drag.
     const layer = target.getLayer()
+    // In crop mode a press off the crop box's image and handles applies the crop, and that is all
+    // it does; the hand tool still pans.
+    const { cropping, tool: toolId } = useEditorStore.getState()
+    if (cropping && toolId !== 'hand' && (!layer || layer === content)) {
+      applyCrop()
+      return
+    }
+    // A press on the overlay (the Transformer's handles) is the overlay's own drag.
     if (layer && layer !== content) return
     // Only shapes on a listening content layer are hit; otherwise the target is the Stage.
     const targetId = layer === content ? target.id() || null : null
@@ -209,17 +244,19 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
     const hit = target.getLayer() === contentLayerRef.current ? target.id() || null : null
     const picked = hit === null ? null : pickTarget(state.doc, hit, state.selection)
     if (picked !== null && !state.selection.includes(picked)) state.select([picked])
-    const { doc, selection } = useEditorStore.getState()
+    const { doc, selection, currentPageId } = useEditorStore.getState()
     if (selection.length === 0) return
-    setMenu({ x: evt.clientX, y: evt.clientY, edits: editGroups(doc, selection) })
+    setMenu({ x: evt.clientX, y: evt.clientY, edits: editGroups(doc, selection, currentPageId) })
   }
 
   return (
     // The padding only shapes the fit; the Stage fills the whole area, padding included.
     // A browser keeping the text editor's caret in view may scroll this box; the view does the
     // panning here, so it goes straight back.
+    // Images and SVG files dropped here are imported (useFileInput).
     <div
       ref={containerRef}
+      {...{ [DROP_TARGET_ATTR]: '' }}
       className="relative min-h-0 min-w-0 flex-1 touch-none overflow-hidden p-2 select-none [-webkit-touch-callout:none] sm:p-4"
       onScroll={(e) => e.currentTarget.scrollTo(0, 0)}
     >
@@ -284,6 +321,7 @@ export function CanvasStage({ stageRef }: CanvasStageProps) {
               {/* Under the Transformer, whose handles win where the two overlap. */}
               <GradientOverlay />
               <SelectionOverlay contentLayerRef={contentLayerRef} />
+              <CropOverlay />
               <PathEditOverlay />
               <BrushCursor ref={cursorRef} tool={tool} size={size} />
             </Layer>

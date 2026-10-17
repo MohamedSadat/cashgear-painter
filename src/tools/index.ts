@@ -4,6 +4,7 @@ import { brushTool } from './brushTool'
 import { directTool } from './directTool'
 import { eraserTool } from './eraserTool'
 import { handTool } from './handTool'
+import { applyCrop } from './imageCrop'
 import { penTool } from './penTool'
 import { selectTool } from './selectTool'
 import { ellipseTool, lineTool, rectTool } from './shapeTools'
@@ -29,10 +30,11 @@ export function toolFor(id: ToolId): ToolController | undefined {
 }
 
 /**
- * Ends what the active tool is drawing, keeping what can be kept, such as a pen path: before a
- * page switch or a file action.
+ * Ends what the active tool is drawing, keeping what can be kept, such as a pen path, and applies
+ * an open crop: before a page switch or a file action.
  */
 export function settleTool(): void {
+  applyCrop()
   const tool = toolFor(useEditorStore.getState().tool)
   if (tool?.onSettle) tool.onSettle()
   else tool?.onCancel?.()

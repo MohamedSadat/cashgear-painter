@@ -4,7 +4,9 @@ import { solid } from '../lib/paint/paint'
 import {
   IDENTITY_TRANSFORM,
   emptyDoc,
+  type AssetMeta,
   type GroupNode,
+  type ImageNode,
   type Point,
   type StrokeNode,
   type VectorNode,
@@ -25,11 +27,13 @@ import {
   canSimplify,
   createEllipseNode,
   createGroupNode,
+  createImageNode,
   createLineNode,
   createPathNode,
   createRectNode,
   createStrokeNode,
   createTextNode,
+  imageBoxOn,
   reorderIds,
   shapeToPath,
   useEditorStore,
@@ -1552,5 +1556,118 @@ describe('boolean operations', () => {
     // Once simple, it stays as it is.
     expect(await store().simplify([s.id])).toBe(false)
     expect(store().past).toHaveLength(steps + 1)
+  })
+})
+
+const photo: AssetMeta = {
+  id: 'a'.repeat(64),
+  mime: 'image/jpeg',
+  width: 4000,
+  height: 3000,
+  bytes: 2_000_000,
+}
+const icon: AssetMeta = { id: 'b'.repeat(64), mime: 'image/png', width: 64, height: 32, bytes: 900 }
+const image = (id: string) => store().doc.nodes[id] as ImageNode
+
+describe('images', () => {
+  it('fits a new image inside 80% of the page, centered, and keeps a small one at its size', () => {
+    // 4000 × 3000 on a 1600 × 1000 page: 80% of the height is the limit.
+    const box = imageBoxOn({ width: 1600, height: 1000 }, photo)
+    expect(box.width).toBeCloseTo((800 * 4) / 3)
+    expect(box.height).toBe(800)
+    expect(box.x).toBeCloseTo((1600 - (800 * 4) / 3) / 2)
+    expect(box.y).toBe(100)
+    expect(imageBoxOn({ width: 1600, height: 1000 }, icon)).toEqual({
+      x: 768,
+      y: 484,
+      width: 64,
+      height: 32,
+    })
+  })
+
+  it('imports images and their asset records as one undo step, selected', () => {
+    const imported = store().importImages([
+      { asset: photo, name: 'Holiday' },
+      { asset: icon, name: 'Logo' },
+    ])
+
+    expect(ids()).toEqual(imported)
+    expect(store().selection).toEqual(imported)
+    expect(store().doc.assets).toEqual({ [photo.id]: photo, [icon.id]: icon })
+    const [first, second] = imported.map(image)
+    expect(first).toMatchObject({ type: 'image', name: 'Holiday', assetId: photo.id, crop: null })
+    // Each one a little below and right of the one before.
+    expect(second.transform.x).toBe(768 + PASTE_OFFSET)
+    expect(second.transform.y).toBe(484 + PASTE_OFFSET)
+    expect(store().past).toHaveLength(1)
+
+    store().undo()
+    expect(ids()).toEqual([])
+    expect(store().doc.assets).toEqual({})
+  })
+
+  it('stores an image imported twice once', () => {
+    store().importImages([{ asset: icon, name: 'Logo' }])
+    store().importImages([{ asset: { ...icon }, name: 'Logo again' }])
+
+    expect(ids()).toHaveLength(2)
+    expect(Object.keys(store().doc.assets)).toEqual([icon.id])
+  })
+
+  it('keeps the asset record of a deleted image, for undo', () => {
+    const [id] = store().importImages([{ asset: icon, name: 'Logo' }])
+    store().deleteNodes([id])
+
+    expect(store().doc.nodes[id]).toBeUndefined()
+    expect(store().doc.assets[icon.id]).toEqual(icon)
+  })
+
+  it('pastes images with their asset records, even into a drawing opened since', () => {
+    const [id] = store().importImages([{ asset: icon, name: 'Logo' }])
+    store().copy([id])
+    expect(store().clipboardAssets).toEqual({ [icon.id]: icon })
+    store().replaceDoc(emptyDoc())
+
+    store().paste()
+
+    const [pasted] = ids()
+    expect(image(pasted).assetId).toBe(icon.id)
+    expect(store().doc.assets).toEqual({ [icon.id]: icon })
+  })
+
+  it('duplicates images on the same asset', () => {
+    const [id] = store().importImages([{ asset: icon, name: 'Logo' }])
+    store().duplicate([id])
+
+    expect(ids()).toHaveLength(2)
+    expect(image(ids()[1]).assetId).toBe(icon.id)
+  })
+
+  it('resets a crop to the whole image, keeping the shown part in place, as one step', () => {
+    const node = {
+      ...createImageNode(icon, { x: 100, y: 50, width: 64, height: 64 }, 'Logo', 'logo'),
+      // The right half, at 2 units per pixel.
+      crop: { x: 32, y: 0, width: 32, height: 32 },
+    }
+    useEditorStore.setState({ doc: { ...store().doc, assets: { [icon.id]: icon } } })
+    store().addNodes([node])
+    const steps = store().past.length
+
+    store().resetCrop(['logo', 'missing'])
+
+    expect(image('logo')).toMatchObject({ width: 128, height: 64, crop: null })
+    expect(image('logo').transform).toMatchObject({ x: 36, y: 50 })
+    expect(store().past).toHaveLength(steps + 1)
+    // Nothing to reset: no step.
+    store().resetCrop(['logo'])
+    expect(store().past).toHaveLength(steps + 1)
+  })
+
+  it('stays out of boolean operations', () => {
+    const [a] = store().importImages([{ asset: icon, name: 'Logo' }])
+    const rect = createRectNode({ x: 0, y: 0, width: 10, height: 10 }, DEFAULT_SHAPE_STYLE)
+    store().addNodes([rect])
+
+    expect(canCombine(store().doc, [a, rect.id])).toBe(false)
   })
 })

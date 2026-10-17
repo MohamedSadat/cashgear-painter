@@ -171,13 +171,15 @@ export function SelectionOverlay({ contentLayerRef }: SelectionOverlayProps) {
   const selection = useEditorStore((s) => s.selection)
   const tool = useEditorStore((s) => s.tool)
   const marquee = useEditorStore((s) => s.marquee)
-  const editing = useEditorStore((s) => s.editingText !== null)
+  const editing = useEditorStore((s) => s.editingText !== null || s.cropping !== null)
   // Handles only work with the select tool; panning with Space keeps them in view. A text being
-  // edited shows the editor instead.
+  // edited shows the editor instead, and an image in crop mode the crop box.
   const shown = (tool === 'select' || tool === 'hand') && !editing
   const single = selection.length === 1 ? doc.nodes[selection[0]] : undefined
   const line = shown && single?.type === 'line' ? single : null
   const text = single?.type === 'text'
+  // A single image keeps its ratio at the corners; its side handles still stretch it.
+  const image = single?.type === 'image'
 
   // Konva's multi-node box is axis-aligned, so stretching one axis would skew rotated nodes, and
   // a group's scale would skew turned children. A single text keeps its ratio at the corners.
@@ -272,7 +274,7 @@ export function SelectionOverlay({ contentLayerRef }: SelectionOverlayProps) {
       snapThreshold(zoom),
       // As Konva decides: a corner keeps the ratio when the Transformer does or Shift is held,
       // and Alt resizes about the center.
-      { keepRatio: !freeAspect || keys.current.shift, centered: keys.current.alt },
+      { keepRatio: !freeAspect || image || keys.current.shift, centered: keys.current.alt },
     )
     state.setGuides(guides)
     const minX = inked.minX + pads.minX
@@ -334,7 +336,7 @@ export function SelectionOverlay({ contentLayerRef }: SelectionOverlayProps) {
         listening={tool === 'select'}
         flipEnabled={false}
         ignoreStroke
-        keepRatio={!freeAspect}
+        keepRatio={!freeAspect || image}
         enabledAnchors={anchors}
         padding={BOX_PADDING}
         anchorSize={ANCHOR_SIZE}

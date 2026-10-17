@@ -1,8 +1,10 @@
 import { useEffect } from 'react'
+import { expectCopy, expectPaste } from '../lib/clipboard'
 import { openDrawing, saveDrawing } from '../lib/fileActions'
 import { goToNeighbourPage } from '../lib/pageActions'
 import { currentPageOf, useEditorStore } from '../store/editorStore'
 import { toolFor } from '../tools'
+import { applyCrop, cancelCrop } from '../tools/imageCrop'
 import type { ToolId } from '../types'
 
 // Inputs that don't take typed text; shortcuts keep working while one of these has focus.
@@ -18,6 +20,12 @@ const NON_TEXT_INPUTS = new Set([
 
 // Keys a focused slider uses itself.
 const SLIDER_KEYS = /^(Arrow|Page(Up|Down)$|Home$|End$)/
+// Keys that leave crop mode open: modifiers, and Space, which pans while held.
+const CROP_KEEPING_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock', ' '])
+
+/** Ctrl/Cmd + C or X: the browser's copy or cut event must still follow (see expectCopy). */
+const isCopyKey = (e: KeyboardEvent) =>
+  (e.ctrlKey || e.metaKey) && !e.altKey && /^[cx]$/i.test(e.key)
 
 const TOOL_KEYS: Record<string, ToolId> = {
   v: 'select',
@@ -43,12 +51,14 @@ export function isTextEntry(target: EventTarget | null): boolean {
 /**
  * The active tool sees each key first (the select tool's are in selectTool.ts); Esc otherwise
  * cancels what the tool is doing. Then: Ctrl/Cmd+Z undo · Ctrl/Cmd+Shift+Z or Ctrl+Y redo ·
- * Ctrl/Cmd+A select all · Ctrl/Cmd+V paste · Ctrl/Cmd+0 fit · Ctrl/Cmd+1 100% ·
+ * Ctrl/Cmd+A select all · Ctrl/Cmd+V paste (an image copied elsewhere, or the editor's own
+ * copies; see clipboard.ts) · Ctrl/Cmd+0 fit · Ctrl/Cmd+1 100% ·
  * Ctrl/Cmd+S save · Ctrl/Cmd+O open · PageUp and PageDown the previous and next page · V select ·
  * A direct select · B brush · E eraser · R rectangle · O ellipse · L line · P pen · T text ·
  * H hand · [ and ] brush size. Alt shortcuts align and distribute the selection, and Ctrl/Cmd +
  * Alt ones combine it, in selectTool.ts. Space for the hand tool is in useViewport. None of them
- * reach the canvas while a text field, such as the text editor's textarea, has focus.
+ * reach the canvas while a text field, such as the text editor's textarea, has focus. In crop
+ * mode Enter applies the crop and Esc cancels it; any other key applies it first.
  */
 export function useShortcuts(): void {
   useEffect(() => {
@@ -59,9 +69,20 @@ export function useShortcuts(): void {
       const store = useEditorStore.getState()
       const key = e.key.toLowerCase()
 
+      if (store.cropping && !CROP_KEEPING_KEYS.has(e.key)) {
+        if (e.key === 'Enter' || e.key === 'Escape') {
+          e.preventDefault()
+          if (e.key === 'Enter') applyCrop()
+          else cancelCrop()
+          return
+        }
+        applyCrop()
+      }
+
       const active = toolFor(store.tool)
       if (active?.onKey?.(e)) {
-        e.preventDefault()
+        if (isCopyKey(e)) expectCopy()
+        else e.preventDefault()
         return
       }
       if (e.key === 'Escape') {
@@ -90,14 +111,13 @@ export function useShortcuts(): void {
           store.setTool('select')
           const roots = currentPageOf(store).rootIds
           store.select(roots.filter((id) => !doc.nodes[id].hidden && !doc.nodes[id].locked))
-        } else if (key === 'v' && store.clipboard.length > 0) {
-          e.preventDefault()
-          store.setTool('select')
-          store.paste()
+        } else if (key === 'v' && !e.altKey) {
+          // Not prevented: the browser's paste event brings what the system clipboard holds.
+          expectPaste()
         } else if (key === 's' && !e.shiftKey) {
           // Instead of the browser's Save page.
           e.preventDefault()
-          saveDrawing()
+          void saveDrawing()
         } else if (key === 'o' && !e.shiftKey) {
           e.preventDefault()
           void openDrawing()

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { strFromU8, unzipSync } from 'fflate'
 import type Konva from 'konva'
 import { readFile } from 'node:fs/promises'
 
@@ -1338,6 +1339,21 @@ async function downloadFromFileMenu(page: Page, item: string) {
   return { name: download.suggestedFilename(), text: await readFile(await download.path(), 'utf8') }
 }
 
+/** Picks a File menu item that downloads a file; returns its suggested name and its bytes. */
+async function downloadBytesFromFileMenu(page: Page, item: string) {
+  const downloadPromise = page.waitForEvent('download')
+  await fromFileMenu(page, item)
+  const download = await downloadPromise
+  return { name: download.suggestedFilename(), bytes: await readFile(await download.path()) }
+}
+
+/** The doc.json of a .painter file, parsed, and the names of the other files in it. */
+function readPainter(bytes: Uint8Array) {
+  const entries = unzipSync(bytes)
+  const others = Object.keys(entries).filter((name) => name !== 'doc.json')
+  return { doc: JSON.parse(strFromU8(entries['doc.json'])), others, entries }
+}
+
 /**
  * Draws the SVG at the PNG export's size, 3200 × 2000, and counts the pixels that differ from the
  * PNG: `some` by more than 16 of 255 in a channel, as anti-aliased edges may, `far` by more than 96.
@@ -1450,7 +1466,7 @@ test('the SVG export matches the PNG, and imports back as one group in one undo 
   expect(await shownShapes(page)).toHaveLength(6)
 })
 
-test('save and open a .painter.json drawing; Open is one undo step and refuses unknown versions', async ({
+test('save and open a .painter drawing, or a .painter.json one; Open is one undo step and refuses unknown versions', async ({
   page,
 }) => {
   const undo = page.getByRole('button', { name: 'Undo' })
@@ -1460,19 +1476,22 @@ test('save and open a .painter.json drawing; Open is one undo step and refuses u
   await drawLine(page, [0.1, 0.1], [0.3, 0.3])
   const drawn = await shownAttr(page, 'x')
 
-  const saved = await downloadFromFileMenu(page, 'Save')
-  expect(saved.name).toBe('drawing.painter.json')
-  const doc = JSON.parse(saved.text)
+  // A .painter file is a zip of doc.json, and of the images, which this drawing has none of.
+  const saved = await downloadBytesFromFileMenu(page, 'Save')
+  expect(saved.name).toBe('drawing.painter')
+  const { doc, others } = readPainter(saved.bytes)
+  expect(others).toEqual([])
   expect(doc).toMatchObject({
     version: 3,
     pages: [{ width: 1600, height: 1000, background: { kind: 'solid', color: '#ffffff' } }],
+    assets: {},
   })
   expect(doc.pages[0].rootIds).toHaveLength(2)
 
   // Ctrl+S saves too, instead of the browser saving the page.
   const viaKeys = page.waitForEvent('download')
   await page.keyboard.press('Control+s')
-  expect((await viaKeys).suggestedFilename()).toBe('drawing.painter.json')
+  expect((await viaKeys).suggestedFilename()).toBe('drawing.painter')
 
   await page.getByRole('button', { name: 'Clear' }).click()
   expect(await shownShapes(page)).toEqual([])
@@ -1485,9 +1504,9 @@ test('save and open a .painter.json drawing; Open is one undo step and refuses u
   await (
     await chooser
   ).setFiles({
-    name: 'drawing.painter.json',
-    mimeType: 'application/json',
-    buffer: Buffer.from(saved.text),
+    name: 'drawing.painter',
+    mimeType: 'application/octet-stream',
+    buffer: saved.bytes,
   })
   await expect.poll(() => shownShapes(page)).toEqual(['Path', 'Rect'])
   expect(await shownAttr(page, 'x')).toEqual(drawn)
@@ -1497,6 +1516,12 @@ test('save and open a .painter.json drawing; Open is one undo step and refuses u
   expect(await shownShapes(page)).toEqual([])
   await redo.click()
   expect(await shownShapes(page)).toEqual(['Path', 'Rect'])
+
+  // A .painter.json file, as Save wrote before images, opens too.
+  await page.getByRole('button', { name: 'Clear' }).click()
+  await chooseFromFileMenu(page, 'Open', 'drawing.painter.json', JSON.stringify(doc))
+  await expect.poll(() => shownShapes(page)).toEqual(['Path', 'Rect'])
+  expect(await shownAttr(page, 'x')).toEqual(drawn)
 
   // A file from a newer version, or not a drawing at all, changes nothing.
   const future = JSON.stringify({ ...doc, version: 4 })
@@ -2712,4 +2737,306 @@ test('a circle subtracted from a rectangle leaves a node-editable hole, a union 
   await page.keyboard.press('Control+Enter')
   await page.keyboard.press('Control+a')
   await expect(page.getByRole('button', { name: 'Union' })).toBeDisabled()
+})
+
+/**
+ * Makes an 8000 × 6000 JPEG of four colored quarters, red, green, blue and yellow from the top
+ * left, under fine noise so it weighs as much as a phone photo, and keeps it in the page as
+ * `window.photo`. Returns its size in bytes.
+ */
+function makePhoto(page: Page) {
+  return page.evaluate(async () => {
+    const [w, h] = [8000, 6000]
+    const canvas = new OffscreenCanvas(w, h)
+    const ctx = canvas.getContext('2d')!
+    const quarters = ['#ef4444', '#22c55e', '#3b82f6', '#eab308']
+    quarters.forEach((color, i) => {
+      ctx.fillStyle = color
+      ctx.fillRect((i % 2) * (w / 2), Math.floor(i / 2) * (h / 2), w / 2, h / 2)
+    })
+    const tile = new ImageData(500, 500)
+    for (let i = 0; i < tile.data.length; i += 4) {
+      const v = Math.random() * 255
+      tile.data.set([v, v, v, 24], i)
+    }
+    const noise = new OffscreenCanvas(500, 500)
+    noise.getContext('2d')!.putImageData(tile, 0, 0)
+    for (let y = 0; y < h; y += 500) for (let x = 0; x < w; x += 500) ctx.drawImage(noise, x, y)
+    const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.98 })
+    const win = window as unknown as { photo: File }
+    win.photo = new File([blob], 'photo.jpg', { type: 'image/jpeg' })
+    return blob.size
+  })
+}
+
+/** Which quarter's color an RGBA value is, roughly: the photo's JPEG and noise shift them. */
+function colorOf([r, g, b]: number[]): string {
+  if (r > 200 && g > 200 && b > 200) return 'white'
+  if (r > 150 && g > 120 && b < 100) return 'yellow'
+  if (r > g + 60 && r > b + 60) return 'red'
+  if (g > r + 60 && g > b + 40) return 'green'
+  if (b > r + 60 && b > g + 40) return 'blue'
+  return `rgb(${r}, ${g}, ${b})`
+}
+
+/** Whether every image on the content layer has its bytes decoded and drawn, not a gray box. */
+const imagesDrawn = (page: Page) =>
+  page.evaluate(() =>
+    (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+      .getLayers()[1]
+      .find('Image')
+      .every((image) => (image as Konva.Image).image() !== undefined),
+  )
+
+/** The asset ids IndexedDB holds bytes for, from their asset:<sha256> keys, sorted. */
+function storedAssets(page: Page) {
+  return page.evaluate(
+    () =>
+      new Promise<string[]>((resolve) => {
+        const open = indexedDB.open('painter')
+        open.onsuccess = () => {
+          const request = open.result.transaction('kv').objectStore('kv').getAllKeys()
+          request.onsuccess = () => {
+            open.result.close()
+            resolve(
+              request.result
+                .map(String)
+                .filter((key) => key.startsWith('asset:'))
+                .map((key) => key.slice('asset:'.length))
+                .sort(),
+            )
+          }
+        }
+      }),
+  )
+}
+
+type SavedAsset = { id: string; mime: string; width: number; height: number; bytes: number }
+type SavedImage = { width: number; height: number; transform: Transform }
+
+/** The autosaved doc's asset records, and its first page's images, bottom to top. */
+async function savedImages(page: Page) {
+  const doc = (await savedDoc(page)) as unknown as {
+    pages: { rootIds: string[] }[]
+    nodes: Record<string, SavedImage>
+    assets: Record<string, SavedAsset>
+  } | null
+  return {
+    assets: Object.values(doc?.assets ?? {}),
+    images: doc ? doc.pages[0].rootIds.map((id) => doc.nodes[id]) : [],
+  }
+}
+
+test('a 20 MB photo imports without freezing, crops in the PNG and the SVG, and survives a refresh and a .painter round trip', async ({
+  page,
+  browser,
+}) => {
+  test.setTimeout(120_000)
+  const undo = page.getByRole('button', { name: 'Undo' })
+  const redo = page.getByRole('button', { name: 'Redo' })
+  expect(await makePhoto(page)).toBeGreaterThan(20_000_000)
+
+  // Dropped on the canvas while the main thread is watched: decoding, scaling down and hashing
+  // happen in a worker, so no task holds the page up for long.
+  const longest = await page.evaluate(async () => {
+    const tasks: number[] = []
+    const observer = new PerformanceObserver((list) =>
+      list.getEntries().forEach((entry) => tasks.push(entry.duration)),
+    )
+    observer.observe({ type: 'longtask' })
+    const data = new DataTransfer()
+    data.items.add((window as unknown as { photo: File }).photo)
+    const canvas = document.querySelector('[data-file-drop]')!
+    canvas.dispatchEvent(new DragEvent('dragover', { dataTransfer: data, bubbles: true }))
+    canvas.dispatchEvent(new DragEvent('drop', { dataTransfer: data, bubbles: true }))
+    const stage = (window as unknown as { Konva: typeof Konva }).Konva.stages[0]
+    const drawn = () => (stage.getLayers()[1].findOne('Image') as Konva.Image | undefined)?.image()
+    while (!drawn()) await new Promise((resolve) => setTimeout(resolve, 20))
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    observer.disconnect()
+    return Math.max(0, ...tasks)
+  })
+  expect(longest).toBeLessThan(250)
+  expect(await shownShapes(page)).toEqual(['Image'])
+  await expect(page.getByRole('button', { name: 'Select', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  await expect(page.getByRole('heading', { name: 'photo' })).toBeVisible()
+
+  // Scaled down to 4096 px and saved again as a JPEG, stored once by its SHA-256, and placed in
+  // the middle of the page within 80% of it: 1066.67 × 800 at (266.67, 100).
+  await expect.poll(async () => (await savedImages(page)).images.length).toBe(1)
+  const {
+    assets: [asset],
+    images: [placed],
+  } = await savedImages(page)
+  expect(asset).toMatchObject({ mime: 'image/jpeg', width: 4096, height: 3072 })
+  expect(asset.id).toMatch(/^[0-9a-f]{64}$/)
+  expect(await storedAssets(page)).toEqual([asset.id])
+  expect(placed.width).toBeCloseTo(1066.67, 1)
+  expect(placed.height).toBe(800)
+  expect(placed.transform.x).toBeCloseTo(266.67, 1)
+  expect(placed.transform.y).toBe(100)
+
+  // Enter opens crop mode; the left handle dragged to the middle crops the left half away, and
+  // Enter applies it, as one undo step.
+  await page.keyboard.press('Enter')
+  await expect(page.getByRole('heading', { name: 'Crop image' })).toBeVisible()
+  const box = await artboardBox(page)
+  const left = await overlayPointOf(page, 'crop-middle-left')
+  await drag(page, left, [onArtboard(box, [0.5, 0])[0], left[1]])
+  await page.keyboard.press('Enter')
+  await expect(page.getByRole('heading', { name: 'photo' })).toBeVisible()
+  expect((await shownAttr(page, 'cropX'))[0]).toBeCloseTo(2048, -1)
+  expect((await shownAttr(page, 'width'))[0]).toBeCloseTo(533.33, -1)
+  await undo.click()
+  expect(await shownAttr(page, 'cropWidth')).toEqual([0])
+  await redo.click()
+  expect((await shownAttr(page, 'cropWidth'))[0]).toBeCloseTo(2048, -1)
+
+  // The PNG shows only the right half, where it lay: green above, yellow below, white where the
+  // left half was.
+  const points = [
+    exportPixel([0.6, 0.3]),
+    exportPixel([0.6, 0.8]),
+    exportPixel([0.78, 0.2]),
+    exportPixel([0.3, 0.3]),
+    exportPixel([0.3, 0.8]),
+  ]
+  const expected = ['green', 'yellow', 'green', 'white', 'white']
+  const { png, values } = await exportPixels(page, points)
+  expect(values.map(colorOf)).toEqual(expected)
+
+  // The SVG holds the photo as a data: URL, cropped by a nested <svg>, and draws as the PNG.
+  const svg = await downloadFromFileMenu(page, 'Export SVG')
+  expect(svg.text).toContain('xmlns:xlink="http://www.w3.org/1999/xlink"')
+  expect(svg.text).toMatch(
+    /<g transform="[^"]+"><svg width="[\d.]+" height="800" viewBox="[\d.]+ 0 [\d.]+ 3072" preserveAspectRatio="none"><image width="4096" height="3072" xlink:href="data:image\/jpeg;base64,/,
+  )
+  const { some, far } = await svgAgainstPng(page, svg.text, png)
+  // The photo's right edge falls 2/3 into export column 2666 (1333.33 canvas units): canvas
+  // paints that column with the photo, SVG anti-aliases it, so its 1600 pixels may differ.
+  expect(far).toBeLessThan(1600 + 200)
+  expect(some).toBeLessThan(3200 * 2000 * 0.01)
+
+  // A refresh brings it back from IndexedDB, cropped.
+  await page.reload()
+  await waitForCanvas(page)
+  await expect.poll(() => imagesDrawn(page)).toBe(true)
+  expect((await exportPixels(page, points)).values.map(colorOf)).toEqual(expected)
+
+  // Saved as a .painter file, the photo goes in once, under its hash.
+  const file = await downloadBytesFromFileMenu(page, 'Save')
+  expect(file.name).toBe('drawing.painter')
+  const { doc: inFile, others, entries } = readPainter(file.bytes)
+  expect(others).toEqual([`assets/${asset.id}.jpg`])
+  expect(entries[`assets/${asset.id}.jpg`].length).toBe(asset.bytes)
+  expect(Object.keys(inFile.assets)).toEqual([asset.id])
+
+  // Opened in a fresh browser, with nothing stored, it looks the same, and is stored there.
+  const fresh = await browser.newContext()
+  const other = await fresh.newPage()
+  await other.goto('/')
+  await waitForCanvas(other)
+  const chooser = other.waitForEvent('filechooser')
+  await fromFileMenu(other, 'Open')
+  await (
+    await chooser
+  ).setFiles({ name: 'drawing.painter', mimeType: 'application/octet-stream', buffer: file.bytes })
+  await expect.poll(() => shownShapes(other)).toEqual(['Image'])
+  await expect.poll(() => imagesDrawn(other)).toBe(true)
+  expect((await exportPixels(other, points)).values.map(colorOf)).toEqual(expected)
+  await expect.poll(() => storedAssets(other)).toEqual([asset.id])
+  await fresh.close()
+})
+
+/** A small PNG of one color made in the page, as bytes. */
+async function smallPng(page: Page, color: string): Promise<Buffer> {
+  const base64 = await page.evaluate((color) => {
+    const canvas = document.createElement('canvas')
+    canvas.width = 120
+    canvas.height = 80
+    const ctx = canvas.getContext('2d')!
+    ctx.fillStyle = color
+    ctx.fillRect(0, 0, 120, 80)
+    return canvas.toDataURL('image/png').split(',')[1]
+  }, color)
+  return Buffer.from(base64, 'base64')
+}
+
+/** Pastes a file as the browser does after Ctrl+V when the clipboard holds one. */
+function pasteFile(page: Page, name: string, type: string, bytes: Buffer) {
+  return page.evaluate(
+    ({ name, type, base64 }) => {
+      const data = new DataTransfer()
+      const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+      data.items.add(new File([bytes], name, { type }))
+      document.dispatchEvent(
+        new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }),
+      )
+    },
+    { name, type, base64: bytes.toString('base64') },
+  )
+}
+
+test('images come in by the picker and by paste, are stored once, and leave storage once deleted', async ({
+  page,
+}) => {
+  const red = await smallPng(page, '#ef4444')
+  const blue = await smallPng(page, '#3b82f6')
+
+  // File → Import image… takes images and SVG files, several at once.
+  const chooser = page.waitForEvent('filechooser')
+  await fromFileMenu(page, 'Import image…')
+  await (
+    await chooser
+  ).setFiles([
+    { name: 'red.png', mimeType: 'image/png', buffer: red },
+    {
+      name: 'square.svg',
+      mimeType: 'image/svg+xml',
+      buffer: Buffer.from(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect x="5" y="5" width="30" height="30" fill="#22c55e"/></svg>',
+      ),
+    },
+  ])
+  await expect.poll(() => shownShapes(page)).toEqual(['Image', 'Group'])
+  await expect.poll(() => imagesDrawn(page)).toBe(true)
+  // Small enough, it keeps its size, in the middle of the page.
+  expect((await shownAttr(page, 'width'))[0]).toBe(120)
+  expect((await shownTransforms(page))[0]).toMatchObject({ x: 740, y: 460 })
+
+  // Pasted: the same image again is stored once, a new one is added.
+  await pasteFile(page, 'image.png', 'image/png', red)
+  await expect.poll(() => shownShapes(page)).toEqual(['Image', 'Group', 'Image'])
+  await pasteFile(page, 'image.png', 'image/png', blue)
+  await expect.poll(() => shownShapes(page)).toEqual(['Image', 'Group', 'Image', 'Image'])
+  await expect.poll(async () => (await storedAssets(page)).length).toBe(2)
+  const both = await storedAssets(page)
+  await expect.poll(() => imagesDrawn(page)).toBe(true)
+  expect((await exportPixels(page, [exportPixel([0.5, 0.5])])).values.map(colorOf)).toEqual([
+    'blue',
+  ])
+
+  // Copied in the editor, the selected image pastes as an object, offset.
+  await page.keyboard.press('Control+c')
+  await page.keyboard.press('Control+v')
+  await expect.poll(() => shownShapes(page)).toHaveLength(5)
+  expect((await shownTransforms(page))[4]).toMatchObject({ x: 750, y: 470 })
+
+  // A file that isn't an image says so, and changes nothing.
+  await pasteFile(page, 'notes.png', 'image/png', Buffer.from('hello'))
+  await expect(page.getByRole('status')).toHaveText("notes.png isn't a PNG, JPEG or WebP image.")
+  expect(await shownShapes(page)).toHaveLength(5)
+
+  // Deleted, the images' bytes stay while undo can bring them back; the next start, which has
+  // no undo history, lets them go.
+  await page.keyboard.press('Control+a')
+  await page.keyboard.press('Delete')
+  await expect.poll(async () => (await savedImages(page)).images.length).toBe(0)
+  expect(await storedAssets(page)).toEqual(both)
+  await page.reload()
+  await waitForCanvas(page)
+  await expect.poll(() => storedAssets(page)).toEqual([])
 })

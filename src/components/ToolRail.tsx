@@ -8,6 +8,7 @@ import {
   Grid3x3,
   Hand,
   ImageDown,
+  ImagePlus,
   Magnet,
   Menu as MenuIcon,
   MousePointer2,
@@ -25,6 +26,7 @@ import {
 } from 'lucide-react'
 import { Fragment, useCallback, useRef, useState, type ReactNode } from 'react'
 import { exportSvgFile, importSvgFile, openDrawing, saveDrawing } from '../lib/fileActions'
+import { importImagesFromPicker } from '../lib/imageActions'
 import { currentPageOf, useEditorStore, zoomOf } from '../store/editorStore'
 import type { ToolId } from '../types'
 import { Menu, type MenuItem } from './Menu'
@@ -162,6 +164,7 @@ function FileMenu({ onExportPng }: { onExportPng(): void }) {
       { label: 'Save', shortcut: 'Ctrl+S', icon: Save, run: saveDrawing },
     ],
     [
+      { label: 'Import image…', icon: ImagePlus, run: importImagesFromPicker },
       { label: 'Import SVG…', icon: FileUp, run: importSvgFile },
       { label: 'Export SVG', icon: FileDown, run: exportSvgFile },
       { label: 'Export PNG', icon: ImageDown, run: onExportPng },

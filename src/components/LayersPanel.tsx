@@ -7,6 +7,7 @@ import {
   EyeOff,
   Folder,
   GripVertical,
+  Image as ImageIcon,
   Lock,
   LockOpen,
   PenTool,
@@ -30,6 +31,7 @@ const TYPE_ICONS: Record<NodeType, LucideIcon> = {
   path: PenTool,
   text: Type,
   group: Folder,
+  image: ImageIcon,
 }
 
 // Two clicks or taps on a name this soon rename the layer, besides the browser's dblclick, which

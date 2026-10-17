@@ -79,6 +79,21 @@ export type VectorNode =
       width: number
     })
   | (BaseNode & { type: 'group'; childIds: NodeId[] })
+  | (BaseNode & {
+      type: 'image'
+      assetId: AssetId
+      width: number // local units the shown part fills: 0..width × 0..height
+      height: number
+      crop: CropRect | null // the part of the image shown, in its pixels; null = all of it
+    })
+
+/** A rectangle of an image, in the image's own pixels. */
+export interface CropRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
 
 export type NodeType = VectorNode['type']
 export type NodeOf<T extends NodeType> = Extract<VectorNode, { type: T }>
@@ -86,6 +101,7 @@ export type StrokeNode = NodeOf<'stroke'>
 export type PathNode = NodeOf<'path'>
 export type TextNode = NodeOf<'text'>
 export type GroupNode = NodeOf<'group'>
+export type ImageNode = NodeOf<'image'>
 /** Nodes drawn as geometry with an optional outline: rectangles, ellipses, lines and paths. */
 export type ShapeNode = NodeOf<'rect' | 'ellipse' | 'line' | 'path'>
 
@@ -104,9 +120,11 @@ export interface Page {
   rootIds: NodeId[] // z-order, bottom to top; groups order their own childIds
 }
 
+export type ImageMime = 'image/png' | 'image/jpeg' | 'image/webp'
+
 export interface AssetMeta {
   id: AssetId
-  mime: 'image/png' | 'image/jpeg' | 'image/webp'
+  mime: ImageMime
   width: number
   height: number
   bytes: number

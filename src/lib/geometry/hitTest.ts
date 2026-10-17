@@ -1,15 +1,17 @@
 import { Bezier } from 'bezier-js'
-import type { FillRule, PathNode, ShapeNode, StrokeNode, TextNode, VectorNode } from '../../types'
+import type { FillRule, PathNode, ShapeNode, StrokeNode, Transform, VectorNode } from '../../types'
 import {
   applyTransform,
   arrowHeadSize,
   boxesOverlap,
   contourSegments,
+  imageBox,
   isIdentity,
   nodeBounds,
   outlineReach,
   pointsBox,
   textBox,
+  type Box,
   type Vec,
 } from './bounds'
 import { pathSegments, type Cubic } from './pathData'
@@ -270,23 +272,23 @@ function outlineDistance({ points, closed }: Outline, a: Vec, b: Vec): number {
 const isShape = (node: VectorNode): node is ShapeNode =>
   node.type === 'rect' || node.type === 'ellipse' || node.type === 'line' || node.type === 'path'
 
-/** A text's box in canvas units, after its transform: Konva picks text anywhere in its box. */
-function textOutline(node: TextNode): Outline {
-  const box = textBox(node)
+/** A local box in canvas units, after the transform, as a closed outline. */
+function boxOutline(transform: Transform, box: Box): Outline {
   const corners: Vec[] = [
     [box.minX, box.minY],
     [box.maxX, box.minY],
     [box.maxX, box.maxY],
     [box.minX, box.maxY],
   ]
-  return { points: corners.map((p) => applyTransform(node.transform, p[0], p[1])), closed: true }
+  return { points: corners.map((p) => applyTransform(transform, p[0], p[1])), closed: true }
 }
 
 /**
  * Whether a circle of `radius` swept from a to b touches the node's ink. Testing the swept segment,
  * not just its ends, keeps a fast swipe from skipping strokes between two pointer samples. An
- * unfilled shape is touched only on its outline, as it is picked on the canvas; a text anywhere
- * in its box. Groups are never touched themselves, only what they hold, in canvas units.
+ * unfilled shape is touched only on its outline, as it is picked on the canvas; a text or an
+ * image anywhere in its box. Groups are never touched themselves, only what they hold, in canvas
+ * units.
  */
 export function nodeHitsSegment(node: VectorNode, a: Vec, b: Vec, radius: number): boolean {
   if (node.type === 'group') return false
@@ -306,8 +308,12 @@ export function nodeHitsSegment(node: VectorNode, a: Vec, b: Vec, radius: number
     return false
   }
 
-  if (node.type === 'text') {
-    const outline = textOutline(node)
+  // Konva picks text and images anywhere in their box.
+  if (node.type === 'text' || node.type === 'image') {
+    const outline = boxOutline(
+      node.transform,
+      node.type === 'text' ? textBox(node) : imageBox(node),
+    )
     return outlineDistance(outline, a, b) <= radius || pointInPolygon(a, outline.points)
   }
 

@@ -5,6 +5,7 @@ import {
   DEFAULT_TEXT_STYLE,
   createEllipseNode,
   createGroupNode,
+  createImageNode,
   createLineNode,
   createPathNode,
   createRectNode,
@@ -15,7 +16,9 @@ import { solid } from './paint/paint'
 import {
   emptyDoc,
   newPage,
+  type AssetMeta,
   type Doc,
+  type ImageNode,
   type GroupNode,
   type NodeOf,
   type PathNode,
@@ -28,25 +31,69 @@ import {
   NOT_A_DRAWING,
   SAVE_DELAY_MS,
   STORAGE_KEY,
+  cleanUpAssets,
   docToJson,
+  loadAsset,
   loadDoc,
   parseDocFile,
   sanitizeDoc,
+  saveAsset,
   saveDoc,
   startAutosave,
   type KeyValueStore,
 } from './persistence'
 
-/** An in-memory stand-in for IndexedDB; values are cloned like structured clone would. */
+/**
+ * An in-memory stand-in for IndexedDB; values are cloned like structured clone would, except
+ * blobs, which are immutable and kept as they are.
+ */
 function memoryStore(): KeyValueStore & { data: Map<string, unknown> } {
   const data = new Map<string, unknown>()
+  const clone = (value: unknown) => (value instanceof Blob ? value : structuredClone(value))
   return {
     data,
-    get: async (key) => structuredClone(data.get(key)),
+    get: async (key) => clone(data.get(key)),
     set: async (key, value) => {
-      data.set(key, structuredClone(value))
+      data.set(key, clone(value))
     },
+    del: async (key) => {
+      data.delete(key)
+    },
+    keys: async () => [...data.keys()],
   }
+}
+
+const ASSET_A = 'a'.repeat(64)
+const ASSET_B = 'b'.repeat(64)
+const assetMeta = (id: string): AssetMeta => ({
+  id,
+  mime: 'image/jpeg',
+  width: 400,
+  height: 300,
+  bytes: 12345,
+})
+
+/** An image of the asset, cropped to its middle, turned and see-through. */
+function image(id = 'image', assetId = ASSET_A): ImageNode {
+  const node = createImageNode(
+    assetMeta(assetId),
+    { x: 10.5, y: 20, width: 200, height: 150 },
+    'Photo',
+    id,
+  )
+  return {
+    ...node,
+    crop: { x: 100, y: 75, width: 200, height: 150 },
+    transform: { ...node.transform, rotation: 12 },
+    style: { ...node.style, opacity: 0.8 },
+  }
+}
+
+/** A doc with the nodes on its page and the records of the assets given. */
+function docWithAssets(nodes: VectorNode[], assetIds: string[]): Doc {
+  const doc = docWith(...nodes)
+  for (const id of assetIds) doc.assets[id] = assetMeta(id)
+  return doc
 }
 
 const stroke = (id: string, points: Point[] = [[10.04, 20.06, 0.5]]): StrokeNode =>
@@ -264,11 +311,34 @@ describe('sanitizeDoc', () => {
     expect(kept.pages[0].rootIds).toEqual(['a'])
   })
 
-  it('gives a doc without pages one empty page, and keeps valid asset entries', () => {
-    const asset = { id: 'abc', mime: 'image/png', width: 10, height: 20, bytes: 300 }
-    const value = { ...emptyDoc(), pages: [], assets: { abc: asset, bad: { id: 'other' } } }
+  it('gives a doc without pages one empty page, and drops asset records no image shows', () => {
+    const value = { ...emptyDoc(), pages: [], assets: { [ASSET_A]: assetMeta(ASSET_A) } }
 
-    expect(sanitizeDoc(value)).toEqual({ ...emptyDoc(), assets: { abc: asset } })
+    expect(sanitizeDoc(value)).toEqual(emptyDoc())
+  })
+
+  it('keeps images with their asset records, and drops records that are malformed or unused', () => {
+    const doc = docWithAssets([image('one'), image('two', ASSET_B)], [ASSET_A, ASSET_B])
+    expect(sanitizeDoc(doc)).toEqual(doc)
+
+    const extra = structuredClone(doc) as Doc
+    extra.assets['c'.repeat(64)] = assetMeta('c'.repeat(64))
+    expect(sanitizeDoc(extra)).toEqual(doc)
+  })
+
+  it('drops images without an asset record, with a crop off the image, or malformed', () => {
+    const outside = { ...image('outside'), crop: { x: 300, y: 0, width: 200, height: 10 } }
+    const badId = { ...image('badId'), assetId: 'not-a-hash' }
+    const noSize = { ...image('noSize'), width: 0 }
+    const noAsset = image('noAsset', ASSET_B)
+    const uncropped = { ...image('uncropped'), crop: null }
+    const doc = docWithAssets([outside, badId, noSize, noAsset, uncropped], [ASSET_A])
+    // A record whose id isn't its key, and one with no size, are dropped too.
+    doc.assets[ASSET_B] = { ...assetMeta(ASSET_B), width: 0 }
+
+    const kept = sanitizeDoc(doc)
+    expect(kept.pages[0].rootIds).toEqual(['uncropped'])
+    expect(Object.keys(kept.assets)).toEqual([ASSET_A])
   })
 
   it('drops malformed nodes and keeps the valid ones in order', () => {
@@ -402,6 +472,55 @@ describe('sanitizeDoc', () => {
     await saveDoc(doc, kv)
 
     expect(await loadDoc(kv)).toEqual(doc)
+  })
+
+  it('round-trips images through storage and files, without records no image shows', async () => {
+    const kv = memoryStore()
+    const doc = docWithAssets([image()], [ASSET_A])
+    // Deleted images leave their records in the doc while the editor runs, for undo.
+    const withUnused = { ...doc, assets: { ...doc.assets, [ASSET_B]: assetMeta(ASSET_B) } }
+
+    await saveDoc(withUnused, kv)
+
+    expect(await loadDoc(kv)).toEqual(doc)
+    expect(JSON.parse(docToJson(withUnused)).assets).toEqual(doc.assets)
+    expect(parseDocFile(docToJson(withUnused))).toEqual(doc)
+  })
+})
+
+describe('stored assets', () => {
+  it('stores and loads bytes under asset:<sha256>', async () => {
+    const kv = memoryStore()
+    const blob = new Blob([Uint8Array.from([1, 2, 3])], { type: 'image/png' })
+
+    expect(await saveAsset(ASSET_A, blob, kv)).toBe(true)
+
+    expect([...kv.data.keys()]).toEqual([`asset:${ASSET_A}`])
+    expect(await loadAsset(ASSET_A, kv)).toBe(blob)
+    expect(await loadAsset(ASSET_B, kv)).toBeUndefined()
+    expect(await loadAsset(ASSET_A, null)).toBeUndefined()
+  })
+
+  it('reports a failed write, as when storage is full', async () => {
+    const kv = memoryStore()
+    kv.set = () => Promise.reject(new DOMException('full', 'QuotaExceededError'))
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    expect(await saveAsset(ASSET_A, new Blob(['x']), kv)).toBe(false)
+  })
+
+  it('cleans up stored assets the loaded doc no longer shows, and nothing else', async () => {
+    const kv = memoryStore()
+    const doc = docWithAssets([image()], [ASSET_A])
+    await saveDoc(doc, kv)
+    await saveAsset(ASSET_A, new Blob(['a']), kv)
+    await saveAsset(ASSET_B, new Blob(['b']), kv)
+
+    expect(await cleanUpAssets(doc, kv)).toBe(1)
+
+    expect([...kv.data.keys()].sort()).toEqual([STORAGE_KEY, `asset:${ASSET_A}`].sort())
+    // Without a way to list and delete keys, nothing is cleaned up.
+    expect(await cleanUpAssets(emptyDoc(), { get: kv.get, set: kv.set })).toBe(0)
   })
 })
 

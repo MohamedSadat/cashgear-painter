@@ -10,6 +10,7 @@ import {
 import type { BooleanKind } from '../lib/boolean/booleanOp'
 import { isIdentity } from '../lib/geometry/bounds'
 import { shapeAnchors } from '../lib/geometry/pathData'
+import { resetCrop, type CropDraft } from '../lib/images/crop'
 import { WEB_SAFE_FONTS } from '../lib/geometry/textLayout'
 import {
   absoluteTransform,
@@ -34,10 +35,13 @@ import {
   emptyDoc,
   newPage,
   type Anchor,
+  type AssetId,
+  type AssetMeta,
   type Contour,
   type Doc,
   type FillRule,
   type GroupNode,
+  type ImageNode,
   type NodeId,
   type NodeOf,
   type Page,
@@ -60,6 +64,8 @@ export const MAX_ZOOM = 32
 // one undo step.
 export const MERGE_MS = 500
 export const PASTE_OFFSET = 10 // canvas units between a copy and its duplicate or paste
+// New images fit inside this share of the page.
+export const IMAGE_FIT = 0.8
 
 // Paper.js and the boolean pipeline, loaded on first use so they never weigh on startup.
 const loadBoolean = () => import('../lib/boolean/booleanOp')
@@ -161,6 +167,12 @@ export interface AnchorRef {
   index: number
 }
 
+/** An image to add: its asset's record, and a name for its layer. */
+export interface NewImage {
+  asset: AssetMeta
+  name: string
+}
+
 export interface PageChanges {
   name?: string
   background?: Paint
@@ -187,16 +199,20 @@ export interface EditorState {
   grid: boolean // the 8-unit grid shows, and drags snap to it; not in history or autosave
   guides: Guide[] // the smart guides of the snap being dragged
   clipboard: VectorNode[] // copied nodes with their descendants; not in history or autosave
+  clipboardAssets: Record<AssetId, AssetMeta> // the records of the images among them
   penHover: [x: number, y: number] | null // the pen's pointer while it hovers, in canvas units
   activeAnchor: AnchorRef | null // the direct-select tool's anchor, for Delete and the panel
   textStyle: TextStyle // for new text; not in history or autosave
   editingText: NodeId | null // the text the textarea overlay is editing
+  cropping: CropDraft | null // the image in crop mode, and its crop so far
   toast: Toast | null // a short message, such as what an import skipped
   // What the Transformer drag in progress will change, so the panel's fields follow it live.
   transformPreview: Patch | null
   ratioLocked: boolean // the W and H fields keep the ratio; not in history or autosave
 
   addNodes(nodes: VectorNode[], parentId?: NodeId): void
+  importImages(images: NewImage[]): NodeId[]
+  resetCrop(ids: NodeId[]): void
   replaceDoc(doc: Doc): void
   updateNodes(patch: Record<NodeId, Partial<VectorNode>>, mergeKey?: string): void
   setFill(fills: Record<NodeId, Paint | null>, mergeKey?: string): void
@@ -236,6 +252,7 @@ export interface EditorState {
   setActiveAnchor(anchor: AnchorRef | null): void
   setTextStyle(style: Partial<TextStyle>): void
   setEditingText(id: NodeId | null): void
+  setCropping(draft: CropDraft | null): void
   setTransformPreview(patch: Patch | null): void
   setRatioLocked(on: boolean): void
   showToast(message: string): void
@@ -390,6 +407,38 @@ export function createTextNode(
     align,
     width,
   }
+}
+
+/** An image of the asset filling `box`, placed at its top-left corner, showing all of it. */
+export function createImageNode(
+  asset: AssetMeta,
+  box: Rect,
+  name = 'Image',
+  id: NodeId = newNodeId(),
+): ImageNode {
+  return {
+    ...newBase(id, name, { fill: null, stroke: null, strokeWidth: 0, opacity: 1 }, box.x, box.y),
+    type: 'image',
+    assetId: asset.id,
+    width: box.width,
+    height: box.height,
+    crop: null,
+  }
+}
+
+/**
+ * Where a new image of the asset goes on a page: centered, at its own size in pixels unless that
+ * is more than IMAGE_FIT of the page either way, when it is scaled down to fit.
+ */
+export function imageBoxOn(page: Pick<Page, 'width' | 'height'>, asset: AssetMeta): Rect {
+  const scale = Math.min(
+    1,
+    (page.width * IMAGE_FIT) / asset.width,
+    (page.height * IMAGE_FIT) / asset.height,
+  )
+  const width = asset.width * scale
+  const height = asset.height * scale
+  return { x: (page.width - width) / 2, y: (page.height - height) / 2, width, height }
 }
 
 /** A group around `childIds`, with no transform of its own, so its children stay where they are. */
@@ -828,13 +877,27 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     else set({ doc: next, past: pushSnapshot(past, doc), future: [], ...pageState })
   }
 
-  /** Adds copies of the nodes on top of their groups' or the page's z-order, and selects them. */
-  function insertCopies(nodes: VectorNode[], offset: number): void {
+  /**
+   * Adds copies of the nodes on top of their groups' or the page's z-order, and selects them.
+   * Images bring their asset records from `assets` when the doc has none, as after an Open.
+   */
+  function insertCopies(
+    nodes: VectorNode[],
+    offset: number,
+    assets: Record<AssetId, AssetMeta> = {},
+  ): void {
     const { doc, currentPageId } = get()
     const copies = withNewIds(doc, nodes, offset)
     if (copies.roots.length === 0) return
     commit((draft) => {
-      for (const node of copies.nodes) draft.nodes[node.id] = node
+      for (const node of copies.nodes) {
+        if (node.type === 'image' && !(node.assetId in draft.assets)) {
+          const asset = assets[node.assetId]
+          if (!asset) continue
+          draft.assets[asset.id] = asset
+        }
+        draft.nodes[node.id] = node
+      }
       for (const id of copies.roots) {
         childList(draft, draft.nodes[id].parentId, currentPageId).push(id)
       }
@@ -880,10 +943,12 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     grid: false,
     guides: [],
     clipboard: [],
+    clipboardAssets: {},
     penHover: null,
     activeAnchor: null,
     textStyle: DEFAULT_TEXT_STYLE,
     editingText: null,
+    cropping: null,
     toast: null,
     transformPreview: null,
     ratioLocked: false,
@@ -910,6 +975,41 @@ export const useEditorStore = create<EditorState>()((set, get) => {
           order.push(node.id)
         }
       })
+    },
+
+    // One step: the asset records and the images, centered on the current page and each a little
+    // below and right of the one before, on top and selected.
+    importImages(images) {
+      const { currentPageId } = get()
+      const page = currentPageOf(get())
+      const nodes = images.map(({ asset, name }, i) => {
+        const box = imageBoxOn(page, asset)
+        const step = PASTE_OFFSET * i
+        return createImageNode(asset, { ...box, x: box.x + step, y: box.y + step }, name)
+      })
+      if (nodes.length === 0) return []
+      commit((draft) => {
+        for (const { asset } of images)
+          if (!(asset.id in draft.assets)) draft.assets[asset.id] = asset
+        for (const node of nodes) draft.nodes[node.id] = node
+        rootsOf(draft, currentPageId).push(...nodes.map((node) => node.id))
+      })
+      const ids = nodes.map((node) => node.id)
+      set({ selection: pickable(ids, get().doc, currentPageId), activeAnchor: null })
+      return ids
+    },
+
+    resetCrop(ids) {
+      const { doc } = get()
+      const patch: Record<NodeId, Partial<VectorNode>> = {}
+      for (const id of new Set(ids)) {
+        const node = doc.nodes[id]
+        const asset = node?.type === 'image' ? doc.assets[node.assetId] : undefined
+        if (node?.type !== 'image' || !asset || node.locked) continue
+        const changes = resetCrop(node, asset)
+        if (changes) patch[id] = changes
+      }
+      if (Object.keys(patch).length > 0) get().updateNodes(patch)
     },
 
     replaceDoc(next) {
@@ -1153,7 +1253,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 
     duplicate(ids) {
       const { doc } = get()
-      insertCopies(collectSubtrees(doc, outermost(doc, ids)), PASTE_OFFSET)
+      insertCopies(collectSubtrees(doc, outermost(doc, ids)), PASTE_OFFSET, doc.assets)
     },
 
     copy(ids) {
@@ -1167,14 +1267,20 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       )
       if (nodes.length === 0) return
       pasteCount = 0
-      set({ clipboard: nodes })
+      const assets: Record<AssetId, AssetMeta> = {}
+      for (const node of nodes) {
+        if (node.type === 'image' && node.assetId in doc.assets) {
+          assets[node.assetId] = doc.assets[node.assetId]
+        }
+      }
+      set({ clipboard: nodes, clipboardAssets: assets })
     },
 
     paste() {
-      const { clipboard } = get()
+      const { clipboard, clipboardAssets } = get()
       if (clipboard.length === 0) return
       pasteCount += 1
-      insertCopies(clipboard, PASTE_OFFSET * pasteCount)
+      insertCopies(clipboard, PASTE_OFFSET * pasteCount, clipboardAssets)
     },
 
     convertToPath(ids) {
@@ -1437,6 +1543,10 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 
     setEditingText(id) {
       set({ editingText: id })
+    },
+
+    setCropping(draft) {
+      set({ cropping: draft })
     },
 
     setTransformPreview(patch) {

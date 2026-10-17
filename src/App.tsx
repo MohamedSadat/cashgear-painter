@@ -6,9 +6,13 @@ import { PagesPanel } from './components/PagesPanel'
 import { PropertiesPanel } from './components/PropertiesPanel'
 import { Toast } from './components/Toast'
 import { ToolRail } from './components/ToolRail'
+import { useFileInput } from './hooks/useFileInput'
 import { useShortcuts } from './hooks/useShortcuts'
 import { exportPng } from './lib/exportPng'
+import { assetCache } from './lib/images/assets'
+import { pageSubtree } from './lib/pages'
 import { currentPageOf, useEditorStore } from './store/editorStore'
+import { settleTool } from './tools'
 
 type PanelTab = 'properties' | 'layers' | 'pages'
 
@@ -37,8 +41,20 @@ export default function App() {
   const [tab, setTab] = useState<PanelTab>('properties')
   const wide = useIsWide()
   useShortcuts()
+  useFileInput()
 
-  const handleExport = () => {
+  // Images still loading would be gray boxes in the PNG, so the export waits for them, and for
+  // the frame that draws them.
+  const handleExport = async () => {
+    settleTool()
+    const before = useEditorStore.getState()
+    const assets = pageSubtree(before.doc, currentPageOf(before).id).flatMap((node) =>
+      node.type === 'image' ? [node.assetId] : [],
+    )
+    if (assets.length > 0) {
+      await assetCache.whenSettled(assets)
+      await new Promise((resolve) => requestAnimationFrame(resolve))
+    }
     const stage = stageRef.current
     if (!stage) return
     const state = useEditorStore.getState()

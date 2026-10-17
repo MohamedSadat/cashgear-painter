@@ -17,6 +17,8 @@ import {
   BringToFront,
   Check,
   CopyPlus,
+  Crop,
+  Expand,
   FileOutput,
   Group,
   Italic,
@@ -28,6 +30,7 @@ import {
   Trash2,
   Ungroup,
   Waypoints,
+  X,
   type LucideIcon,
 } from 'lucide-react'
 import { useCallback, useRef, useState, type ReactNode } from 'react'
@@ -51,6 +54,7 @@ import {
   type ZOrder,
 } from '../store/editorStore'
 import { activeAnchorOf, deleteActiveAnchor, setActiveAnchorKind } from '../tools/directTool'
+import { applyCrop, canCrop, cancelCrop, showWholeImage, startCrop } from '../tools/imageCrop'
 import { finishPath } from '../tools/penTool'
 import {
   COMBINE_HINT,
@@ -545,12 +549,40 @@ function MoveToPageButton() {
   )
 }
 
+/** Crop mode's buttons, for touch screens: apply, cancel, and show the whole image. */
+function CropProperties() {
+  return (
+    <>
+      <Header title="Crop image">
+        <div role="group" aria-label="Crop" className="flex items-center gap-0.5">
+          <IconButton label="Apply crop" title="Apply crop (Enter)" onClick={applyCrop}>
+            <Check size={18} />
+          </IconButton>
+          <IconButton label="Cancel crop" title="Cancel crop (Esc)" onClick={cancelCrop}>
+            <X size={18} />
+          </IconButton>
+          <IconButton label="Show whole image" onClick={showWholeImage}>
+            <Expand size={18} />
+          </IconButton>
+        </div>
+      </Header>
+      <p className="text-xs text-neutral-500">
+        Drag the handles to crop, and the image to move it inside the box. Enter applies the crop,
+        Esc cancels it.
+      </p>
+    </>
+  )
+}
+
 function SelectionProperties() {
   const doc = useEditorStore((s) => s.doc)
   const page = useEditorStore(currentPageOf)
   const selection = useEditorStore((s) => s.selection)
   const direct = useEditorStore((s) => s.tool === 'direct')
+  const cropping = useEditorStore((s) => s.cropping !== null)
   const nodes = selection.flatMap((id) => (id in doc.nodes ? [doc.nodes[id]] : []))
+
+  if (cropping) return <CropProperties />
 
   if (nodes.length === 0) {
     return (
@@ -573,6 +605,8 @@ function SelectionProperties() {
   const convertible = nodes.filter((n) => canConvertToPath(n) && !n.locked)
   const lines = nodes.filter((n): n is NodeOf<'line'> => n.type === 'line')
   const texts = nodes.filter((n): n is TextNode => n.type === 'text')
+  const cropped = nodes.filter((n) => n.type === 'image' && n.crop !== null && !n.locked)
+  const croppable = nodes.length === 1 && canCrop(doc, nodes[0].id, page.id)
   const hasGroup = nodes.some((n) => n.type === 'group')
   const colorOnly = filled.every((n) => n.type === 'stroke' || n.type === 'text')
   // Konva and SVG round corners to at most half the shorter side.
@@ -600,6 +634,24 @@ function SelectionProperties() {
               onClick={() => startTextEdit(texts[0].id)}
             >
               <PencilLine size={18} />
+            </IconButton>
+          )}
+          {croppable && (
+            <IconButton
+              label="Crop image"
+              title="Crop image (Enter, or double-click)"
+              onClick={() => startCrop(nodes[0].id)}
+            >
+              <Crop size={18} />
+            </IconButton>
+          )}
+          {cropped.length > 0 && (
+            <IconButton
+              label="Reset crop"
+              title="Reset crop: show the whole image"
+              onClick={() => store().resetCrop(cropped.map((n) => n.id))}
+            >
+              <Expand size={18} />
             </IconButton>
           )}
           <IconButton label="Group" title="Group (Ctrl+G)" onClick={() => store().group(selection)}>

@@ -154,7 +154,7 @@ export function deltaInParent(nodes: Nodes, id: NodeId, dx: number, dy: number):
  * The changes that give `node` the transform `next`, as a Transformer leaves it. Scale is baked
  * into geometry and reset to 1, so outlines keep their width: sizes for rects and ellipses, points
  * for lines, anchors and handles for paths, and width and font size for text (corner handles
- * scale both, side handles only the width). Freehand strokes keep their scale, since a stroke's
+ * scale both, side handles only the width), and width and height for images. Freehand strokes keep their scale, since a stroke's
  * outline is a fill and scales correctly. Groups take only the transform here; bakeTransforms
  * passes their scale on to their children. Null when nothing changes.
  */
@@ -184,6 +184,8 @@ export function bakeTransform(node: VectorNode, next: Transform): Partial<Vector
       }
     case 'text':
       return { transform, width: node.width * Math.abs(sx), fontSize: node.fontSize * Math.abs(sy) }
+    case 'image':
+      return { transform, width: node.width * Math.abs(sx), height: node.height * Math.abs(sy) }
   }
 }
 

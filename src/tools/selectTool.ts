@@ -15,6 +15,7 @@ import {
   type Rect,
 } from '../store/editorStore'
 import type { Doc, NodeId, Transform, VectorNode } from '../types'
+import { startCrop } from './imageCrop'
 import { startTextEdit } from './textTool'
 import type { ToolController, ToolEvent } from './types'
 
@@ -235,7 +236,8 @@ function startMove(start: Xy): Drag {
 
 /**
  * A double-click goes one level deeper: into a group, selecting its child under the pointer;
- * from a path to direct select; into a text's editor. True when it did any of these.
+ * from a path to direct select; into a text's editor; into an image's crop mode. True when it did
+ * any of these.
  */
 function openTarget(doc: Doc, target: NodeId, hit: NodeId): boolean {
   const node = doc.nodes[target]
@@ -252,6 +254,10 @@ function openTarget(doc: Doc, target: NodeId, hit: NodeId): boolean {
   }
   if (node.type === 'text') {
     drag = { kind: 'edit', id: target }
+    return true
+  }
+  if (node.type === 'image') {
+    startCrop(target)
     return true
   }
   return false
@@ -273,7 +279,8 @@ export function ungroupSelection(): void {
  * what lies fully inside it. Resize and rotate belong to the Transformer in SelectionOverlay.
  * A click picks a whole group; a double-click enters it and selects the child under the pointer,
  * and clicks then pick within it until one lands outside. Double-clicking a path switches to
- * direct select to edit its anchors, and double-clicking a text edits it. Alt + A, H or D aligns
+ * direct select to edit its anchors, double-clicking a text edits it, and double-clicking an image
+ * crops it (Enter does too). Alt + A, H or D aligns
  * the selection's left edges, centers or right edges, Alt + W, V or S its tops, middles or
  * bottoms, and Alt + Shift + H or V distributes it. Ctrl/Cmd + Alt + U, S, I or X unites,
  * subtracts, intersects or excludes it.
@@ -380,10 +387,11 @@ export const selectTool: ToolController = {
         store().deleteNodes(selection)
         return true
       }
-      // Enter edits a text, or goes into a group, selecting what it holds.
+      // Enter edits a text, crops an image, or goes into a group, selecting what it holds.
       if (e.key === 'Enter' && selection.length === 1) {
         const node = doc.nodes[selection[0]]
         if (node?.type === 'text') startTextEdit(node.id)
+        else if (node?.type === 'image') startCrop(node.id)
         else if (node?.type === 'group') store().select(node.childIds)
         else return false
         return true

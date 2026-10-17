@@ -1,14 +1,35 @@
 import { arrowHeadSize, fillBox } from '../geometry/bounds'
+import { IMAGE_PLACEHOLDER_COLOR } from '../images/assetRefs'
 import { cachedPathData } from '../geometry/pathData'
 import { TEXT_LINE_HEIGHT, firstBaseline, quoteFamilies, textLines } from '../geometry/textLayout'
 import { pageById } from '../pages'
 import { lastStop, placeGradient, type PaintBox } from '../paint/paint'
 import { pageBox } from '../paint/toKonva'
 import { cachedStrokePath } from '../strokePath'
-import type { Doc, NodeOf, Paint, Stop, TextNode, Transform, VectorNode } from '../../types'
+import type {
+  AssetMeta,
+  Doc,
+  ImageNode,
+  NodeOf,
+  Paint,
+  Stop,
+  TextNode,
+  Transform,
+  VectorNode,
+} from '../../types'
 
 export const SVG_FILE_NAME = 'drawing.svg'
 export const SVG_NS = 'http://www.w3.org/2000/svg'
+export const XLINK_NS = 'http://www.w3.org/1999/xlink'
+
+/** An image's bytes as a URL an SVG can hold, such as a data: URL; null when there are none. */
+export type ImageHref = (asset: AssetMeta) => string | null
+
+export interface SvgOptions {
+  // Without it, or without bytes for an asset, an image is the gray box the canvas shows while
+  // it loads.
+  imageHref?: ImageHref
+}
 
 /** n rounded to `digits` decimals, without a trailing '.0' or a '-0'. */
 function num(n: number, digits = 3): string {
@@ -132,10 +153,12 @@ const solidStop = (stop: Stop): Attrs => ({
   'fill-opacity': stop.opacity < 1 ? Math.max(0, stop.opacity) : undefined,
 })
 
-/** What nodeSvg passes down: the defs it fills as it goes. */
+/** What nodeSvg passes down: the defs it fills as it goes, and how to find images' bytes. */
 interface Defs {
   markers: Markers
   gradients: Gradients
+  imageHref: ImageHref
+  xlink: boolean // whether an image needs the xlink namespace on the root
 }
 
 /** A node's fill, laid out in its fill box. */
@@ -213,6 +236,28 @@ function lineSvg(node: NodeOf<'line'>, common: Attrs, markers: Markers): string 
 }
 
 /**
+ * An image as Konva draws it: stretched over its box. A cropped one is a nested <svg> whose
+ * viewBox is the crop, which clips the rest; it sits in a <g> that carries the transform, since
+ * SVG 1.1 has none on <svg>. Images use xlink:href, which every viewer reads.
+ */
+function imageSvg(doc: Doc, node: ImageNode, common: Attrs, defs: Defs, indent: string): string {
+  const { width, height, crop } = node
+  const asset = doc.assets[node.assetId]
+  const href = asset ? defs.imageHref(asset) : null
+  if (!asset || href === null) {
+    return `${indent}<rect${attrs({ ...common, width, height, fill: IMAGE_PLACEHOLDER_COLOR })}/>`
+  }
+  defs.xlink = true
+  if (crop === null) {
+    return `${indent}<image${attrs({ ...common, width, height, preserveAspectRatio: 'none', 'xlink:href': href })}/>`
+  }
+  const viewBox = [crop.x, crop.y, crop.width, crop.height].map((n) => num(n)).join(' ')
+  const image = `<image${attrs({ width: asset.width, height: asset.height, 'xlink:href': href })}/>`
+  const clip = `<svg${attrs({ width, height, viewBox, preserveAspectRatio: 'none' })}>${image}</svg>`
+  return `${indent}<g${attrs(common)}>${clip}</g>`
+}
+
+/**
  * The node and, for a group, its children, as SVG elements. Hidden nodes are left out. Konva fades
  * a see-through group child by child rather than as a whole, so a group's opacity is multiplied
  * into each child's instead of going on its <g>: the export looks like the screen.
@@ -269,18 +314,30 @@ function nodeSvg(doc: Doc, node: VectorNode, fade: number, defs: Defs, indent: s
     }
     case 'text':
       return textSvg(node, common, defs, indent)
+    case 'image':
+      return imageSvg(doc, node, common, defs, indent)
   }
 }
 
 /**
  * A page of the doc (the first by default) as a standalone SVG at the page's size, built from the
  * model rather than from Konva: the background, then every visible node bottom to top, each
- * placed by its transform. Objects off the page are kept, and clipped by the viewBox.
+ * placed by its transform. Objects off the page are kept, and clipped by the viewBox. Images
+ * hold their bytes as `imageHref` gives them, as data: URLs for a file.
  */
-export function exportSvg(doc: Doc, pageId = doc.pages[0].id): string {
+export function exportSvg(
+  doc: Doc,
+  pageId = doc.pages[0].id,
+  { imageHref = () => null }: SvgOptions = {},
+): string {
   const page = pageById(doc, pageId) ?? doc.pages[0]
   const { width, height } = page
-  const defs: Defs = { markers: new Markers(), gradients: new Gradients() }
+  const defs: Defs = {
+    markers: new Markers(),
+    gradients: new Gradients(),
+    imageHref,
+    xlink: false,
+  }
   const background = defs.gradients.fill(page.background, () => pageBox(page))
   const body = page.rootIds
     .map((id) => doc.nodes[id])
@@ -291,6 +348,7 @@ export function exportSvg(doc: Doc, pageId = doc.pages[0].id): string {
     '<?xml version="1.0" encoding="UTF-8"?>',
     `<svg${attrs({
       xmlns: SVG_NS,
+      'xmlns:xlink': defs.xlink ? XLINK_NS : undefined,
       viewBox: `0 0 ${width} ${height}`,
       width,
       height,

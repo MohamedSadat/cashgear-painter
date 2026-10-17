@@ -1,10 +1,11 @@
-import { createStore, get, set } from 'idb-keyval'
+import { createStore, del, get, keys, set } from 'idb-keyval'
 import { defaultStorage, loadV1Strokes, migrateV1, migrateV2 } from '../store/migrate'
 import {
   DEFAULT_PAGE_HEIGHT,
   DEFAULT_PAGE_WIDTH,
   emptyDoc,
   newPage,
+  type AssetId,
   type AssetMeta,
   type Contour,
   type Doc,
@@ -13,6 +14,14 @@ import {
   type Point,
   type VectorNode,
 } from '../types'
+import {
+  ASSET_KEY_PREFIX,
+  assetKey,
+  isAssetId,
+  referencedAssets,
+  withoutUnusedAssets,
+} from './images/assetRefs'
+import { isValidCrop } from './images/crop'
 import { clampPageSize } from './pages'
 import { isPaint } from './paint/paint'
 
@@ -27,6 +36,9 @@ const DB_STORE_NAME = 'kv'
 export interface KeyValueStore {
   get(key: string): Promise<unknown>
   set(key: string, value: unknown): Promise<void>
+  // For cleaning up unused assets; without them, nothing is cleaned up.
+  del?(key: string): Promise<void>
+  keys?(): Promise<IDBValidKey[]>
 }
 
 interface DocState {
@@ -49,7 +61,12 @@ export function defaultKeyValueStore(): KeyValueStore | null {
       idbStore = null
     } else {
       const store = createStore(DB_NAME, DB_STORE_NAME)
-      idbStore = { get: (key) => get(key, store), set: (key, value) => set(key, value, store) }
+      idbStore = {
+        get: (key) => get(key, store),
+        set: (key, value) => set(key, value, store),
+        del: (key) => del(key, store),
+        keys: () => keys(store),
+      }
     }
   } catch {
     idbStore = null
@@ -75,10 +92,12 @@ function compactNode(node: VectorNode): VectorNode {
   }
 }
 
+// Asset records no image shows any more stay in the doc while the editor runs, for undo; they
+// aren't saved.
 function compactDoc(doc: Doc): Doc {
   const nodes: Record<NodeId, VectorNode> = {}
   for (const [id, node] of Object.entries(doc.nodes)) nodes[id] = compactNode(node)
-  return { ...doc, nodes }
+  return { ...withoutUnusedAssets(doc), nodes }
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -173,6 +192,14 @@ const TYPE_CHECKS: Record<string, (node: Record<string, unknown>) => boolean> = 
     isLength(node.width),
   // Children are checked one by one as the tree is walked.
   group: (node) => Array.isArray(node.childIds),
+  // The asset and the crop are checked against the doc's asset records as the tree is walked.
+  image: (node) =>
+    isAssetId(node.assetId) &&
+    isFiniteNumber(node.width) &&
+    node.width > 0 &&
+    isFiniteNumber(node.height) &&
+    node.height > 0 &&
+    (node.crop === null || isObject(node.crop)),
 }
 
 function isNode(id: string, value: unknown): value is VectorNode {
@@ -195,11 +222,14 @@ const MIMES: ReadonlySet<unknown> = new Set(['image/png', 'image/jpeg', 'image/w
 
 function isAssetMeta(id: string, value: unknown): value is AssetMeta {
   return (
+    isAssetId(id) &&
     isObject(value) &&
     value.id === id &&
     MIMES.has(value.mime) &&
-    isLength(value.width) &&
-    isLength(value.height) &&
+    isFiniteNumber(value.width) &&
+    value.width > 0 &&
+    isFiniteNumber(value.height) &&
+    value.height > 0 &&
     isLength(value.bytes)
   )
 }
@@ -216,12 +246,20 @@ function freePageId(taken: ReadonlySet<string>): string {
  * dropped. Each page's tree is walked from its roots: a node is kept only under the parent its
  * `parentId` names, once in the whole doc, and a group keeps the children that pass; a group left
  * empty goes too, as do nodes no list reaches. Page ids are made unique, sizes kept in range and
- * unreadable backgrounds made white; a doc without pages gets an empty one.
+ * unreadable backgrounds made white; a doc without pages gets an empty one. An image is kept only
+ * with a record of its asset and a crop inside the image, and records no image uses are dropped.
  */
 export function sanitizeDoc(value: unknown): Doc {
   const doc = emptyDoc()
   if (!isObject(value) || value.version !== 3 || !isObject(value.nodes)) return doc
   if (!Array.isArray(value.pages)) return doc
+
+  const assets: Record<AssetId, AssetMeta> = {}
+  if (isObject(value.assets)) {
+    for (const [id, meta] of Object.entries(value.assets)) {
+      if (isAssetMeta(id, meta)) assets[id] = meta
+    }
+  }
 
   const nodes = value.nodes
   const seen = new Set<string>()
@@ -231,6 +269,10 @@ export function sanitizeDoc(value: unknown): Doc {
       if (typeof id !== 'string' || seen.has(id) || !Object.hasOwn(nodes, id)) return []
       const node = nodes[id]
       if (!isNode(id, node) || node.parentId !== parentId) return []
+      if (node.type === 'image') {
+        const asset = Object.hasOwn(assets, node.assetId) ? assets[node.assetId] : undefined
+        if (!asset || (node.crop !== null && !isValidCrop(node.crop, asset))) return []
+      }
       seen.add(id)
       if (node.type === 'path') {
         doc.nodes[id] = { ...node, contours: node.contours.filter(isContour) }
@@ -269,11 +311,8 @@ export function sanitizeDoc(value: unknown): Doc {
   }
   if (pages.length > 0) doc.pages = pages
 
-  if (isObject(value.assets)) {
-    for (const [id, meta] of Object.entries(value.assets)) {
-      if (isAssetMeta(id, meta)) doc.assets[id] = meta
-    }
-  }
+  const used = referencedAssets(doc.nodes)
+  for (const [id, meta] of Object.entries(assets)) if (used.has(id)) doc.assets[id] = meta
   return doc
 }
 
@@ -353,6 +392,65 @@ export async function loadStartupDoc(
   const doc = migrateV1(strokes)
   if (strokes.length > 0) await saveDoc(doc, kv)
   return doc
+}
+
+/**
+ * Stores an asset's bytes under `asset:<sha256>`. Returns false when the write failed, for
+ * example because storage is full or blocked.
+ */
+export async function saveAsset(
+  id: AssetId,
+  blob: Blob,
+  kv: KeyValueStore | null = defaultKeyValueStore(),
+): Promise<boolean> {
+  if (!kv) return false
+  try {
+    await kv.set(assetKey(id), blob)
+    return true
+  } catch (error) {
+    console.warn('Saving an image failed', error)
+    return false
+  }
+}
+
+/** An asset's stored bytes; undefined when they aren't stored or can't be read. */
+export async function loadAsset(
+  id: AssetId,
+  kv: KeyValueStore | null = defaultKeyValueStore(),
+): Promise<Blob | undefined> {
+  if (!kv) return undefined
+  try {
+    const value = await kv.get(assetKey(id))
+    return value instanceof Blob ? value : undefined
+  } catch (error) {
+    console.warn('Loading an image failed', error)
+    return undefined
+  }
+}
+
+/**
+ * Deletes the stored assets the doc doesn't show. Run on start, when no undo history can bring
+ * them back yet. Returns how many went.
+ */
+export async function cleanUpAssets(
+  doc: Doc,
+  kv: KeyValueStore | null = defaultKeyValueStore(),
+): Promise<number> {
+  if (!kv?.keys || !kv.del) return 0
+  try {
+    const used = referencedAssets(doc.nodes)
+    const doomed = (await kv.keys()).filter(
+      (key): key is string =>
+        typeof key === 'string' &&
+        key.startsWith(ASSET_KEY_PREFIX) &&
+        !used.has(key.slice(ASSET_KEY_PREFIX.length)),
+    )
+    for (const key of doomed) await kv.del(key)
+    return doomed.length
+  } catch (error) {
+    console.warn('Cleaning up unused images failed', error)
+    return 0
+  }
 }
 
 /** Returns false when the write failed, for example because storage is full or blocked. */

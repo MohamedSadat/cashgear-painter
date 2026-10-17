@@ -1,12 +1,14 @@
 import { memo } from 'react'
-import { Arrow, Ellipse, Group, Path, Rect, Text } from 'react-konva'
+import { Arrow, Ellipse, Group, Image as KonvaImage, Path, Rect, Text } from 'react-konva'
 import { arrowHeadSize } from '../lib/geometry/bounds'
 import { cachedPathData } from '../lib/geometry/pathData'
+import { IMAGE_PLACEHOLDER_COLOR } from '../lib/images/assetRefs'
+import { useAsset } from '../lib/images/assets'
 import { TEXT_LINE_HEIGHT } from '../lib/geometry/textLayout'
 import { nodeKonvaFill } from '../lib/paint/toKonva'
 import { cachedStrokePath, strokeToPath } from '../lib/strokePath'
 import { useEditorStore, zoomOf } from '../store/editorStore'
-import type { GroupNode, NodeId, ShapeNode, TextNode, VectorNode } from '../types'
+import type { GroupNode, ImageNode, NodeId, ShapeNode, TextNode, VectorNode } from '../types'
 
 const DIMMED_OPACITY = 0.3
 // Thin strokes are easy to grab: the hit area reaches this many screen pixels around the ink.
@@ -116,6 +118,32 @@ function TextView({ node, common }: { node: TextNode; common: CommonProps }) {
   )
 }
 
+/**
+ * An image stretched over its box, showing its crop. A gray box stands in while the image loads,
+ * or when its bytes can't be found; Konva picks either anywhere in the box. In crop mode the
+ * overlay draws it instead.
+ */
+function ImageView({ node, common }: { node: ImageNode; common: CommonProps }) {
+  const { image } = useAsset(node.assetId)
+  const cropping = useEditorStore((s) => s.cropping?.id === node.id)
+  const { crop } = node
+  return (
+    <KonvaImage
+      {...common}
+      visible={!cropping}
+      image={image ?? undefined}
+      width={node.width}
+      height={node.height}
+      // A crop of 0 × 0 draws the whole image.
+      cropX={crop?.x ?? 0}
+      cropY={crop?.y ?? 0}
+      cropWidth={crop?.width ?? 0}
+      cropHeight={crop?.height ?? 0}
+      fill={image ? undefined : IMAGE_PLACEHOLDER_COLOR}
+    />
+  )
+}
+
 /** A child of a group, read from the store, so a changed child re-renders without its group. */
 function ChildView({ id }: { id: NodeId }) {
   const node = useEditorStore((s) => s.doc.nodes[id])
@@ -188,5 +216,7 @@ export const NodeView = memo(function NodeView({
       return <TextView node={node} common={common} />
     case 'group':
       return <GroupView node={node} common={common} />
+    case 'image':
+      return <ImageView node={node} common={common} />
   }
 })
