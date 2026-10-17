@@ -3,7 +3,7 @@ import { IMAGE_PLACEHOLDER_COLOR } from '../images/assetRefs'
 import { cachedPathData } from '../geometry/pathData'
 import { TEXT_LINE_HEIGHT, firstBaseline, quoteFamilies, textLines } from '../geometry/textLayout'
 import { pageById } from '../pages'
-import { lastStop, placeGradient, type PaintBox } from '../paint/paint'
+import { isGradient, lastStop, placeGradient, type PaintBox } from '../paint/paint'
 import { pageBox } from '../paint/toKonva'
 import { cachedStrokePath } from '../strokePath'
 import type {
@@ -12,6 +12,7 @@ import type {
   ImageNode,
   NodeOf,
   Paint,
+  ShapeNode,
   Stop,
   TextNode,
   Transform,
@@ -25,11 +26,35 @@ export const XLINK_NS = 'http://www.w3.org/1999/xlink'
 /** An image's bytes as a URL an SVG can hold, such as a data: URL; null when there are none. */
 export type ImageHref = (asset: AssetMeta) => string | null
 
+/** The font-family an SVG text is written with, from the text's font stack. */
+export type FontFamilyOf = (stack: string) => string
+
+/** A picture of a node in its own coordinates, written in its place (see SvgOptions). */
+export interface NodeImage {
+  href: string
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
 export interface SvgOptions {
   // Without it, or without bytes for an asset, an image is the gray box the canvas shows while
   // it loads.
   imageHref?: ImageHref
+  // The text's own stack by default; the PDF export names the font it draws the text with.
+  fontFamily?: FontFamilyOf
+  // Put before every id in <defs>, so SVGs drawn into one PDF don't share ids.
+  idPrefix?: string
+  // A picture to write in place of a node, or null for the node itself. The PDF export pictures
+  // what svg2pdf.js can't draw. A text stays on top of its picture, invisible but selectable.
+  nodeImage?(node: VectorNode): NodeImage | null
+  // A gradient-filled shape's outline as an element of its own over the fill: jsPDF clips to the
+  // shape and strokes before it paints a gradient, which hides the inner half of the outline.
+  outlineApart?: boolean
 }
+
+const ownFamily: FontFamilyOf = (stack) => quoteFamilies(stack).replaceAll('"', "'")
 
 /** n rounded to `digits` decimals, without a trailing '.0' or a '-0'. */
 function num(n: number, digits = 3): string {
@@ -86,23 +111,34 @@ class Markers {
   private ids = new Map<string, string>()
   readonly defs: string[] = []
 
+  private readonly prefix: string
+
+  constructor(prefix: string) {
+    this.prefix = prefix
+  }
+
   /**
    * A marker drawn as Konva draws an arrowhead: a triangle `arrowHeadSize` long and wide with its
    * tip on the line's end, filled and outlined in the line's color with round joins. A start
-   * marker points backwards, so plain orient="auto" serves both ends.
+   * marker points backwards, so plain orient="auto" serves both ends. It is in units of the line's
+   * width (markerUnits' default), which svg2pdf.js assumes whatever markerUnits says, with a
+   * viewBox around the triangle and its outline, which svg2pdf.js clips to.
    */
   id(color: string, width: number, end: 'start' | 'end'): string {
     const key = `${color} ${width} ${end}`
     let id = this.ids.get(key)
     if (id !== undefined) return id
-    id = `arrow-${end}-${this.ids.size + 1}`
+    id = `${this.prefix}arrow-${end}-${this.ids.size + 1}`
     this.ids.set(key, id)
-    const head = arrowHeadSize(width)
+    const unit = Math.max(width, 0.01)
+    const head = arrowHeadSize(width) / unit
     const back = end === 'end' ? -head : head
-    const d = `M 0 0 L ${num(back)} ${num(head / 2)} L ${num(back)} ${num(-head / 2)} Z`
+    const d = `M 0 0 L ${num(back, 4)} ${num(head / 2, 4)} L ${num(back, 4)} ${num(-head / 2, 4)} Z`
+    // The outline, one unit wide, reaches half a unit past the triangle.
+    const box = [Math.min(0, back) - 0.5, -head / 2 - 0.5, head + 1, head + 1].map((n) => num(n, 4))
     this.defs.push(
-      `<marker${attrs({ id, markerUnits: 'userSpaceOnUse', orient: 'auto', style: 'overflow:visible' })}>` +
-        `<path${attrs({ d, fill: color, stroke: color, 'stroke-width': width, 'stroke-linejoin': 'round' })}/>` +
+      `<marker${attrs({ id, viewBox: box.join(' '), markerWidth: box[2], markerHeight: box[3], orient: 'auto', style: 'overflow:visible' })}>` +
+        `<path${attrs({ d, fill: color, stroke: color, 'stroke-width': 1, 'stroke-linejoin': 'round' })}/>` +
         '</marker>',
     )
     return id
@@ -118,6 +154,12 @@ class Markers {
 class Gradients {
   private ids = new Map<string, string>()
   readonly defs: string[] = []
+
+  private readonly prefix: string
+
+  constructor(prefix: string) {
+    this.prefix = prefix
+  }
 
   /** The fill attributes for a paint laid out in `box`, the element's fill box. */
   fill(paint: Paint | null, box: () => PaintBox | null): Attrs {
@@ -139,7 +181,7 @@ class Gradients {
     const body = `${attrs({ gradientUnits: 'userSpaceOnUse', ...geometry })}>${stops.join('')}</${tag}>`
     let id = this.ids.get(tag + body)
     if (id === undefined) {
-      id = `gradient-${this.ids.size + 1}`
+      id = `${this.prefix}gradient-${this.ids.size + 1}`
       this.ids.set(tag + body, id)
       this.defs.push(`<${tag}${attrs({ id })}${body}`)
     }
@@ -158,6 +200,9 @@ interface Defs {
   markers: Markers
   gradients: Gradients
   imageHref: ImageHref
+  fontFamily: FontFamilyOf
+  nodeImage: (node: VectorNode) => NodeImage | null
+  outlineApart: boolean
   xlink: boolean // whether an image needs the xlink namespace on the root
 }
 
@@ -165,14 +210,30 @@ interface Defs {
 const nodeFill = (node: VectorNode, defs: Defs) =>
   defs.gradients.fill(node.style.fill, () => fillBox(node))
 
-/** Fill and outline as Konva paints them: no fill is fill="none", no outline no stroke at all. */
-function paint(node: VectorNode, defs: Defs): Attrs {
+/**
+ * A rectangle, ellipse or path element, filled and outlined as Konva paints it: no fill is
+ * fill="none", no outline no stroke at all. `filling` goes with the fill and `outlining` with the
+ * outline. With outlineApart, a gradient-filled shape with an outline is two elements, the fill
+ * under the outline.
+ */
+function shapeSvg(
+  tag: string,
+  node: ShapeNode,
+  geometry: Attrs,
+  { common, defs, indent }: { common: Attrs; defs: Defs; indent: string },
+  filling: Attrs = {},
+  outlining: Attrs = {},
+): string {
   const { style } = node
-  return {
-    ...nodeFill(node, defs),
-    stroke: style.stroke ?? undefined,
-    'stroke-width': style.stroke === null ? undefined : style.strokeWidth,
+  const fill = nodeFill(node, defs)
+  const outline: Attrs =
+    style.stroke === null ? {} : { stroke: style.stroke, 'stroke-width': style.strokeWidth }
+  const element = (list: Attrs) => `${indent}<${tag}${attrs({ ...common, ...geometry, ...list })}/>`
+  if (defs.outlineApart && style.stroke !== null && isGradient(style.fill)) {
+    return `${element({ ...fill, ...filling })}
+${element({ fill: 'none', ...outline, ...outlining })}`
   }
+  return element({ ...fill, ...outline, ...filling, ...(style.stroke === null ? {} : outlining) })
 }
 
 const FONT_WEIGHTS: Record<TextNode['fontStyle'], string | undefined> = {
@@ -195,7 +256,13 @@ const ANCHORS: Record<TextNode['align'], string | undefined> = {
  * written on one line: with xml:space="preserve", whitespace between the tspans would count as
  * trailing spaces and push centered and right-aligned lines to the left.
  */
-function textSvg(node: TextNode, common: Attrs, defs: Defs, indent: string): string {
+function textSvg(
+  node: TextNode,
+  common: Attrs,
+  defs: Defs,
+  indent: string,
+  invisible = false,
+): string {
   const x = node.align === 'center' ? node.width / 2 : node.align === 'right' ? node.width : 0
   const baseline = firstBaseline(node)
   const step = node.fontSize * TEXT_LINE_HEIGHT
@@ -205,8 +272,8 @@ function textSvg(node: TextNode, common: Attrs, defs: Defs, indent: string): str
   if (spans.length === 0) return ''
   const open = `<text${attrs({
     ...common,
-    ...nodeFill(node, defs),
-    'font-family': quoteFamilies(node.fontFamily).replaceAll('"', "'"),
+    ...(invisible ? { fill: 'none' } : nodeFill(node, defs)),
+    'font-family': defs.fontFamily(node.fontFamily),
     'font-size': node.fontSize,
     'font-weight': FONT_WEIGHTS[node.fontStyle],
     'font-style': node.fontStyle.includes('italic') ? 'italic' : undefined,
@@ -278,6 +345,18 @@ function nodeSvg(doc: Doc, node: VectorNode, fade: number, defs: Defs, indent: s
   }
 
   if (opacity < 1) common.opacity = opacity
+  const image = defs.nodeImage(node)
+  if (image) {
+    defs.xlink = true
+    const { href, ...box } = image
+    const picture = `${indent}<image${attrs({ ...common, ...box, preserveAspectRatio: 'none', 'xlink:href': href })}/>`
+    if (node.type !== 'text') return picture
+    const text = textSvg(node, { transform: common.transform }, defs, indent, true)
+    return text === ''
+      ? picture
+      : `${picture}
+${text}`
+  }
   switch (node.type) {
     case 'stroke':
       // The outline is a fill, as on the canvas.
@@ -285,32 +364,25 @@ function nodeSvg(doc: Doc, node: VectorNode, fade: number, defs: Defs, indent: s
     case 'rect': {
       // Konva keeps a corner radius within half the shorter side; SVG would clamp rx and ry apart.
       const r = Math.max(0, Math.min(node.cornerRadius, node.width / 2, node.height / 2))
-      return `${indent}<rect${attrs({
-        ...common,
-        width: node.width,
-        height: node.height,
-        rx: r > 0 ? r : undefined,
-        ry: r > 0 ? r : undefined,
-        ...paint(node, defs),
-      })}/>`
+      const corner = r > 0 ? r : undefined
+      const geometry = { width: node.width, height: node.height, rx: corner, ry: corner }
+      return shapeSvg('rect', node, geometry, { common, defs, indent })
     }
     case 'ellipse':
-      return `${indent}<ellipse${attrs({ ...common, rx: node.rx, ry: node.ry, ...paint(node, defs) })}/>`
+      return shapeSvg('ellipse', node, { rx: node.rx, ry: node.ry }, { common, defs, indent })
     case 'line':
       return indent + lineSvg(node, common, defs.markers)
     case 'path': {
       // Konva draws paths with miter joins, round caps and canvas's miter limit of 10 (SVG's is 4).
-      const outlined = node.style.stroke !== null
-      return `${indent}<path${attrs({
-        ...common,
-        d: cachedPathData(node),
-        ...paint(node, defs),
-        // Nonzero is SVG's default, as it is canvas's.
-        'fill-rule': node.fillRule === 'evenodd' ? 'evenodd' : undefined,
-        'stroke-linejoin': outlined ? 'miter' : undefined,
-        'stroke-linecap': outlined ? 'round' : undefined,
-        'stroke-miterlimit': outlined ? 10 : undefined,
-      })}/>`
+      // Nonzero is SVG's default, as it is canvas's.
+      return shapeSvg(
+        'path',
+        node,
+        { d: cachedPathData(node) },
+        { common, defs, indent },
+        { 'fill-rule': node.fillRule === 'evenodd' ? 'evenodd' : undefined },
+        { 'stroke-linejoin': 'miter', 'stroke-linecap': 'round', 'stroke-miterlimit': 10 },
+      )
     }
     case 'text':
       return textSvg(node, common, defs, indent)
@@ -328,14 +400,23 @@ function nodeSvg(doc: Doc, node: VectorNode, fade: number, defs: Defs, indent: s
 export function exportSvg(
   doc: Doc,
   pageId = doc.pages[0].id,
-  { imageHref = () => null }: SvgOptions = {},
+  {
+    imageHref = () => null,
+    fontFamily = ownFamily,
+    idPrefix = '',
+    nodeImage,
+    outlineApart = false,
+  }: SvgOptions = {},
 ): string {
   const page = pageById(doc, pageId) ?? doc.pages[0]
   const { width, height } = page
   const defs: Defs = {
-    markers: new Markers(),
-    gradients: new Gradients(),
+    markers: new Markers(idPrefix),
+    gradients: new Gradients(idPrefix),
     imageHref,
+    fontFamily,
+    nodeImage: nodeImage ?? (() => null),
+    outlineApart,
     xlink: false,
   }
   const background = defs.gradients.fill(page.background, () => pageBox(page))

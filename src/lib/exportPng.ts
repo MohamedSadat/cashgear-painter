@@ -10,12 +10,12 @@ const MAX_PIXELS = 16_777_216
 const MAX_SIDE = 16_384
 
 /**
- * PNG pixels per page unit: 2, or less for a page so large that twice its size would be more
- * than browsers can draw.
+ * Pixels per page unit for an image of the page: `scale` (the PNG's 2 by default), or less for a
+ * page so large that it would be more than browsers can draw.
  */
-export function exportPixelRatio(width: number, height: number): number {
+export function exportPixelRatio(width: number, height: number, scale = EXPORT_SCALE): number {
   return Math.min(
-    EXPORT_SCALE,
+    scale,
     Math.sqrt(MAX_PIXELS / (width * height)),
     MAX_SIDE / Math.max(width, height),
   )

@@ -3,6 +3,7 @@ import {
   Circle,
   Eraser,
   FileDown,
+  FileText,
   FileUp,
   FolderOpen,
   Grid3x3,
@@ -157,7 +158,10 @@ function RailMenu({ label, title, icon: Icon, groups }: RailMenuProps) {
 }
 
 /** Open, save, import and export behind one button, so they fit the phone's second rail row. */
-function FileMenu({ onExportPng }: { onExportPng(): void }) {
+function FileMenu({
+  onExportPng,
+  onExportPdf,
+}: Pick<ToolRailProps, 'onExportPng' | 'onExportPdf'>) {
   const groups: MenuItem[][] = [
     [
       { label: 'Open…', shortcut: 'Ctrl+O', icon: FolderOpen, run: openDrawing },
@@ -168,6 +172,7 @@ function FileMenu({ onExportPng }: { onExportPng(): void }) {
       { label: 'Import SVG…', icon: FileUp, run: importSvgFile },
       { label: 'Export SVG', icon: FileDown, run: exportSvgFile },
       { label: 'Export PNG', icon: ImageDown, run: onExportPng },
+      { label: 'Export PDF…', icon: FileText, run: onExportPdf },
     ],
   ]
   return (
@@ -191,13 +196,14 @@ function ViewMenu() {
 
 interface ToolRailProps {
   onExportPng(): void
+  onExportPdf(): void
 }
 
 /**
  * The tools, then history, zoom, the view menu and the file menu. A vertical rail on the left from 640 px up;
  * above the canvas, wrapping onto a second row, on phones.
  */
-export function ToolRail({ onExportPng }: ToolRailProps) {
+export function ToolRail({ onExportPng, onExportPdf }: ToolRailProps) {
   const tool = useEditorStore((s) => s.tool)
   const canUndo = useEditorStore((s) => s.past.length > 0)
   const canRedo = useEditorStore((s) => s.future.length > 0)
@@ -257,7 +263,7 @@ export function ToolRail({ onExportPng }: ToolRailProps) {
           {zoomPercent}%
         </button>
         <ViewMenu />
-        <FileMenu onExportPng={onExportPng} />
+        <FileMenu onExportPng={onExportPng} onExportPdf={onExportPdf} />
       </div>
     </nav>
   )

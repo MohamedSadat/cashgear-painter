@@ -2,6 +2,7 @@ import { expect, test, type Page } from '@playwright/test'
 import { strFromU8, unzipSync } from 'fflate'
 import type Konva from 'konva'
 import { readFile } from 'node:fs/promises'
+import { readPdf } from './pdf.ts'
 
 const WHITE = [255, 255, 255, 255]
 const BLACK = [0, 0, 0, 255]
@@ -3039,4 +3040,292 @@ test('images come in by the picker and by paste, are stored once, and leave stor
   await page.reload()
   await waitForCanvas(page)
   await expect.poll(() => storedAssets(page)).toEqual([])
+})
+
+/** Whether the page has loaded the lazy chunk that holds jsPDF, svg2pdf.js and the PDF export. */
+const pdfLoaded = (page: Page) =>
+  page.evaluate(() =>
+    performance.getEntriesByType('resource').some((entry) => entry.name.includes('exportPdf')),
+  )
+
+/**
+ * Each path a PDF content stream paints or clips by: how many subpaths it has (m, or re) and the
+ * operator that ends it (f, S, W n, …), in drawing order.
+ */
+function pdfPaths(content: string) {
+  const out: { subpaths: number; end: string }[] = []
+  let subpaths = 0
+  for (const line of content.split('\n')) {
+    if (/ (m|re)$/.test(line)) subpaths++
+    else if (/^(f\*?|S|B\*?|b\*?|n|W\*? [nS])$/.test(line)) {
+      if (subpaths > 0) out.push({ subpaths, end: line })
+      subpaths = 0
+    }
+  }
+  return out
+}
+
+/** Opens File → Export PDF…, sets it up, exports, and returns the file's name and its contents. */
+async function exportPdfFromDialog(
+  page: Page,
+  { range, mode }: { range?: string; mode?: 'Vector' | 'Image' } = {},
+) {
+  await fromFileMenu(page, 'Export PDF…')
+  const dialog = page.getByRole('dialog', { name: 'Export PDF' })
+  await expect(dialog).toBeVisible()
+  if (range !== undefined) {
+    await dialog.getByRole('radio', { name: 'Pages', exact: true }).check()
+    await dialog.getByRole('textbox', { name: 'Page range' }).fill(range)
+  }
+  if (mode) await dialog.getByRole('radio', { name: new RegExp(`^${mode}`) }).check()
+  const downloadPromise = page.waitForEvent('download')
+  await dialog.getByRole('button', { name: 'Export' }).click()
+  const download = await downloadPromise
+  await expect(dialog).toHaveCount(0)
+  return { name: download.suggestedFilename(), pdf: readPdf(await readFile(await download.path())) }
+}
+
+const A4 = [595.5, 842.25] // pt: 794 × 1123 px × 0.75
+
+test('release: pages, snapping, a gradient, a boolean, an image and text export as a 3-page A4 PDF with selectable text', async ({
+  page,
+}) => {
+  const pages = page.getByRole('complementary', { name: 'Pages' })
+  const font = page.getByRole('combobox', { name: 'Font' })
+  const placeText = async (at: Xy, words: string) => {
+    await page.mouse.click(...(await screenOf(page, at)))
+    await expect(page.getByRole('textbox', { name: 'Text' })).toBeFocused()
+    await page.keyboard.type(words)
+    await page.keyboard.press('Control+Enter')
+    await expect(page.getByRole('textbox', { name: 'Text' })).toHaveCount(0)
+  }
+
+  // Page 1 becomes A4 from the page's size presets.
+  await page.keyboard.press('v')
+  await page.getByRole('combobox', { name: 'Page size' }).selectOption('a4')
+  await expect.poll(() => pageRatio(page)).toBe(0.71)
+
+  // A rectangle dropped 3 screen px from the page's top-left corner snaps its ink onto both edges.
+  await drawRectOnCanvas(page, [100, 100], [400, 300])
+  const zoom = await zoomOf(page)
+  const guides = await dragOnCanvas(page, [250, 200], [-98 * zoom + 3, -98 * zoom + 3])
+  expect(guides).toHaveLength(2)
+  const [placed] = await shownTransforms(page)
+  expect(placed.x).toBeCloseTo(2, 6)
+  expect(placed.y).toBeCloseTo(2, 6)
+
+  // A linear gradient from the panel, then a circle subtracted from it: a path with a hole.
+  await page
+    .getByRole('group', { name: 'Fill type' })
+    .getByRole('button', { name: 'Linear', exact: true })
+    .click()
+  expect((await shownFill(page)).priority).toBe('linear-gradient')
+  await page.keyboard.press('o')
+  await drag(page, await screenOf(page, [80, 50]), await screenOf(page, [220, 190]))
+  expect(await pdfLoaded(page)).toBe(false)
+  await page.keyboard.press('Control+a')
+  await page.keyboard.press('Control+Alt+s')
+  await expect.poll(() => shownShapes(page)).toEqual(['Path'])
+  expect((await shownFill(page)).priority).toBe('linear-gradient')
+
+  // A text in Georgia, which the PDF embeds as Gelasio.
+  await page.keyboard.press('t')
+  await font.selectOption({ label: 'Georgia' })
+  await placeText([60, 500], 'Georgia on page one')
+
+  // Page 2: an image from the picker, its left half cropped away.
+  await pages.getByRole('button', { name: 'Add page' }).click()
+  expect(await pageNames(page)).toEqual(['Page 1', 'Page 2*'])
+  const chooser = page.waitForEvent('filechooser')
+  await fromFileMenu(page, 'Import image…')
+  await (
+    await chooser
+  ).setFiles({ name: 'red.png', mimeType: 'image/png', buffer: await smallPng(page, '#ef4444') })
+  await expect.poll(() => shownShapes(page)).toEqual(['Image'])
+  await expect.poll(() => imagesDrawn(page)).toBe(true)
+  await page.keyboard.press('Enter')
+  const left = await overlayPointOf(page, 'crop-middle-left')
+  const middle = await screenOf(page, [397, 0])
+  await drag(page, left, [middle[0], left[1]])
+  await page.keyboard.press('Enter')
+  expect((await shownAttr(page, 'cropX'))[0]).toBeCloseTo(60, 0)
+
+  // Page 3: a text in Arial.
+  await pages.getByRole('button', { name: 'Add page' }).click()
+  await page.keyboard.press('t')
+  await font.selectOption({ label: 'Arial' })
+  await placeText([60, 200], 'Arial on page three')
+
+  // All three pages, as vectors, by default; the PDF code loads only when one is made.
+  await fromFileMenu(page, 'Export PDF…')
+  const dialog = page.getByRole('dialog', { name: 'Export PDF' })
+  await expect(dialog.getByRole('radio', { name: 'All 3 pages' })).toBeChecked()
+  await expect(dialog.getByRole('radio', { name: /^Vector/ })).toBeChecked()
+  await expect(dialog.getByRole('list', { name: 'Warnings' })).toHaveCount(0)
+  await dialog.getByRole('button', { name: 'Cancel' }).click()
+  await expect(dialog).toHaveCount(0)
+  expect(await pdfLoaded(page)).toBe(false)
+  const { name, pdf } = await exportPdfFromDialog(page)
+  expect(await pdfLoaded(page)).toBe(true)
+  expect(name).toBe('drawing.pdf')
+
+  // Three A4 pages, each with its own text as text a viewer selects.
+  expect(pdf.pages.map((p) => [p.width, p.height])).toEqual([A4, A4, A4])
+  expect(pdf.pages.map((p) => p.text)).toEqual([
+    ['Georgia on page one'],
+    [],
+    ['Arial on page three'],
+  ])
+  const gelasio = (d: string) => /\/BaseFont \/Gelasio/.test(d) && /\/Subtype \/Type0/.test(d)
+  expect(pdf.objects.some(gelasio)).toBe(true)
+  expect(pdf.objects.some((d) => /\/FontFile2/.test(d))).toBe(true)
+
+  // Page 1: the gradient is a shading that fills the boolean shape's two contours, hole and all,
+  // and its outline goes over it.
+  expect(pdf.objects.some((d) => /\/ShadingType 2/.test(d))).toBe(true)
+  const paths = pdfPaths(pdf.pages[0].content)
+  expect(paths).toContainEqual({ subpaths: 2, end: 'W n' })
+  expect(paths).toContainEqual({ subpaths: 2, end: 'S' })
+  expect(pdf.pages[0].content).toMatch(/\/Sh\d+ sh/)
+
+  // Page 2: the image, clipped to its crop by a rectangle.
+  expect(pdf.pages[1].content).toMatch(/ re\nW\nn\n[\s\S]*\/I\d+ Do/)
+  const png = (d: string) => /\/Subtype \/Image/.test(d) && /\/Width 120\b/.test(d)
+  expect(pdf.objects.some(png)).toBe(true)
+
+  // Page 2 alone in image mode: one A4 page, a 300 dpi JPEG and no text.
+  const image = await exportPdfFromDialog(page, { range: '2', mode: 'Image' })
+  expect(image.pdf.pages.map((p) => [p.width, p.height])).toEqual([A4])
+  expect(image.pdf.pages[0].text).toEqual([])
+  const jpegs = image.pdf.objects.filter((d) => /\/Filter \/DCTDecode/.test(d))
+  expect(jpegs).toHaveLength(1)
+  expect(jpegs[0]).toMatch(/\/Width 2481\b/)
+  expect(jpegs[0]).toMatch(/\/Height 3509\b/)
+})
+
+test('the PDF dialog checks page ranges, warns about fonts, draws pages it must as images, and keeps its keys from the canvas', async ({
+  page,
+}) => {
+  const text = (id: string, words: string, fontFamily: string) => ({
+    id,
+    type: 'text',
+    name: 'Text',
+    parentId: null,
+    transform: { x: 100, y: 100, rotation: 0, scaleX: 1, scaleY: 1 },
+    style: { fill: { kind: 'solid', color: '#000000' }, stroke: null, strokeWidth: 0, opacity: 1 },
+    hidden: false,
+    locked: false,
+    text: words,
+    fontFamily,
+    fontSize: 40,
+    fontStyle: 'normal',
+    align: 'left',
+    width: 600,
+  })
+  const pageOf = (id: string, name: string, rootIds: string[], width = 1123, height = 794) => ({
+    id,
+    name,
+    width,
+    height,
+    background: { kind: 'solid', color: '#ffffff' },
+    rootIds,
+  })
+  await putSaved(page, 'painter:v3', {
+    version: 3,
+    pages: [
+      pageOf('p1', 'Cover', ['a']),
+      pageOf('p2', 'Arabic', ['b'], 794, 1123),
+      pageOf('p3', 'Back', ['c']),
+    ],
+    nodes: {
+      a: text('a', 'Verdana words', 'Verdana, Geneva, sans-serif'),
+      b: text('b', 'مرحبا', 'Arial, Helvetica, sans-serif'),
+      c: text('c', 'Back page', 'Times New Roman, Times, serif'),
+    },
+    assets: {},
+  })
+  await page.reload()
+  await waitForCanvas(page)
+  expect(await pageNames(page)).toEqual(['Cover*', 'Arabic', 'Back'])
+
+  // A text selected on the canvas stays put whatever is pressed in the dialog.
+  await page.keyboard.press('v')
+  await page.keyboard.press('Control+a')
+  expect(await selectedCount(page)).toBe(1)
+  await fromFileMenu(page, 'Export PDF…')
+  const dialog = page.getByRole('dialog', { name: 'Export PDF' })
+  const warnings = dialog.getByRole('list', { name: 'Warnings' }).getByRole('listitem')
+  await expect(warnings).toHaveText([
+    "Verdana isn't a PDF font, so page 1 shows it in Helvetica.",
+    "Page 2 has characters the PDF's fonts can't show, such as Arabic, Chinese or emoji, so it is drawn as an image, without selectable text.",
+  ])
+  await dialog.getByRole('button', { name: 'Cancel' }).focus()
+  await page.keyboard.press('Delete')
+  await page.keyboard.press('b')
+
+  // Image mode draws every page as an image: nothing to warn about.
+  await dialog.getByRole('radio', { name: /^Image/ }).check()
+  await expect(warnings).toHaveCount(0)
+  await dialog.getByRole('radio', { name: /^Vector/ }).check()
+
+  // A range starts at the current page, says what is wrong with it, and narrows the warnings.
+  const exportButton = dialog.getByRole('button', { name: 'Export' })
+  const range = dialog.getByRole('textbox', { name: 'Page range' })
+  await dialog.getByRole('radio', { name: 'Pages', exact: true }).check()
+  await expect(range).toHaveValue('1')
+  await range.fill('2-5')
+  await expect(dialog.getByText("Page 5 doesn't exist: pages run from 1 to 3.")).toBeVisible()
+  await expect(range).toHaveAttribute('aria-invalid', 'true')
+  await expect(exportButton).toBeDisabled()
+  await range.fill('3-1')
+  await expect(dialog.getByText('3-1 runs backwards; write it as 1-3.')).toBeVisible()
+  await range.fill('1, 3')
+  await expect(exportButton).toBeEnabled()
+  await expect(warnings).toHaveText(["Verdana isn't a PDF font, so page 1 shows it in Helvetica."])
+
+  // Esc closes it without a download; the canvas never saw the keys.
+  await page.keyboard.press('Escape')
+  await expect(dialog).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Select', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  expect(await shownShapes(page)).toEqual(['Text'])
+  expect(await selectedCount(page)).toBe(1)
+
+  // Pages 1 and 3 as vectors, each at its own landscape size, text selectable; Verdana's text
+  // is set in Helvetica.
+  const both = await exportPdfFromDialog(page, { range: '1, 3' })
+  expect(both.pdf.pages.map((p) => [p.width, p.height])).toEqual([
+    [842.25, 595.5],
+    [842.25, 595.5],
+  ])
+  expect(both.pdf.pages.map((p) => p.text)).toEqual([['Verdana words'], ['Back page']])
+  expect(both.pdf.objects.some((d) => /\/BaseFont \/Helvetica\b/.test(d))).toBe(true)
+
+  // Page 2 in vector mode is still drawn as an image, as on screen: portrait, no text.
+  const arabic = await exportPdfFromDialog(page, { range: '2' })
+  expect(arabic.pdf.pages.map((p) => [p.width, p.height])).toEqual([A4])
+  expect(arabic.pdf.pages[0].text).toEqual([])
+  expect(arabic.pdf.objects.some((d) => /\/Filter \/DCTDecode/.test(d))).toBe(true)
+})
+
+test.describe('the PDF dialog on a 375 px phone', () => {
+  test.use({ viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: true })
+
+  test('opens from the file menu by touch, fits the screen and exports', async ({ page }) => {
+    await page.getByRole('button', { name: 'File', exact: true }).tap()
+    await page.getByRole('menuitem', { name: 'Export PDF…' }).tap()
+    const dialog = page.getByRole('dialog', { name: 'Export PDF' })
+    const box = (await dialog.boundingBox())!
+    expect(box.x).toBeGreaterThanOrEqual(0)
+    expect(box.x + box.width).toBeLessThanOrEqual(375)
+    expect(box.y + box.height).toBeLessThanOrEqual(812)
+    const exportButton = dialog.getByRole('button', { name: 'Export' })
+    expect((await exportButton.boundingBox())!.height).toBeGreaterThanOrEqual(36)
+    const downloadPromise = page.waitForEvent('download')
+    await exportButton.tap()
+    const pdf = readPdf(await readFile(await (await downloadPromise).path()))
+    expect(pdf.pages.map((p) => [p.width, p.height])).toEqual([[1200, 750]])
+  })
 })

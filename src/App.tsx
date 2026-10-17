@@ -3,6 +3,7 @@ import { useRef, useState, useSyncExternalStore } from 'react'
 import { CanvasStage } from './components/CanvasStage'
 import { LayersPanel } from './components/LayersPanel'
 import { PagesPanel } from './components/PagesPanel'
+import { PdfExportDialog } from './components/PdfExportDialog'
 import { PropertiesPanel } from './components/PropertiesPanel'
 import { Toast } from './components/Toast'
 import { ToolRail } from './components/ToolRail'
@@ -39,6 +40,7 @@ function useIsWide(): boolean {
 export default function App() {
   const stageRef = useRef<Konva.Stage>(null)
   const [tab, setTab] = useState<PanelTab>('properties')
+  const [pdfOpen, setPdfOpen] = useState(false)
   const wide = useIsWide()
   useShortcuts()
   useFileInput()
@@ -66,6 +68,12 @@ export default function App() {
     }
   }
 
+  // The dialog reads the drawing as it is, with what the tool was drawing kept.
+  const openPdfDialog = () => {
+    settleTool()
+    setPdfOpen(true)
+  }
+
   // Shown on phones only for the open tab; from 640 px up, always.
   const shownOn = (id: PanelTab) => (tab === id ? 'flex-1' : 'hidden sm:flex')
 
@@ -75,7 +83,7 @@ export default function App() {
   // layers on the right.
   return (
     <div className="flex h-dvh flex-col bg-neutral-100 sm:flex-row">
-      <ToolRail onExportPng={handleExport} />
+      <ToolRail onExportPng={handleExport} onExportPdf={openPdfDialog} />
       {wide && (
         <PagesPanel layout="strip" className="w-28 shrink-0 border-r border-neutral-200 bg-white" />
       )}
@@ -109,6 +117,7 @@ export default function App() {
         {!wide && <PagesPanel layout="row" className={tab === 'pages' ? 'flex-1' : 'hidden'} />}
       </div>
       <Toast />
+      {pdfOpen && <PdfExportDialog onClose={() => setPdfOpen(false)} />}
     </div>
   )
 }

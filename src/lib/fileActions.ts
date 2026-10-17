@@ -6,6 +6,8 @@ import { withoutUnusedAssets } from './images/assetRefs'
 import { askToPersistStorage, assetCache } from './images/assets'
 import { pageSubtree } from './pages'
 import type { OpenedAsset } from './painterFile'
+import type { PdfExportOptions } from './pdf/exportPdf'
+import { PDF_FILE_NAME } from './pdf/pdfPages'
 import { parseDocFile, saveAsset } from './persistence'
 import { SVG_FILE_NAME, exportSvg } from './svg/exportSvg'
 import { importSvg } from './svg/importSvg'
@@ -14,6 +16,8 @@ const store = () => useEditorStore.getState()
 
 // The .painter zip code and fflate, loaded on the first save or open.
 const loadPainterFile = () => import('./painterFile')
+// The PDF export with jsPDF and svg2pdf.js, loaded on the first PDF export.
+const loadPdf = () => import('./pdf/exportPdf')
 
 const errorMessage = (error: unknown, fallback: string) =>
   error instanceof Error && error.message ? error.message : fallback
@@ -122,6 +126,19 @@ export async function exportSvgFile(): Promise<void> {
   const urls = await imageDataUrls(state.doc, pageId)
   const svg = exportSvg(state.doc, pageId, { imageHref: (asset) => urls.get(asset.id) ?? null })
   downloadText(svg, SVG_FILE_NAME, 'image/svg+xml')
+}
+
+/**
+ * Downloads the chosen pages as drawing.pdf (see exportPdf), loading the PDF code first. Errors,
+ * and an abort through `signal`, reach the caller, the export dialog; what the PDF shows
+ * differently goes in a toast.
+ */
+export async function exportPdfFile(options: PdfExportOptions): Promise<void> {
+  settleTool()
+  const { exportPdf } = await loadPdf()
+  const { bytes, notes } = await exportPdf(store().doc, options)
+  downloadBytes(bytes, PDF_FILE_NAME, 'application/pdf')
+  if (notes.length > 0) store().showToast(notes.join(' '))
 }
 
 /**

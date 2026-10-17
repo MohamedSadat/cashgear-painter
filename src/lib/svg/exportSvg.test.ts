@@ -193,9 +193,10 @@ describe('exportSvg', () => {
     const svg = exportSvg(docOf(a, b, c))
     const head = arrowHeadSize(4)
     expect(head).toBe(26)
+    // In units of the line's width (4): a triangle 26 long and wide, outlined 4 wide.
     expect(elements(svg, 'marker')).toEqual([
-      `    <marker id="arrow-start-1" markerUnits="userSpaceOnUse" orient="auto" style="overflow:visible"><path d="M 0 0 L 26 13 L 26 -13 Z" fill="#000000" stroke="#000000" stroke-width="4" stroke-linejoin="round"/></marker>`,
-      `    <marker id="arrow-end-2" markerUnits="userSpaceOnUse" orient="auto" style="overflow:visible"><path d="M 0 0 L -26 13 L -26 -13 Z" fill="#000000" stroke="#000000" stroke-width="4" stroke-linejoin="round"/></marker>`,
+      `    <marker id="arrow-start-1" viewBox="-0.5 -3.75 7.5 7.5" markerWidth="7.5" markerHeight="7.5" orient="auto" style="overflow:visible"><path d="M 0 0 L 6.5 3.25 L 6.5 -3.25 Z" fill="#000000" stroke="#000000" stroke-width="1" stroke-linejoin="round"/></marker>`,
+      `    <marker id="arrow-end-2" viewBox="-7 -3.75 7.5 7.5" markerWidth="7.5" markerHeight="7.5" orient="auto" style="overflow:visible"><path d="M 0 0 L -6.5 3.25 L -6.5 -3.25 Z" fill="#000000" stroke="#000000" stroke-width="1" stroke-linejoin="round"/></marker>`,
     ])
     expect(elements(svg, 'line').map((l) => l.trim())).toEqual([
       '<line x1="0" y1="0" x2="100" y2="0" stroke="#000000" stroke-width="4" stroke-linecap="round" marker-start="url(#arrow-start-1)" marker-end="url(#arrow-end-2)"/>',
@@ -258,5 +259,79 @@ describe('exportSvg', () => {
     )
     expect(elements(svg, 'g')).toHaveLength(1)
     expect(svg).not.toContain('<ellipse')
+  })
+
+  it('puts a prefix before every id it writes, and names the font a text is drawn with', () => {
+    const gradient: Paint = {
+      kind: 'linear',
+      stops: [
+        { offset: 0, color: '#ff0000', opacity: 1 },
+        { offset: 1, color: '#0000ff', opacity: 1 },
+      ],
+      start: [0, 0],
+      end: [1, 1],
+    }
+    const rect = createRectNode(box, { ...DEFAULT_SHAPE_STYLE, fill: gradient }, 'r')
+    const line = { ...createLineNode([0, 0], [50, 0], DEFAULT_SHAPE_STYLE, 'l'), arrowEnd: true }
+    const text = createTextNode(0, 0, 300, DEFAULT_TEXT_STYLE, 'Hi', 't')
+    const svg = exportSvg(docOf(rect, line, text), undefined, {
+      idPrefix: 'page2-',
+      fontFamily: (stack) => (stack.startsWith('Arial') ? 'helvetica' : 'times'),
+    })
+    expect(svg).toContain('<linearGradient id="page2-gradient-1"')
+    expect(svg).toContain('fill="url(#page2-gradient-1)"')
+    expect(svg).toContain('<marker id="page2-arrow-end-1"')
+    expect(svg).toContain('marker-end="url(#page2-arrow-end-1)"')
+    expect(svg).toContain('font-family="helvetica"')
+  })
+
+  it('writes the outline of a gradient-filled shape apart, over its fill, when asked', () => {
+    const gradient: Paint = {
+      kind: 'radial',
+      stops: [
+        { offset: 0, color: '#ffffff', opacity: 1 },
+        { offset: 1, color: '#000000', opacity: 1 },
+      ],
+      center: [0.5, 0.5],
+      radius: 0.5,
+    }
+    const anchors = [corner(0, 0), corner(100, 0), corner(0, 100)]
+    const path = {
+      ...createPathNode(anchors, true, { ...DEFAULT_SHAPE_STYLE, fill: gradient }, 'p'),
+      fillRule: 'evenodd' as const,
+    }
+    const plain = createEllipseNode(box, { ...DEFAULT_SHAPE_STYLE, fill: solid('#ff0000') }, 'e')
+    const svg = exportSvg(docOf(path, plain), undefined, { outlineApart: true })
+    const [fill, outline] = elements(svg, 'path').map((l) => l.trim())
+    expect(fill).toMatch(/^<path d="[^"]+" fill="url\(#gradient-1\)" fill-rule="evenodd"\/>$/)
+    expect(outline).toMatch(
+      /^<path d="[^"]+" fill="none" stroke="#000000" stroke-width="4" stroke-linejoin="miter" stroke-linecap="round" stroke-miterlimit="10"\/>$/,
+    )
+    // A solid fill keeps its outline on the same element.
+    expect(elements(svg, 'ellipse')).toHaveLength(1)
+    expect(exportSvg(docOf(path))).not.toContain('fill="none"')
+  })
+
+  it('writes a picture in place of a node when asked, a text staying on top, invisible', () => {
+    const rect = createRectNode(box, { ...DEFAULT_SHAPE_STYLE, opacity: 0.5 }, 'r')
+    const text = {
+      ...createTextNode(10, 20, 300, DEFAULT_TEXT_STYLE, 'Pictured', 't'),
+      style: { fill: solid('#123456'), stroke: null, strokeWidth: 0, opacity: 1 },
+    }
+    const other = createEllipseNode(box, DEFAULT_SHAPE_STYLE, 'e')
+    const picture = { href: 'data:image/png;base64,AAAA', x: -1, y: -2, width: 30, height: 40 }
+    const svg = exportSvg(docOf(rect, text, other), undefined, {
+      nodeImage: (node) => (node.type === 'ellipse' ? null : picture),
+    })
+    expect(svg).toContain('xmlns:xlink="http://www.w3.org/1999/xlink"')
+    expect(elements(svg, 'image').map((l) => l.trim())).toEqual([
+      '<image transform="translate(100 50)" opacity="0.5" x="-1" y="-2" width="30" height="40" preserveAspectRatio="none" xlink:href="data:image/png;base64,AAAA"/>',
+      '<image transform="translate(10 20)" x="-1" y="-2" width="30" height="40" preserveAspectRatio="none" xlink:href="data:image/png;base64,AAAA"/>',
+    ])
+    const [shown] = elements(svg, 'text')
+    expect(shown).toContain('<text transform="translate(10 20)" fill="none"')
+    expect(shown).toContain('>Pictured</tspan>')
+    expect(elements(svg, 'rect')).toHaveLength(1) // the background only
+    expect(elements(svg, 'ellipse')).toHaveLength(1)
   })
 })
